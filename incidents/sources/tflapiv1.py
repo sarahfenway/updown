@@ -57,6 +57,7 @@ def check():
                             text=status_details,
                             source=Report.SOURCE_TFLAPI_V1,
                             information=issue["appearance"] != "RealTime",
+                            resolved=False,
                         )
 
                         if created:

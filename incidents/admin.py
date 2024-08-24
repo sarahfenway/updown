@@ -21,6 +21,7 @@ class IncidentAdmin(admin.ModelAdmin):
         "resolved",
     )
     ordering = ("-start_time",)
+    raw_id_fields = ["station"]
 
     inlines = [
         ReportInline,
@@ -40,6 +41,7 @@ class ReportAdmin(admin.ModelAdmin):
         "source",
     )
     ordering = ("-start_time",)
+    raw_id_fields = ["station"]
 
 
 admin.site.site_header = "Up Down London Administration"

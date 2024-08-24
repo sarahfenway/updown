@@ -35,8 +35,11 @@
                                         There is no step free access at this station.
                                     {% endif %}
                                     <i>
+                                        {% if issue.reports.count == 1 and issue.reports.first.source == "U" %}
+                                            This is a user report, which will be automatically closed at {{ issue.reports.first.end_time|date:"H:i, d M" }} unless reported by TfL.
+                                        {% endif %}
                                         {% if issue.start_time %}
-                                            {{ issue.start_time }}
+                                            <br>{{ issue.start_time }}
                                         {% endif %}
                                     </i>
                                 </p>
@@ -65,7 +68,11 @@
                         <div class="issue">
                             <h3>{{ issue.station }}</h3>
                             <p>
-                                Step free access has now been restored at this station.
+                                {% if issue.reports.count == 1 and issue.reports.first.source == "U" %}
+                                    This was a user report, which we have automatically closed.
+                                {% else %}
+                                    Step free access has now been restored at this station.
+                                {% endif %}
                                 <i>
                                     {% if issue.end_time %}
                                         {{ issue.end_time }}

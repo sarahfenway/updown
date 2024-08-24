@@ -38,6 +38,9 @@ def consolidate_incidents():
 
             tweet = f"{incident.station.name}: {incident.text}"
 
+            if report.source == Report.SOURCE_USER:
+                tweet += "\n\nThis is a user report"
+
             if len(tweet) > 280:
                 if incident.information:
                     tweet = f"New information on step free access at {incident.station.name}"
@@ -62,14 +65,25 @@ def consolidate_incidents():
         incident.reports.add(report)
 
     for incident in Incident.objects.filter(resolved=False):
+        # Resolve user generated reports
+        for report in incident.reports.filter(
+            source=Report.SOURCE_USER, resolved=False, end_time__lt=timezone.now()
+        ):
+            report.resolved = True
+            report.save()
+
         # Check if the incident has been resolved
         if incident.reports.filter(resolved=False).count() == 0:
             incident.resolved = True
             incident.end_time = timezone.now()
             incident.save()
 
-            tweet = f"Step free access has been restored at {incident.station.name}"
-            send_tweet(tweet)
+            if (
+                incident.reports.count() > 1
+                or incident.reports.first().source != Report.SOURCE_USER
+            ):
+                tweet = f"Step free access has been restored at {incident.station.name}"
+                send_tweet(tweet)
 
 
 class Command(BaseCommand):
