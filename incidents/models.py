@@ -51,5 +51,11 @@ class Report(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["station_id","source","information","resolved","text"]),
-            models.Index(fields=["resolved", "source"])
+            models.Index(fields=["resolved", "source"]),
+            models.Index(fields=['-start_time', '-id'], name='idx_start_time_id'),
+            models.Index(fields=['station_id'], name='idx_station_id'),
+            models.Index(
+                fields=['-start_time', '-id', 'information', 'station_id', 'text', 'end_time', 'resolved', 'source'],
+                name='idx_covering'),
         ]
+        ordering = ['-start_time', '-id']
