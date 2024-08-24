@@ -15,6 +15,8 @@ class Incident(models.Model):
         return f"{self.station.name} - Resolved: {self.resolved} - {self.reports.count()} reports"
 
 
+
+
 class Report(models.Model):
     SOURCE_TWITTER = "T"
     SOURCE_MASTODON = "M"
@@ -45,3 +47,9 @@ class Report(models.Model):
 
     def __str__(self):
         return f"{self.station.name} - Resolved: {self.resolved} - {self.get_source_display()}"
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["station_id","source","information","resolved","text"]),
+            models.Index(fields=["resolved", "source"])
+        ]
