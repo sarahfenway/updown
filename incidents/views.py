@@ -17,13 +17,13 @@ from incidents.utils import get_last_updated
 @never_cache
 def detail(request):
     issues = Incident.objects.filter(resolved=False, information=False).order_by(
-        "station__parent_station"
+        "-start_time", "station__parent_station"
     )
     resolved = Incident.objects.filter(
         resolved=True, end_time__gte=timezone.now() - timedelta(hours=12)
-    ).order_by("station__parent_station")
+    ).order_by("-start_time", "station__parent_station")
     information = Incident.objects.filter(resolved=False, information=True).order_by(
-        "station__parent_station"
+        "-start_time", "station__parent_station"
     )
 
     return render(

@@ -2,6 +2,7 @@ import re
 
 import arrow
 import tweepy
+import atproto
 from arrow import ParserError
 from django.conf import settings
 from django.utils import timezone
@@ -126,6 +127,23 @@ def send_tweet(tweet_text):
             pass
     else:
         print("Should have tweeted: " + tweet_text)
+
+def send_bluesky(tweet_text):
+    """Send a blue sky post"""
+    if settings.DEBUG is False:
+        try:
+
+            client = atproto.Client()
+            profile = client.login(settings.BLUESKY_USER_NAME, settings.BLUESKY_PASSWORD)
+            print('Welcome,', profile.display_name)
+
+            text = atproto.client_utils.TextBuilder().text(tweet_text)
+            client.send_post(text)
+        # Except everything.
+        except:
+            pass
+    else:
+        print("Should have posted on blue sky: " + tweet_text)
 
 
 def update_last_updated():

@@ -6,7 +6,7 @@ from django.utils import timezone
 from incidents.models import Report, Incident
 from incidents.sources.tflapiv1 import check as check_tflv1
 from incidents.sources.tflapiv2 import check as check_tflv2
-from incidents.utils import send_tweet, update_last_updated
+from incidents.utils import send_tweet, update_last_updated, send_bluesky
 
 
 def consolidate_incidents():
@@ -50,6 +50,7 @@ def consolidate_incidents():
                     )
 
             send_tweet(tweet)
+            send_bluesky(tweet)
         else:
             # Update the existing incident
             incident.information = report.information
@@ -84,6 +85,7 @@ def consolidate_incidents():
             ):
                 tweet = f"Step free access has been restored at {incident.station.name}"
                 send_tweet(tweet)
+                send_bluesky(tweet)
 
 
 class Command(BaseCommand):
