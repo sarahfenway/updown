@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.urls import path
 
-from incidents.views import detail, UpdateIncidentsView, alexa
+from incidents.views import detail, UpdateIncidentsView, alexa, stp
 from pages.views import FAQPageView, PressPageView, PrivacyPageView
 
 urlpatterns = [
@@ -12,4 +12,5 @@ urlpatterns = [
     path("faq/", FAQPageView.as_view(), name="faq"),
     path("press/", PressPageView.as_view(), name="press"),
     path("privacy/", PrivacyPageView.as_view(), name="privacy"),
+    path("stp/", stp, name="stp"),
 ]

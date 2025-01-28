@@ -31,6 +31,8 @@ ALLOWED_HOSTS = [
     "www.updownlondon.com",
     "updownlondon.info",
     "www.updownlondon.info",
+    "isstpthameslinkliftbroken.com",
+    "www.isstpthameslinkliftbroken.com",
 ]
 
 
