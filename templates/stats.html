@@ -2,7 +2,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>{% block title %}{% endblock %}Up Down London</title>
+    <title>{% block title %}{% endblock %}Stats</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
     <link rel="shortcut icon" href="{% static "favicon.ico" %}" type="image/x-icon" />
@@ -30,48 +30,37 @@
 <body>
 <div class="container">
     <div class="row header-box">
-        <div class="col-md-6 col-md-offset-3">
-            <h1>
-                <i class="icon-arrow-up green"></i><i class="icon-arrow-down red"></i>
-                UP DOWN LONDON
-            </h1>
-            <p class="text-muted sub-h1">Lift status at Transport for London stations</p>
-        </div>
-    </div>
-    {% block menu %}
-
-    {% endblock %}
-    <div class="row">
-        {% block content %}{% endblock %}
-    </div>
-
-    <hr>
-    <div class="row">
-        <div class="col-md-6 col-md-offset-3">
-            <p>Call TfL's Travel Information Centre on 0343 222 1234 if you need help planning your journey.</p>
-
-            {% if last_updated %}<p>Last updated: {{ last_updated }}</p>{% endif %}
+        <div class="col-md-12">
+            <h1>In the last 30 days</h1>
+            <h2>Total</h2>
+            <p>Count: {{ total_count }}</p>
+            <p>Duration: {{ total_delays }}</p>
+            
+            <h2>Unavailable Staff</h2>
+            <p>Count: {{ station_staff_count }}</p>
+            <p>Duration: {{  station_staff_delays }}</p>
+            
+            <h2>Faulty Lift</h2>
+            <p>Count: {{ faulty_lift_count }}</p>
+            <p>Duration: {{  faulty_lift_delays }}</p>
+            
+            <h2>Planned Maintenance</h2>
+            <p>Count: {{ planned_maintenance_count }}</p>
+            <p>Duration: {{ planned_maintenance_delays }}</p>
+            
         </div>
     </div>
     <hr>
-    <div class="row">
+    <div class="row header-box">
         <div class="col-md-6 col-md-offset-3">
-            <p>
-                Seen an error? Any comments? Please <a href="mailto:tubetimes@jaggedseam.com">let us know</a>. <a
-                    href="https://twitter.com/TubeLifts" class="twitter-follow-button" data-show-count="false">Follow
-                @TubeLifts</a>
-            </p>
-            <p class="text-muted" style="font-size: smaller; line-height: 1.2em;">
-                From an idea by Christiane Link and inspired by Up
-                Down Vienna. Up Down London uses data provided by Transport for London (TfL), but is not affiliated
-                with or endorsed by TfL. &copy; Up Down London 2013-{% now "Y" %}, except status updates provided by
-                TfL. The <a href="https://github.com/kirknorthrop/updown/" class="text-muted">Up Down source code</a> is
-                partially licensed under the AGPL. If you want to use our data, or want advice on setting up a similar
-                site for your city <a href="mailto:tubetimes@jaggedseam.com" class="text-muted">drop us a line</a>. <a
-                    href="{% url 'privacy' %}" class="text-muted">Privacy Policy</a>
-            </p>
+            <h3>
+                <a href="https://updownlondon.com/" style="color: #333">Visit <i class="icon-arrow-up green"></i><i class="icon-arrow-down red"></i>
+                    UP DOWN LONDON for full lift status</a></h3>
+            </h3>
         </div>
     </div>
+
+
 </div>
 </body>
 <!-- jQuery -->
