@@ -104,13 +104,13 @@ def stats(request):
         "stats.html",
         {
             "total_count": total_count,
-            "total_delays": f"{total_delays.days}:{int(total_delays.seconds/24/60)}:{int(total_delays.seconds/60%60)}",
+            "total_delays": f"{total_delays.days}:{int(total_delays.seconds/24)}:{int(total_delays.seconds/24/60)}:{int(total_delays.seconds/60%60)}",
             "station_staff_count": station_staff_count,
-            "station_staff_delays": f"{station_staff_delays.days}:{int(station_staff_delays.seconds/24/60)}:{int(station_staff_delays.seconds/60%60)}",
+            "station_staff_delays": f"{station_staff_delays.days}:{int(station_staff_delays.seconds/24)}:{int(station_staff_delays.seconds/24/60)}:{int(station_staff_delays.seconds/60%60)}",
             "faulty_lift_count": faulty_lift_count,
-            "faulty_lift_delays": f"{faulty_lift_delays.days}:{int(faulty_lift_delays.seconds/24/60)}:{int(faulty_lift_delays.seconds/60%60)}",
+            "faulty_lift_delays": f"{faulty_lift_delays.days}:{int(faulty_lift_delays.seconds/24)}:{int(faulty_lift_delays.seconds/24/60)}:{int(faulty_lift_delays.seconds/60%60)}",
             "planned_maintenance_count": planned_maintenance_count,
-            "planned_maintenance_delays": f"{planned_maintenance_delays.days}:{int(planned_maintenance_delays.seconds/24/60)}:{int(planned_maintenance_delays.seconds/60%60)}",
+            "planned_maintenance_delays": f"{planned_maintenance_delays.days}:{int(planned_maintenance_delays.seconds/24)}:{int(planned_maintenance_delays.seconds/24/60)}:{int(planned_maintenance_delays.seconds/60%60)}",
             "last_updated": get_last_updated(),
         },
     )
