@@ -37,16 +37,16 @@
             <p>Duration: {{ total_delays }}</p>
             
             <h2>Unavailable Staff</h2>
-            <p>Count: {{ station_staff_count }}</p>
-            <p>Duration: {{  station_staff_delays }}</p>
+            <p>Count: {{ station_staff_count }} ({{ station_staff_count_percentage }}%)</p>
+            <p>Duration: {{  station_staff_delays }} ({{ station_staff_delays_percentage }}%)</p>
             
             <h2>Faulty Lift</h2>
-            <p>Count: {{ faulty_lift_count }}</p>
-            <p>Duration: {{  faulty_lift_delays }}</p>
+            <p>Count: {{ faulty_lift_count }} ({{ faulty_lift_count_percentage }}%)</p>
+            <p>Duration: {{  faulty_lift_delays }} ({{ faulty_lift_delays_percentage }}%)</p>
             
             <h2>Planned Maintenance</h2>
-            <p>Count: {{ planned_maintenance_count }}</p>
-            <p>Duration: {{ planned_maintenance_delays }}</p>
+            <p>Count: {{ planned_maintenance_count }} ({{ planned_maintenance_count_percentage }}%)</p>
+            <p>Duration: {{ planned_maintenance_delays }} ({{ planned_maintenance_delays_percentage }}%)</p>
             
         </div>
     </div>
