@@ -1,10 +1,12 @@
-from datetime import timedelta, datetime
+from datetime import datetime
+from datetime import timedelta
 
 from django.conf import settings
 from django.core.management import call_command
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce, Now
 from django.http import HttpResponse, HttpResponseNotFound
+from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 from django.utils.decorators import method_decorator
@@ -42,6 +44,90 @@ def detail(request):
             "last_updated": get_last_updated(),
         },
     )
+
+
+@never_cache
+def api_incidents(request):
+    # Fetch querysets
+    issues_qs = (
+        Incident.objects.filter(resolved=False, information=False)
+        .order_by("-start_time", "station__parent_station")
+        .annotate(
+            # Create a new database-level alias:
+            station_name=F("station__parent_station__name"),
+            station_naptan=F("station__parent_station__naptan_id"),
+        )
+    )
+
+    resolved_qs = (
+        Incident.objects.filter(
+            resolved=True, end_time__gte=timezone.now() - timedelta(hours=12)
+        )
+        .order_by("-start_time", "station__parent_station")
+        .annotate(
+            # Create a new database-level alias:
+            station_name=F("station__parent_station__name"),
+            station_naptan=F("station__parent_station__naptan_id"),
+        )
+    )
+
+    information_qs = (
+        Incident.objects.filter(resolved=False, information=True)
+        .order_by("-start_time", "station__parent_station")
+        .annotate(
+            # Create a new database-level alias:
+            station_name=F("station__parent_station__name"),
+            station_naptan=F("station__parent_station__naptan_id"),
+        )
+    )
+
+    # Convert them into something JSON-friendly.
+    # You can specify exactly which fields you want via .values().
+    issues_data = list(
+        issues_qs.values(
+            "id",
+            "text",
+            "start_time",
+            "end_time",
+            "resolved",
+            "information",
+            "station_name",
+            "station_naptan",
+        )
+    )
+    resolved_data = list(
+        resolved_qs.values(
+            "id",
+            "text",
+            "start_time",
+            "end_time",
+            "resolved",
+            "information",
+            "station_name",
+            "station_naptan",
+        )
+    )
+    information_data = list(
+        information_qs.values(
+            "id",
+            "text",
+            "start_time",
+            "end_time",
+            "resolved",
+            "information",
+            "station_name",
+            "station_naptan",
+        )
+    )
+
+    data = {
+        "issues": issues_data,
+        "resolved": resolved_data,
+        "information": information_data,
+        "last_updated": datetime.now().isoformat(),
+    }
+
+    return JsonResponse(data)
 
 
 def stp(request):
