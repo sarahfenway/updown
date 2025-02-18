@@ -19,7 +19,7 @@ from stations.models import Station
 
 @never_cache
 def detail(request):
-    if request.headers['host'].endswith("isstpthameslinkliftbroken.com"):
+    if request.headers["host"].endswith("isstpthameslinkliftbroken.com"):
         return stp(request)
 
     issues = Incident.objects.filter(resolved=False, information=False).order_by(
@@ -51,7 +51,10 @@ def stp(request):
     yes_or_no = False
 
     for issue in issues:
-        if "to the thameslink" in issue.text.lower() and "faulty lift" in issue.text.lower():
+        if (
+            "to the thameslink" in issue.text.lower()
+            and "faulty lift" in issue.text.lower()
+        ):
             yes_or_no = True
 
     return render(
@@ -106,17 +109,38 @@ def stats(request):
             "total_count": total_count,
             "total_delays": f"{total_delays.days}:{total_delays.seconds // 3600}:{(total_delays.seconds % 3600) // 60}:{(total_delays.seconds % 60)}",
             "station_staff_count": station_staff_count,
-            "station_staff_count_percentage": round((station_staff_count / total_count) * 100, 2),
+            "station_staff_count_percentage": round(
+                (station_staff_count / total_count) * 100, 2
+            ),
             "station_staff_delays": f"{station_staff_delays.days}:{station_staff_delays.seconds // 3600}:{(station_staff_delays.seconds % 3600) // 60}:{(station_staff_delays.seconds % 60)}",
-            "station_staff_delays_percentage": round((station_staff_delays.total_seconds() / total_delays.total_seconds()) * 100, 2),
+            "station_staff_delays_percentage": round(
+                (station_staff_delays.total_seconds() / total_delays.total_seconds())
+                * 100,
+                2,
+            ),
             "faulty_lift_count": faulty_lift_count,
-            "faulty_lift_count_percentage": round((faulty_lift_count / total_count) * 100, 2),
+            "faulty_lift_count_percentage": round(
+                (faulty_lift_count / total_count) * 100, 2
+            ),
             "faulty_lift_delays": f"{faulty_lift_delays.days}:{faulty_lift_delays.seconds // 3600}:{(faulty_lift_delays.seconds % 3600) // 60}:{(faulty_lift_delays.seconds % 60)}",
-            "faulty_lift_delays_percentage": round((faulty_lift_delays.total_seconds() / total_delays.total_seconds()) * 100, 2),
+            "faulty_lift_delays_percentage": round(
+                (faulty_lift_delays.total_seconds() / total_delays.total_seconds())
+                * 100,
+                2,
+            ),
             "planned_maintenance_count": planned_maintenance_count,
-            "planned_maintenance_count_percentage": round((planned_maintenance_count / total_count) * 100, 2),
+            "planned_maintenance_count_percentage": round(
+                (planned_maintenance_count / total_count) * 100, 2
+            ),
             "planned_maintenance_delays": f"{planned_maintenance_delays.days}:{planned_maintenance_delays.seconds // 3600}:{(planned_maintenance_delays.seconds % 3600) // 60}:{(planned_maintenance_delays.seconds % 60)}",
-            "planned_maintenance_delays_percentage": round((planned_maintenance_delays.total_seconds() / total_delays.total_seconds()) * 100, 2),
+            "planned_maintenance_delays_percentage": round(
+                (
+                    planned_maintenance_delays.total_seconds()
+                    / total_delays.total_seconds()
+                )
+                * 100,
+                2,
+            ),
             "last_updated": get_last_updated(),
         },
     )

@@ -128,14 +128,16 @@ def send_tweet(tweet_text):
     else:
         print("Should have tweeted: " + tweet_text)
 
+
 def send_bluesky(tweet_text):
     """Send a blue sky post"""
     if settings.DEBUG is False:
         try:
-
             client = atproto.Client()
-            profile = client.login(settings.BLUESKY_USER_NAME, settings.BLUESKY_PASSWORD)
-            print('Welcome,', profile.display_name)
+            profile = client.login(
+                settings.BLUESKY_USER_NAME, settings.BLUESKY_PASSWORD
+            )
+            print("Welcome,", profile.display_name)
 
             text = atproto.client_utils.TextBuilder().text(tweet_text)
             client.send_post(text)

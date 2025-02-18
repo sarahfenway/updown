@@ -15,8 +15,6 @@ class Incident(models.Model):
         return f"{self.station.name} - Resolved: {self.resolved} - {self.reports.count()} reports"
 
 
-
-
 class Report(models.Model):
     SOURCE_TWITTER = "T"
     SOURCE_MASTODON = "M"
@@ -50,12 +48,24 @@ class Report(models.Model):
 
     class Meta:
         indexes = [
-            models.Index(fields=["station_id","source","information","resolved","text"]),
-            models.Index(fields=["resolved", "source"]),
-            models.Index(fields=['-start_time', '-id'], name='idx_start_time_id'),
-            models.Index(fields=['station_id'], name='idx_station_id'),
             models.Index(
-                fields=['-start_time', '-id', 'information', 'station_id', 'text', 'end_time', 'resolved', 'source'],
-                name='idx_covering'),
+                fields=["station_id", "source", "information", "resolved", "text"]
+            ),
+            models.Index(fields=["resolved", "source"]),
+            models.Index(fields=["-start_time", "-id"], name="idx_start_time_id"),
+            models.Index(fields=["station_id"], name="idx_station_id"),
+            models.Index(
+                fields=[
+                    "-start_time",
+                    "-id",
+                    "information",
+                    "station_id",
+                    "text",
+                    "end_time",
+                    "resolved",
+                    "source",
+                ],
+                name="idx_covering",
+            ),
         ]
-        ordering = ['-start_time', '-id']
+        ordering = ["-start_time", "-id"]
