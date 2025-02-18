@@ -3,8 +3,10 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.management import call_command
+from django.db.models import CharField
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
-from django.db.models.functions import Coalesce, Now
+from django.db.models.functions import Coalesce
+from django.db.models.functions import Now
 from django.http import HttpResponse, HttpResponseNotFound
 from django.http import JsonResponse
 from django.shortcuts import render
@@ -53,9 +55,12 @@ def api_incidents(request):
         Incident.objects.filter(resolved=False, information=False)
         .order_by("-start_time", "station__parent_station")
         .annotate(
-            # Create a new database-level alias:
             station_name=F("station__parent_station__name"),
-            station_naptan=F("station__parent_station__naptan_id"),
+            station_naptan=Coalesce(
+                "station__parent_station__naptan_id",
+                "station__parent_station__hub_naptan_id",
+                output_field=CharField(),
+            ),
         )
     )
 
@@ -67,7 +72,11 @@ def api_incidents(request):
         .annotate(
             # Create a new database-level alias:
             station_name=F("station__parent_station__name"),
-            station_naptan=F("station__parent_station__naptan_id"),
+            station_naptan=Coalesce(
+                "station__parent_station__naptan_id",
+                "station__parent_station__hub_naptan_id",
+                output_field=CharField(),
+            ),
         )
     )
 
@@ -77,7 +86,11 @@ def api_incidents(request):
         .annotate(
             # Create a new database-level alias:
             station_name=F("station__parent_station__name"),
-            station_naptan=F("station__parent_station__naptan_id"),
+            station_naptan=Coalesce(
+                "station__parent_station__naptan_id",
+                "station__parent_station__hub_naptan_id",
+                output_field=CharField(),
+            ),
         )
     )
 
