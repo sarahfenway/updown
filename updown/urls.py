@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.urls import path
 
 from incidents.views import detail, UpdateIncidentsView, alexa, stp, stats
-from pages.views import FAQPageView, PressPageView, PrivacyPageView
+from pages.views import FAQPageView, PrivacyPageView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
