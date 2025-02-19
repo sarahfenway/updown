@@ -8,13 +8,15 @@ from incidents.views import (
     stp,
     stats,
     api_incidents,
+    api_stations,
 )
 from pages.views import FAQPageView, PrivacyPageView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("", detail, name="home"),
-    path("api/incidents/", api_incidents, name="home"),
+    path("api/incidents/", api_incidents, name="incidents"),
+    path("api/stations/", api_stations, name="stations"),
     path("problems.txt", alexa),
     path("functions/update_incidents", UpdateIncidentsView.as_view()),
     path("faq/", FAQPageView.as_view(), name="faq"),

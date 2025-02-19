@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.management import call_command
-from django.db.models import CharField
+from django.db.models import CharField, Q
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Now
@@ -138,6 +138,38 @@ def api_incidents(request):
         "resolved": resolved_data,
         "information": information_data,
         "last_updated": datetime.now().isoformat(),
+    }
+
+    return JsonResponse(data)
+
+
+def api_stations(request):
+    stations_qs = (
+        Station.objects.filter(
+            Q(tube=True) | Q(dlr=True) | Q(overground=True) | Q(crossrail=True)
+        )
+        .annotate(
+            station_name=F("station__parent_station__name"),
+            station_naptan=Coalesce(
+                "station__parent_station__naptan_id",
+                "station__parent_station__hub_naptan_id",
+                output_field=CharField(),
+            ),
+        )
+        .exclude(Q(station_name__isnull=True) | Q(station_naptan__isnull=True))
+        .order_by("station_name")
+        .distinct()
+    )
+
+    stations = list(
+        stations_qs.values(
+            "station_name",
+            "station_naptan",
+        )
+    )
+
+    data = {
+        "stations": stations,
     }
 
     return JsonResponse(data)
