@@ -40,6 +40,11 @@ def check():
                         first_colon = issue["description"].find(":")
 
                         station = find_station_from_naptan(issue["atcoCode"])
+
+                        if not station:
+                            # We don't have this station in our database
+                            continue
+
                         status_details = issue["description"][first_colon + 1 :].strip()
                         status_details = status_details.replace(
                             "No Step Free Access - ", ""
