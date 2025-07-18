@@ -5,7 +5,7 @@ from django.utils import timezone
 
 from incidents.models import Report, Incident
 from incidents.sources.tflapiv1 import check as check_tflv1
-from incidents.sources.tflapiv2 import check as check_tflv2
+# from incidents.sources.tflapiv2 import check as check_tflv2
 from incidents.utils import send_tweet, update_last_updated, send_bluesky
 
 
@@ -94,7 +94,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         try:
             check_tflv1()
-            check_tflv2()
+#             check_tflv2()
             consolidate_incidents()
             update_last_updated()
         except Exception as e:
