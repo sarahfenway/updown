@@ -88,6 +88,7 @@ def parse_date(text):
 
 def find_dates(text):
     start_and_end = re.search("From (.*?) until (.*?)(,|there|due)", text, flags=re.I)
+    multi_date = re.search(r"(\w+ \d+), .*? and (\w+ \d+ \w+)", text, flags=re.I)
 
     start_date = None
     end_date = None
@@ -96,11 +97,15 @@ def find_dates(text):
         start_date = parse_date(start_and_end.groups()[0])
         end_date = parse_date(start_and_end.groups()[1])
 
-        while start_date and end_date and end_date < start_date:
-            start_date = start_date.replace(year=start_date.year - 1)
+    elif multi_date:
+        start_date = parse_date(multi_date.groups()[0])
+        end_date = parse_date(multi_date.groups()[1])
 
-        if start_date and end_date and start_date.year == 2:
-            start_date = start_date.replace(year=end_date.year, month=end_date.month)
+    while start_date and end_date and end_date < start_date:
+        start_date = start_date.replace(year=start_date.year - 1)
+
+    if start_date and end_date and start_date.year == 2:
+        start_date = start_date.replace(year=end_date.year, month=end_date.month)
 
     return start_date, end_date
 
