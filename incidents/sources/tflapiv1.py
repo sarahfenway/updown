@@ -68,7 +68,7 @@ def check():
                         if created:
                             if issue["appearance"] == "PlannedWork":
                                 start_date, end_date = find_dates(status_details)
-                                report.start_time = start_date
+                                report.start_time = start_date or timezone.now()
                                 report.end_time = end_date
                                 if " changes " not in status_details:
                                     if (start_date and start_date < timezone.now()) or (
