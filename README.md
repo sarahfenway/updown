@@ -6,7 +6,7 @@
 
 Applies to all PNG and ICO graphics files, and all contents of the `templates` directory.
 
-Copyright © 2013-2023 Kirk Northrop and Christiane Link. All rights reserved.
+Copyright © 2013-2026 Sarah Fenway and Christiane Link. All rights reserved.
 
 These files must not be re-used without express written permission from Up Down London, who are contactable via <https://www.updownlondon.com/>.
 
@@ -14,7 +14,7 @@ These files must not be re-used without express written permission from Up Down 
 
 Applies to all Up Down project files that are not included modules or part of the Up Down London assets license.
 
-Copyright © 2013-2023 Kirk Northrop
+Copyright © 2013-2026 Sarah Fenway
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published
