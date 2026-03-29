@@ -6,6 +6,7 @@ from incidents.models import Incident, Report
 class ReportInline(admin.TabularInline):
     model = Incident.reports.through
     raw_id_fields = ["report"]
+    extra = 0
 
 
 @admin.register(Incident)
@@ -22,6 +23,9 @@ class IncidentAdmin(admin.ModelAdmin):
     )
     ordering = ("-start_time",)
     raw_id_fields = ["station"]
+    list_select_related = ["station", "station__parent_station"]
+    show_full_result_count = False
+    list_per_page = 50
 
     inlines = [
         ReportInline,
@@ -42,6 +46,9 @@ class ReportAdmin(admin.ModelAdmin):
     )
     ordering = ("-start_time",)
     raw_id_fields = ["station"]
+    list_select_related = ["station", "station__parent_station"]
+    show_full_result_count = False
+    list_per_page = 50
 
 
 admin.site.site_header = "Up Down London Administration"

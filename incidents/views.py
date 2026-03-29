@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.management import call_command
-from django.db.models import CharField, Q
+from django.db.models import CharField, Prefetch, Q
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Now
@@ -16,7 +16,7 @@ from django.views import View
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_exempt
 
-from incidents.models import Incident
+from incidents.models import Incident, Report
 from incidents.utils import get_last_updated
 from stations.models import Station
 
@@ -45,19 +45,51 @@ def _duration_percentage(part, whole):
     return round((part.total_seconds() / whole.total_seconds()) * 100, 2)
 
 
+def _incident_queryset():
+    report_queryset = Report.objects.only("id", "source", "end_time").order_by("id")
+
+    return Incident.objects.select_related(
+        "station", "station__parent_station"
+    ).prefetch_related(
+        Prefetch("reports", queryset=report_queryset, to_attr="prefetched_reports")
+    )
+
+
+def _prepare_incidents(queryset):
+    incidents = list(queryset)
+
+    for incident in incidents:
+        reports = getattr(incident, "prefetched_reports", [])
+        incident.reports_count = len(reports)
+        incident.is_single_user_report = (
+            incident.reports_count == 1 and reports[0].source == Report.SOURCE_USER
+        )
+        incident.single_user_report_end_time = (
+            reports[0].end_time if incident.is_single_user_report else None
+        )
+
+    return incidents
+
+
 @never_cache
 def detail(request):
     if request.get_host().endswith("isstpthameslinkliftbroken.com"):
         return stp(request)
 
-    issues = Incident.objects.filter(resolved=False, information=False).order_by(
-        "-start_time", "station__parent_station"
+    issues = _prepare_incidents(
+        _incident_queryset()
+        .filter(resolved=False, information=False)
+        .order_by("-start_time", "station__parent_station")
     )
-    resolved = Incident.objects.filter(
-        resolved=True, end_time__gte=timezone.now() - timedelta(hours=12)
-    ).order_by("-start_time", "station__parent_station")
-    information = Incident.objects.filter(resolved=False, information=True).order_by(
-        "-start_time", "station__parent_station"
+    resolved = _prepare_incidents(
+        _incident_queryset()
+        .filter(resolved=True, end_time__gte=timezone.now() - timedelta(hours=12))
+        .order_by("-start_time", "station__parent_station")
+    )
+    information = _prepare_incidents(
+        _incident_queryset()
+        .filter(resolved=False, information=True)
+        .order_by("-start_time", "station__parent_station")
     )
 
     return render(
@@ -188,6 +220,7 @@ def api_stations(request):
         Station.objects.filter(
             Q(tube=True) | Q(dlr=True) | Q(overground=True) | Q(crossrail=True)
         )
+        .filter(Q(parent_station=F("pk")) | Q(parent_station__isnull=True))
         .annotate(
             station_name=Coalesce(
                 "parent_station__name",
@@ -210,7 +243,7 @@ def api_stations(request):
         stations_qs.values(
             "station_name",
             "station_naptan",
-        ).distinct()
+        )
     )
 
     data = {
@@ -221,8 +254,16 @@ def api_stations(request):
 
 
 def stp(request):
-    stp = Station.objects.filter(hub_naptan_id="HUBKGX").first().parent_station
-    issues = Incident.objects.filter(resolved=False, information=False, station=stp)
+    station = (
+        Station.objects.select_related("parent_station")
+        .only("id", "parent_station_id")
+        .filter(hub_naptan_id="HUBKGX")
+        .first()
+    )
+    stp = station.parent_station if station else None
+    issues = _prepare_incidents(
+        _incident_queryset().filter(resolved=False, information=False, station=stp)
+    )
 
     yes_or_no = False
 

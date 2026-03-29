@@ -66,3 +66,10 @@ class Station(models.Model):
 
     def __str__(self):
         return self.name
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["name"], name="station_name_idx"),
+            models.Index(fields=["naptan_id"], name="station_naptan_idx"),
+            models.Index(fields=["hub_naptan_id"], name="station_hub_naptan_idx"),
+        ]

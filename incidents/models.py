@@ -12,7 +12,31 @@ class Incident(models.Model):
     reports = models.ManyToManyField("incidents.Report")
 
     def __str__(self):
-        return f"{self.station.name} - Resolved: {self.resolved} - {self.reports.count()} reports"
+        if hasattr(self, "reports_count"):
+            reports_count = self.reports_count
+        elif hasattr(self, "prefetched_reports"):
+            reports_count = len(self.prefetched_reports)
+        else:
+            reports_count = self.reports.count()
+
+        return (
+            f"{self.station.name} - Resolved: {self.resolved} - "
+            f"{reports_count} reports"
+        )
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["resolved", "information", "-start_time", "-id"],
+                name="incident_status_idx",
+            ),
+            models.Index(fields=["end_time"], name="incident_end_time_idx"),
+            models.Index(
+                fields=["station_id", "resolved"],
+                name="incident_station_resolved_idx",
+            ),
+        ]
+        ordering = ["-start_time", "-id"]
 
 
 class Report(models.Model):

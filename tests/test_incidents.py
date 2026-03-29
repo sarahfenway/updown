@@ -7,7 +7,9 @@ from io import StringIO
 from unittest.mock import MagicMock, patch
 
 from django.core.management import CommandError, call_command
+from django.db import connection
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from incidents.management.commands.update_incidents import consolidate_incidents
@@ -545,6 +547,36 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(list(response.context["resolved"]), [resolved])
         self.assertEqual(list(response.context["information"]), [information])
         self.assertEqual(response.context["last_updated"], "09:15 26 Mar")
+
+    def test_detail_avoids_n_plus_one_queries_for_reports(self):
+        now = timezone.now()
+        stations = [
+            self.create_parent_station("Bank"),
+            self.create_parent_station("Waterloo"),
+            self.create_parent_station("Victoria"),
+        ]
+
+        for index, station in enumerate(stations):
+            issue = self.create_incident(
+                station,
+                text=f"Active outage {index}",
+                resolved=False,
+                start_time=now - timedelta(hours=index + 1),
+            )
+            issue.reports.add(
+                self.create_report(
+                    station,
+                    source=Report.SOURCE_USER,
+                    end_time=now + timedelta(hours=1),
+                )
+            )
+
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLessEqual(len(queries), 8)
 
     def test_detail_switches_to_stp_view_for_special_host(self):
         stp_station = self.create_parent_station(
