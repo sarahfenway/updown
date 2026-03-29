@@ -26,6 +26,9 @@ def check():
                 try:
                     station = find_station_from_naptan(issue["stationUniqueId"])
 
+                    if not station:
+                        continue
+
                     first_colon = issue["message"].find(":")
                     status_details = issue["message"][first_colon + 1 :].strip()
                     status_details = status_details.replace(

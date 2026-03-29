@@ -21,9 +21,33 @@ from incidents.utils import get_last_updated
 from stations.models import Station
 
 
+def _format_duration(duration):
+    if duration is None:
+        return "0:0:0:0"
+
+    return (
+        f"{duration.days}:{duration.seconds // 3600}:"
+        f"{(duration.seconds % 3600) // 60}:{duration.seconds % 60}"
+    )
+
+
+def _percentage(part, whole):
+    if not part or not whole:
+        return 0
+
+    return round((part / whole) * 100, 2)
+
+
+def _duration_percentage(part, whole):
+    if not part or not whole:
+        return 0
+
+    return round((part.total_seconds() / whole.total_seconds()) * 100, 2)
+
+
 @never_cache
 def detail(request):
-    if request.headers["host"].endswith("isstpthameslinkliftbroken.com"):
+    if request.get_host().endswith("isstpthameslinkliftbroken.com"):
         return stp(request)
 
     issues = Incident.objects.filter(resolved=False, information=False).order_by(
@@ -55,10 +79,16 @@ def api_incidents(request):
         Incident.objects.filter(resolved=False, information=False)
         .order_by("-start_time", "station__parent_station")
         .annotate(
-            station_name=F("station__parent_station__name"),
+            station_name=Coalesce(
+                "station__parent_station__name",
+                "station__name",
+                output_field=CharField(),
+            ),
             station_naptan=Coalesce(
                 "station__parent_station__naptan_id",
                 "station__parent_station__hub_naptan_id",
+                "station__naptan_id",
+                "station__hub_naptan_id",
                 output_field=CharField(),
             ),
         )
@@ -70,11 +100,16 @@ def api_incidents(request):
         )
         .order_by("-start_time", "station__parent_station")
         .annotate(
-            # Create a new database-level alias:
-            station_name=F("station__parent_station__name"),
+            station_name=Coalesce(
+                "station__parent_station__name",
+                "station__name",
+                output_field=CharField(),
+            ),
             station_naptan=Coalesce(
                 "station__parent_station__naptan_id",
                 "station__parent_station__hub_naptan_id",
+                "station__naptan_id",
+                "station__hub_naptan_id",
                 output_field=CharField(),
             ),
         )
@@ -84,11 +119,16 @@ def api_incidents(request):
         Incident.objects.filter(resolved=False, information=True)
         .order_by("-start_time", "station__parent_station")
         .annotate(
-            # Create a new database-level alias:
-            station_name=F("station__parent_station__name"),
+            station_name=Coalesce(
+                "station__parent_station__name",
+                "station__name",
+                output_field=CharField(),
+            ),
             station_naptan=Coalesce(
                 "station__parent_station__naptan_id",
                 "station__parent_station__hub_naptan_id",
+                "station__naptan_id",
+                "station__hub_naptan_id",
                 output_field=CharField(),
             ),
         )
@@ -149,23 +189,28 @@ def api_stations(request):
             Q(tube=True) | Q(dlr=True) | Q(overground=True) | Q(crossrail=True)
         )
         .annotate(
-            station_name=F("station__parent_station__name"),
+            station_name=Coalesce(
+                "parent_station__name",
+                "name",
+                output_field=CharField(),
+            ),
             station_naptan=Coalesce(
-                "station__parent_station__naptan_id",
-                "station__parent_station__hub_naptan_id",
+                "parent_station__naptan_id",
+                "parent_station__hub_naptan_id",
+                "naptan_id",
+                "hub_naptan_id",
                 output_field=CharField(),
             ),
         )
         .exclude(Q(station_name__isnull=True) | Q(station_naptan__isnull=True))
         .order_by("station_name")
-        .distinct()
     )
 
     stations = list(
         stations_qs.values(
             "station_name",
             "station_naptan",
-        )
+        ).distinct()
     )
 
     data = {
@@ -200,7 +245,7 @@ def stp(request):
 
 
 def stats(request):
-    thirty = datetime.now() - timedelta(days=30)
+    thirty = timezone.now() - timedelta(days=30)
     qs = Incident.objects.filter(end_time__gt=thirty)
     total_count = qs.count()
     total_delays = qs.annotate(
@@ -238,39 +283,28 @@ def stats(request):
         "stats.html",
         {
             "total_count": total_count,
-            "total_delays": f"{total_delays.days}:{total_delays.seconds // 3600}:{(total_delays.seconds % 3600) // 60}:{(total_delays.seconds % 60)}",
+            "total_delays": _format_duration(total_delays),
             "station_staff_count": station_staff_count,
-            "station_staff_count_percentage": round(
-                (station_staff_count / total_count) * 100, 2
+            "station_staff_count_percentage": _percentage(
+                station_staff_count, total_count
             ),
-            "station_staff_delays": f"{station_staff_delays.days}:{station_staff_delays.seconds // 3600}:{(station_staff_delays.seconds % 3600) // 60}:{(station_staff_delays.seconds % 60)}",
-            "station_staff_delays_percentage": round(
-                (station_staff_delays.total_seconds() / total_delays.total_seconds())
-                * 100,
-                2,
+            "station_staff_delays": _format_duration(station_staff_delays),
+            "station_staff_delays_percentage": _duration_percentage(
+                station_staff_delays, total_delays
             ),
             "faulty_lift_count": faulty_lift_count,
-            "faulty_lift_count_percentage": round(
-                (faulty_lift_count / total_count) * 100, 2
-            ),
-            "faulty_lift_delays": f"{faulty_lift_delays.days}:{faulty_lift_delays.seconds // 3600}:{(faulty_lift_delays.seconds % 3600) // 60}:{(faulty_lift_delays.seconds % 60)}",
-            "faulty_lift_delays_percentage": round(
-                (faulty_lift_delays.total_seconds() / total_delays.total_seconds())
-                * 100,
-                2,
+            "faulty_lift_count_percentage": _percentage(faulty_lift_count, total_count),
+            "faulty_lift_delays": _format_duration(faulty_lift_delays),
+            "faulty_lift_delays_percentage": _duration_percentage(
+                faulty_lift_delays, total_delays
             ),
             "planned_maintenance_count": planned_maintenance_count,
-            "planned_maintenance_count_percentage": round(
-                (planned_maintenance_count / total_count) * 100, 2
+            "planned_maintenance_count_percentage": _percentage(
+                planned_maintenance_count, total_count
             ),
-            "planned_maintenance_delays": f"{planned_maintenance_delays.days}:{planned_maintenance_delays.seconds // 3600}:{(planned_maintenance_delays.seconds % 3600) // 60}:{(planned_maintenance_delays.seconds % 60)}",
-            "planned_maintenance_delays_percentage": round(
-                (
-                    planned_maintenance_delays.total_seconds()
-                    / total_delays.total_seconds()
-                )
-                * 100,
-                2,
+            "planned_maintenance_delays": _format_duration(planned_maintenance_delays),
+            "planned_maintenance_delays_percentage": _duration_percentage(
+                planned_maintenance_delays, total_delays
             ),
             "last_updated": get_last_updated(),
         },

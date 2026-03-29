@@ -10,3 +10,4 @@ filelogs
 .deployed
 packages/updown/update_incidents/.env
 last_updated
+.venv
