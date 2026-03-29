@@ -1,4 +1,3 @@
-from django.contrib.postgres.fields import ArrayField
 from django.db import models
 
 
@@ -24,7 +23,7 @@ class Station(models.Model):
     )
 
     name = models.CharField(max_length=200)
-    alternate_names = ArrayField(models.CharField(max_length=128), null=True)
+    alternate_names = models.JSONField(null=True)
     naptan_id = models.CharField(
         max_length=32, null=True, blank=True, verbose_name="NaPTAN ID"
     )

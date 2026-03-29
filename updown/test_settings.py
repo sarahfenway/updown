@@ -1,7 +1,5 @@
 from .settings import *  # noqa: F401,F403
 
-from django.contrib.postgres.fields import ArrayField
-
 
 SECRET_KEY = SECRET_KEY or "test-secret-key"
 DEBUG = True
@@ -25,7 +23,3 @@ PASSWORD_HASHERS = [
 ]
 
 STATICFILES_DIRS = [f"{BASE_DIR}/static"]
-
-
-ArrayField.db_type = lambda self, connection: "text"
-ArrayField.get_placeholder = lambda self, value, compiler, connection: "%s"

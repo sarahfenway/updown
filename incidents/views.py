@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.management import call_command
-from django.db.models import CharField, Prefetch, Q
+from django.db.models import CharField, Count, Prefetch, Q
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Now
@@ -287,37 +287,50 @@ def stp(request):
 
 def stats(request):
     thirty = timezone.now() - timedelta(days=30)
-    qs = Incident.objects.filter(end_time__gt=thirty)
-    total_count = qs.count()
-    total_delays = qs.annotate(
-        active_duration=ExpressionWrapper(
-            Coalesce("end_time", Now()) - F("start_time"), output_field=DurationField()
-        )
-    ).aggregate(total=Sum("active_duration"))["total"]
+    station_staff_filter = Q(text__regex=r"^.*unavailability of (?:station )?staff.*$")
+    faulty_lift_filter = Q(text__regex="faulty lift")
+    planned_maintenance_filter = Q(text__regex="planned maintenance")
 
-    station_staff = qs.filter(text__regex=r"^.*unavailability of (?:station )?staff.*$")
-    station_staff_count = station_staff.count()
-    station_staff_delays = station_staff.annotate(
-        active_duration=ExpressionWrapper(
-            Coalesce("end_time", Now()) - F("start_time"), output_field=DurationField()
+    stats_data = (
+        Incident.objects.filter(end_time__gt=thirty)
+        .annotate(
+            active_duration=ExpressionWrapper(
+                Coalesce("end_time", Now()) - F("start_time"),
+                output_field=DurationField(),
+            )
         )
-    ).aggregate(total=Sum("active_duration"))["total"]
+        .aggregate(
+            total_count=Count("id"),
+            total_delays=Sum("active_duration"),
+            station_staff_count=Count("id", filter=station_staff_filter),
+            station_staff_delays=Sum(
+                "active_duration",
+                filter=station_staff_filter,
+            ),
+            faulty_lift_count=Count("id", filter=faulty_lift_filter),
+            faulty_lift_delays=Sum(
+                "active_duration",
+                filter=faulty_lift_filter,
+            ),
+            planned_maintenance_count=Count(
+                "id",
+                filter=planned_maintenance_filter,
+            ),
+            planned_maintenance_delays=Sum(
+                "active_duration",
+                filter=planned_maintenance_filter,
+            ),
+        )
+    )
 
-    faulty_lift = qs.filter(text__regex="faulty lift")
-    faulty_lift_count = faulty_lift.count()
-    faulty_lift_delays = faulty_lift.annotate(
-        active_duration=ExpressionWrapper(
-            Coalesce("end_time", Now()) - F("start_time"), output_field=DurationField()
-        )
-    ).aggregate(total=Sum("active_duration"))["total"]
-
-    planned_maintenance = qs.filter(text__regex="planned maintenance")
-    planned_maintenance_count = planned_maintenance.count()
-    planned_maintenance_delays = planned_maintenance.annotate(
-        active_duration=ExpressionWrapper(
-            Coalesce("end_time", Now()) - F("start_time"), output_field=DurationField()
-        )
-    ).aggregate(total=Sum("active_duration"))["total"]
+    total_count = stats_data["total_count"]
+    total_delays = stats_data["total_delays"]
+    station_staff_count = stats_data["station_staff_count"]
+    station_staff_delays = stats_data["station_staff_delays"]
+    faulty_lift_count = stats_data["faulty_lift_count"]
+    faulty_lift_delays = stats_data["faulty_lift_delays"]
+    planned_maintenance_count = stats_data["planned_maintenance_count"]
+    planned_maintenance_delays = stats_data["planned_maintenance_delays"]
 
     return render(
         request,

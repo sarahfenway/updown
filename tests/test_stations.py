@@ -32,6 +32,22 @@ class StationUtilityTests(SimpleTestCase):
 
 
 class StationQueryTests(TestCase):
+    def test_alternate_names_round_trip_as_plain_list(self):
+        station = Station.objects.create(
+            name="Baker Street",
+            notes="",
+            alternate_names=["Baker St", "Baker Street Underground"],
+            tube=True,
+            national_rail=False,
+        )
+
+        station.refresh_from_db()
+
+        self.assertEqual(
+            station.alternate_names,
+            ["Baker St", "Baker Street Underground"],
+        )
+
     def test_find_station_and_find_station_from_naptan(self):
         parent = Station.objects.create(
             name="Bank",

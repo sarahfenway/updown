@@ -748,6 +748,38 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(response.context["planned_maintenance_delays_percentage"], 0)
         self.assertEqual(response.context["last_updated"], "09:15 26 Mar")
 
+    def test_stats_uses_small_constant_number_of_queries(self):
+        parent = self.create_parent_station("Green Park")
+        now = timezone.now()
+        self.create_incident(
+            parent,
+            text="unavailability of station staff",
+            start_time=now - timedelta(hours=5),
+            end_time=now - timedelta(hours=3),
+            resolved=True,
+        )
+        self.create_incident(
+            parent,
+            text="faulty lift",
+            start_time=now - timedelta(hours=3),
+            end_time=now - timedelta(hours=2),
+            resolved=True,
+        )
+        self.create_incident(
+            parent,
+            text="planned maintenance",
+            start_time=now - timedelta(hours=2),
+            end_time=now - timedelta(hours=1, minutes=30),
+            resolved=True,
+        )
+
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get("/stats/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLessEqual(len(queries), 2)
+
     def test_faq_and_privacy_pages_render(self):
         faq_response = self.client.get("/faq/")
         privacy_response = self.client.get("/privacy/")
