@@ -515,6 +515,11 @@ def api_training_data(request):
                 "has_faulty_lift": "faulty lift" in text,
                 "has_planned_maintenance": "planned maintenance" in text,
                 "has_staff_issue": "staff" in text,
+                "is_planned_work": (
+                    "planned" in text
+                    or "until " in text
+                    or incident.information
+                ),
                 "tube": bool(station.tube),
                 "dlr": bool(station.dlr),
                 "national_rail": bool(station.national_rail),

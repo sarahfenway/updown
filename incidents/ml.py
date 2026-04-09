@@ -56,6 +56,11 @@ def predict_duration(incident):
         "has_faulty_lift": int("faulty lift" in text),
         "has_planned_maintenance": int("planned maintenance" in text),
         "has_staff_issue": int("staff" in text),
+        "is_planned_work": int(
+            "planned" in text
+            or "until " in text
+            or incident.information
+        ),
         "tube": int(bool(station.tube)),
         "dlr": int(bool(station.dlr)),
         "national_rail": int(bool(station.national_rail)),
@@ -81,7 +86,10 @@ def predict_duration(incident):
         tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index)
         df = pd.concat([df, tfidf_df], axis=1)
 
-    predicted_minutes = model.predict(df)[0]
+    import numpy as np
+
+    # Model predicts log1p(minutes), so inverse transform
+    predicted_minutes = np.expm1(model.predict(df)[0])
 
     # Clamp to reasonable range: 5 minutes to 30 days
     predicted_minutes = max(5, min(predicted_minutes, 60 * 24 * 30))

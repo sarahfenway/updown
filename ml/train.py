@@ -36,6 +36,7 @@ FEATURE_COLUMNS = [
     "has_faulty_lift",
     "has_planned_maintenance",
     "has_staff_issue",
+    "is_planned_work",
     "tube",
     "dlr",
     "national_rail",
@@ -71,6 +72,7 @@ def prepare_features(df):
         "has_faulty_lift",
         "has_planned_maintenance",
         "has_staff_issue",
+        "is_planned_work",
         "tube",
         "dlr",
         "national_rail",
@@ -110,7 +112,9 @@ def train_model(df, feature_cols):
     df = df.sort_values("start_time").reset_index(drop=True)
 
     X = df[feature_cols]
-    y = df[TARGET_COLUMN]
+    # Log-transform target so the model optimises for relative error,
+    # not absolute minutes — stops long planned outages dominating training
+    y_log = np.log1p(df[TARGET_COLUMN])
 
     model = GradientBoostingRegressor(
         n_estimators=200,
@@ -127,13 +131,17 @@ def train_model(df, feature_cols):
 
     for train_idx, test_idx in tscv.split(X):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        y_train, y_test = y_log.iloc[train_idx], y_log.iloc[test_idx]
 
         model.fit(X_train, y_train)
-        preds = model.predict(X_test)
+        preds_log = model.predict(X_test)
 
-        mae_scores.append(mean_absolute_error(y_test, preds))
-        median_ae_scores.append(median_absolute_error(y_test, preds))
+        # Convert back to minutes for reporting
+        preds = np.expm1(preds_log)
+        y_actual = np.expm1(y_test)
+
+        mae_scores.append(mean_absolute_error(y_actual, preds))
+        median_ae_scores.append(median_absolute_error(y_actual, preds))
 
     print(f"\nCross-validation results ({tscv.n_splits} splits):")
     print(f"  Mean Absolute Error:   {sum(mae_scores)/len(mae_scores):.1f} minutes")
@@ -143,7 +151,7 @@ def train_model(df, feature_cols):
     )
 
     # Train final model on all data
-    model.fit(X, y)
+    model.fit(X, y_log)
 
     # Feature importance
     print("\nFeature importance:")

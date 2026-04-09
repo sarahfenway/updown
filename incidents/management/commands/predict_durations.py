@@ -17,11 +17,18 @@ class Command(BaseCommand):
             action="store_true",
             help="Re-predict even if an incident already has an estimate",
         )
+        parser.add_argument(
+            "--backfill",
+            type=int,
+            metavar="DAYS",
+            help="Also predict for incidents resolved in the last N days",
+        )
 
     def handle(self, *args, **options):
+        backfill_days = options["backfill"] or 1
         incidents = Incident.objects.filter(
             Q(resolved=False)
-            | Q(resolved=True, end_time__gte=timezone.now() - timedelta(days=1))
+            | Q(resolved=True, end_time__gte=timezone.now() - timedelta(days=backfill_days))
         )
         if not options["overwrite"]:
             incidents = incidents.filter(estimated_duration__isnull=True)
