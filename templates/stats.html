@@ -56,30 +56,25 @@
                 <p>Median absolute error: {{ prediction_median_abs_error }}</p>
 
                 {% if confidence_chart %}
-                <h3>Confidence vs Accuracy</h3>
-                <p><i>Does higher confidence actually mean better predictions?</i></p>
+                <h3>Confidence vs Median Error</h3>
+                <p><i>Shorter bars = better predictions. Does higher confidence mean smaller errors?</i></p>
                 <svg viewBox="0 0 500 220" style="width:100%;max-width:500px;font-family:Montserrat,sans-serif;font-size:11px">
                     <!-- Y axis -->
-                    <text x="0" y="10" fill="#333">Accuracy</text>
+                    <text x="0" y="10" fill="#333">Median error</text>
                     <line x1="60" y1="20" x2="490" y2="20" stroke="#eee"/>
-                    <text x="45" y="24" text-anchor="end" fill="#999">100%</text>
-                    <line x1="60" y1="60" x2="490" y2="60" stroke="#eee"/>
-                    <text x="45" y="64" text-anchor="end" fill="#999">75%</text>
+                    <text x="45" y="24" text-anchor="end" fill="#999">{{ chart_max_hours }}h</text>
                     <line x1="60" y1="100" x2="490" y2="100" stroke="#eee"/>
-                    <text x="45" y="104" text-anchor="end" fill="#999">50%</text>
-                    <line x1="60" y1="140" x2="490" y2="140" stroke="#eee"/>
-                    <text x="45" y="144" text-anchor="end" fill="#999">25%</text>
                     <line x1="60" y1="180" x2="490" y2="180" stroke="#ccc"/>
-                    <text x="45" y="184" text-anchor="end" fill="#999">0%</text>
+                    <text x="45" y="184" text-anchor="end" fill="#999">0h</text>
                     <!-- X axis label -->
                     <text x="275" y="210" text-anchor="middle" fill="#333">Confidence bucket</text>
                     <!-- Bars -->
                     {% for bucket in confidence_chart %}
-                        {% if bucket.accuracy != None %}
+                        {% if bucket.median_hours != None %}
                             <rect x="{{ bucket.x }}" y="{{ bucket.y }}"
                                   width="35" height="{{ bucket.h }}" rx="2"
-                                  fill="#5cb85c" opacity="0.8">
-                                <title>{{ bucket.label }}: {{ bucket.accuracy }}% accurate (n={{ bucket.count }})</title>
+                                  fill="#d9534f" opacity="0.8">
+                                <title>{{ bucket.label }}: {{ bucket.median_hours }}h median error (n={{ bucket.count }})</title>
                             </rect>
                         {% else %}
                             <rect x="{{ bucket.x }}" y="{{ bucket.y }}"

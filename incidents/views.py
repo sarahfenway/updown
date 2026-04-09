@@ -413,7 +413,7 @@ def _prediction_stats(since):
     abs_errors = []
     count = 0
     # Buckets for confidence vs accuracy chart
-    buckets = {}  # confidence_pct -> list of absolute percentage errors
+    buckets = {}  # confidence_pct -> list of absolute error in hours
 
     for inc in incidents:
         error = inc.actual_duration - inc.estimated_duration
@@ -424,13 +424,9 @@ def _prediction_stats(since):
         count += 1
 
         if inc.prediction_confidence is not None:
-            actual_mins = inc.actual_duration.total_seconds() / 60
-            predicted_mins = inc.estimated_duration.total_seconds() / 60
-            if actual_mins > 0:
-                pct_error = abs(predicted_mins - actual_mins) / actual_mins
-                # Bucket by confidence in 10% bands
-                bucket = min(9, int(inc.prediction_confidence * 10)) * 10
-                buckets.setdefault(bucket, []).append(pct_error)
+            abs_error_hours = abs_error.total_seconds() / 3600
+            bucket = min(9, int(inc.prediction_confidence * 10)) * 10
+            buckets.setdefault(bucket, []).append(abs_error_hours)
 
     abs_errors.sort()
     median_abs_error = abs_errors[len(abs_errors) // 2]
@@ -453,21 +449,27 @@ def _prediction_stats(since):
             return f"{hours}h {minutes}m"
         return f"{minutes}m"
 
-    # Build chart data: for each confidence bucket, median percentage error
+    # Build chart data: for each confidence bucket, median absolute error in hours
     chart_height = 160
-    chart_data = []
-    for i, bucket in enumerate(range(0, 100, 10)):
+    # Find max median error across buckets for scaling
+    medians = {}
+    for bucket in range(0, 100, 10):
         errors = buckets.get(bucket, [])
-        x = 60 + i * 43
         if errors:
             errors.sort()
-            median_pct = errors[len(errors) // 2]
-            accuracy = round(max(0, 1 - median_pct) * 100)
-            bar_h = round(accuracy / 100 * chart_height)
+            medians[bucket] = errors[len(errors) // 2]
+    max_hours = max(medians.values()) if medians else 1
+
+    chart_data = []
+    for i, bucket in enumerate(range(0, 100, 10)):
+        x = 60 + i * 43
+        if bucket in medians:
+            median_hrs = medians[bucket]
+            bar_h = round(median_hrs / max_hours * chart_height)
             chart_data.append({
                 "label": f"{bucket}-{bucket + 10}%",
-                "accuracy": accuracy,
-                "count": len(errors),
+                "median_hours": round(median_hrs, 1),
+                "count": len(buckets[bucket]),
                 "x": x,
                 "y": 20 + chart_height - bar_h,
                 "h": bar_h,
@@ -476,13 +478,14 @@ def _prediction_stats(since):
         else:
             chart_data.append({
                 "label": f"{bucket}-{bucket + 10}%",
-                "accuracy": None,
+                "median_hours": None,
                 "count": 0,
                 "x": x,
                 "y": 170,
                 "h": 10,
                 "text_x": x + 17,
             })
+    chart_max_hours = round(max_hours, 1)
 
     return {
         "prediction_count": count,
@@ -490,6 +493,7 @@ def _prediction_stats(since):
         "prediction_mean_abs_error": _fmt_duration(mean_abs_error),
         "prediction_median_abs_error": _fmt_duration(median_abs_error),
         "confidence_chart": chart_data,
+        "chart_max_hours": chart_max_hours,
     }
 
 
@@ -529,55 +533,71 @@ class UpdateIncidentsView(View):
 
 
 def api_training_data(request):
+    import json
+
     key = request.GET.get("key")
     if key != settings.FUNCTIONS_SECRET_KEY:
         return HttpResponseNotFound()
 
-    incidents = (
-        Incident.objects.filter(resolved=True, end_time__isnull=False)
-        .select_related("station")
-        .annotate(num_reports=Count("reports"))
-        .order_by("start_time")
-    )
+    base_qs = Incident.objects.filter(resolved=True, end_time__isnull=False)
 
-    # Pre-compute concurrent incidents with a sweep line (O(n log n))
-    # Build sorted event list: +1 at start_time, -1 at end_time
+    # Pre-compute concurrent incidents with a sweep line using lightweight query
     events = []
-    for inc in incidents.values_list("id", "start_time", "end_time"):
-        events.append((inc[1], 1, inc[0]))   # start
-        events.append((inc[2], -1, inc[0]))   # end
+    for inc_id, start, end in base_qs.values_list("id", "start_time", "end_time"):
+        events.append((start, 1, inc_id))
+        events.append((end, -1, inc_id))
     events.sort(key=lambda e: (e[0], e[1]))
 
-    concurrent_at = {}  # incident_id -> concurrent count at start
+    concurrent_at = {}
     active = 0
-    for timestamp, delta, inc_id in events:
+    for _, delta, inc_id in events:
         if delta == 1:
-            concurrent_at[inc_id] = active  # others already active
+            concurrent_at[inc_id] = active
             active += 1
         else:
             active -= 1
+    del events
 
-    last_incident_at_station = {}  # station_id -> most recent start_time
+    # Pre-compute report counts
+    report_counts = dict(
+        base_qs.annotate(n=Count("reports")).values_list("id", "n")
+    )
 
-    data = []
-    for incident in incidents.iterator():
-        duration = (incident.end_time - incident.start_time).total_seconds()
-        if duration <= 0:
-            continue
+    # Cache stations to avoid repeated lookups
+    station_cache = {
+        s.id: s for s in Station.objects.all()
+    }
 
-        station = incident.station
-        text = incident.text.lower()
+    last_incident_at_station = {}
 
-        # Days since last incident at this station
-        prev_time = last_incident_at_station.get(station.id)
-        if prev_time:
-            days_since_last = (incident.start_time - prev_time).total_seconds() / 86400
-        else:
-            days_since_last = -1  # no prior incident
-        last_incident_at_station[station.id] = incident.start_time
+    def generate():
+        yield '{"incidents":['
+        first = True
+        for incident in (
+            base_qs.order_by("start_time")
+            .only(
+                "id", "station_id", "information", "text",
+                "start_time", "end_time", "estimated_duration",
+            )
+            .iterator(chunk_size=500)
+        ):
+            duration = (incident.end_time - incident.start_time).total_seconds()
+            if duration <= 0:
+                continue
 
-        data.append(
-            {
+            station = station_cache.get(incident.station_id)
+            if station is None:
+                continue
+            text = incident.text.lower()
+
+            prev_time = last_incident_at_station.get(incident.station_id)
+            if prev_time:
+                days_since_last = (incident.start_time - prev_time).total_seconds() / 86400
+            else:
+                days_since_last = -1
+            last_incident_at_station[incident.station_id] = incident.start_time
+
+            row = {
                 "station_id": station.id,
                 "station_name": station.name,
                 "information": incident.information,
@@ -602,7 +622,7 @@ def api_training_data(request):
                 "crossrail": bool(station.crossrail),
                 "overground": bool(station.overground),
                 "access_via_lift": bool(station.access_via_lift),
-                "num_reports": incident.num_reports,
+                "num_reports": report_counts.get(incident.id, 0),
                 "days_since_last_incident": round(days_since_last, 2),
                 "concurrent_incidents": concurrent_at.get(incident.id, 0),
                 "estimated_duration_minutes": (
@@ -611,9 +631,16 @@ def api_training_data(request):
                     else None
                 ),
             }
-        )
 
-    return JsonResponse({"incidents": data})
+            if not first:
+                yield ","
+            first = False
+            yield json.dumps(row)
+        yield "]}"
+
+    from django.http import StreamingHttpResponse
+    response = StreamingHttpResponse(generate(), content_type="application/json")
+    return response
 
 
 @method_decorator(csrf_exempt, name="dispatch")
