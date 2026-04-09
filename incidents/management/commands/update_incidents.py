@@ -7,6 +7,7 @@ from incidents.models import Report, Incident
 from incidents.sources.tflapiv1 import check as check_tflv1
 # from incidents.sources.tflapiv2 import check as check_tflv2
 from incidents.utils import send_tweet, update_last_updated, send_bluesky
+from incidents.ml import predict_duration
 
 
 def consolidate_incidents():
@@ -34,6 +35,10 @@ def consolidate_incidents():
                 end_time=report.end_time,
                 resolved=report.resolved,
             )
+            try:
+                incident.estimated_duration = predict_duration(incident)
+            except Exception:
+                pass
             incident.save()
 
             tweet = f"{incident.station.name}: {incident.text}"

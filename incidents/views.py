@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 from datetime import timedelta
 
@@ -18,6 +19,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from incidents.models import Incident, Report
 from incidents.utils import get_last_updated
+from incidents.ml import predict_duration
 from stations.models import Station
 
 
@@ -398,3 +400,72 @@ class UpdateIncidentsView(View):
             call_command("update_incidents")
             return HttpResponse(status=204)
         return HttpResponseNotFound()
+
+
+def api_training_data(request):
+    key = request.GET.get("key")
+    if key != settings.FUNCTIONS_SECRET_KEY:
+        return HttpResponseNotFound()
+
+    incidents = (
+        Incident.objects.filter(resolved=True, end_time__isnull=False)
+        .select_related("station")
+        .order_by("-start_time")
+    )
+
+    data = []
+    for incident in incidents:
+        duration = (incident.end_time - incident.start_time).total_seconds()
+        if duration <= 0:
+            continue
+
+        station = incident.station
+        text = incident.text.lower()
+
+        data.append(
+            {
+                "station_id": station.id,
+                "station_name": station.name,
+                "information": incident.information,
+                "start_time": incident.start_time.isoformat(),
+                "end_time": incident.end_time.isoformat(),
+                "duration_minutes": duration / 60,
+                "hour_of_day": incident.start_time.hour,
+                "day_of_week": incident.start_time.weekday(),
+                "month": incident.start_time.month,
+                "text": incident.text,
+                "has_faulty_lift": "faulty lift" in text,
+                "has_planned_maintenance": "planned maintenance" in text,
+                "has_staff_issue": "staff" in text,
+                "tube": bool(station.tube),
+                "dlr": bool(station.dlr),
+                "national_rail": bool(station.national_rail),
+                "crossrail": bool(station.crossrail),
+                "overground": bool(station.overground),
+                "access_via_lift": bool(station.access_via_lift),
+            }
+        )
+
+    return JsonResponse({"incidents": data})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class UploadModelView(View):
+    def post(self, request, *args, **kwargs):
+        key = request.POST.get("key")
+        if key != settings.FUNCTIONS_SECRET_KEY:
+            return HttpResponseNotFound()
+
+        model_file = request.FILES.get("model")
+        if not model_file:
+            return JsonResponse({"error": "No model file provided"}, status=400)
+
+        model_path = os.path.join(settings.BASE_DIR, "ml_model.joblib")
+        with open(model_path, "wb") as f:
+            for chunk in model_file.chunks():
+                f.write(chunk)
+
+        # Clear the cached model so it's reloaded on next prediction
+        predict_duration.cache_clear()
+
+        return JsonResponse({"status": "ok"})
