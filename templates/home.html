@@ -80,7 +80,11 @@
                                 {% endif %}
                                 <i>
                                     {% if issue.end_time %}
-                                        {{ issue.end_time }}
+                                        {% if issue.duration_vs_expected %}
+                                            <span title="BETA: Lasted {{ issue.duration_vs_expected }}">{{ issue.end_time }}</span>
+                                        {% else %}
+                                            {{ issue.end_time }}
+                                        {% endif %}
                                     {% endif %}
                                 </i>
                             </p>

@@ -74,6 +74,22 @@ def _prepare_incidents(queryset):
         else:
             incident.expected_end_time = None
 
+        if incident.resolved and incident.end_time and incident.start_time and incident.estimated_duration:
+            actual = incident.end_time - incident.start_time
+            diff = actual - incident.estimated_duration
+            total_minutes = abs(int(diff.total_seconds())) // 60
+            hours, minutes = divmod(total_minutes, 60)
+            if hours:
+                duration_str = f"{hours}h {minutes}m"
+            else:
+                duration_str = f"{minutes}m"
+            if diff.total_seconds() > 0:
+                incident.duration_vs_expected = f"{duration_str} longer than expected"
+            else:
+                incident.duration_vs_expected = f"{duration_str} shorter than expected"
+        else:
+            incident.duration_vs_expected = None
+
     return incidents
 
 
