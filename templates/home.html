@@ -39,7 +39,12 @@
                                             This is a user report, which will be automatically closed at {{ issue.single_user_report_end_time|date:"H:i, d M" }} unless reported by TfL.
                                         {% endif %}
                                         {% if issue.start_time %}
-                                            <br>{{ issue.start_time }}
+                                            <br>
+                                            {% if issue.expected_end_time %}
+                                                <span title="BETA: Expected to last until {{ issue.expected_end_time|date:'H:i, d M' }}">{{ issue.start_time }}</span>
+                                            {% else %}
+                                                {{ issue.start_time }}
+                                            {% endif %}
                                         {% endif %}
                                     </i>
                                 </p>

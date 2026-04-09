@@ -10,6 +10,11 @@ class Incident(models.Model):
     end_time = models.DateTimeField(null=True, blank=True)
     resolved = models.BooleanField(default=False)
     reports = models.ManyToManyField("incidents.Report")
+    estimated_duration = models.DurationField(
+        null=True,
+        blank=True,
+        help_text="ML-predicted duration for this incident",
+    )
 
     def __str__(self):
         if hasattr(self, "reports_count"):
