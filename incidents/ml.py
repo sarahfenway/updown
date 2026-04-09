@@ -142,16 +142,14 @@ def predict_duration(incident):
     # Clamp to reasonable range: 5 minutes to 30 days
     predicted_minutes = max(5, min(predicted_minutes, 60 * 24 * 30))
 
-    # Compute confidence from quantile interval width
+    # Compute confidence from quantile interval ratio
     confidence = None
     if model_lower is not None and model_upper is not None:
-        lower = np.expm1(model_lower.predict(df)[0])
-        upper = np.expm1(model_upper.predict(df)[0])
-        if predicted_minutes > 0:
-            # Narrow interval relative to prediction = high confidence
-            spread = max(0, upper - lower)
-            confidence = max(0.05, min(0.95, 1 - spread / predicted_minutes))
-            confidence = round(confidence, 2)
+        lower = max(1, np.expm1(model_lower.predict(df)[0]))
+        upper = max(1, np.expm1(model_upper.predict(df)[0]))
+        # Ratio of lower/upper: close to 1 = tight interval = confident
+        confidence = max(0.05, min(0.95, lower / upper))
+        confidence = round(confidence, 2)
 
     return timedelta(minutes=predicted_minutes), confidence
 
