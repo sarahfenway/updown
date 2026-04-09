@@ -43,6 +43,8 @@ def predict_duration(incident):
     model_lower = data.get("model_lower")
     model_upper = data.get("model_upper")
 
+    from django.utils import timezone as tz
+
     from incidents.models import Incident
 
     station = incident.station
@@ -62,6 +64,38 @@ def predict_duration(incident):
     mean_dur = (station_stats["station_mean_duration"] or 0) / 60
     count = station_stats["station_incident_count"] or 0
 
+    # Number of reports on this incident
+    if hasattr(incident, "prefetched_reports"):
+        num_reports = len(incident.prefetched_reports)
+    elif incident.pk:
+        num_reports = incident.reports.count()
+    else:
+        num_reports = 1
+
+    # Days since last incident at this station
+    prev = (
+        Incident.objects.filter(
+            station=station, start_time__lt=incident.start_time
+        )
+        .order_by("-start_time")
+        .values_list("start_time", flat=True)
+        .first()
+    )
+    if prev:
+        days_since_last = (incident.start_time - prev).total_seconds() / 86400
+    else:
+        days_since_last = -1
+
+    # Concurrent incidents at start time
+    concurrent = Incident.objects.filter(
+        resolved=False, start_time__lte=incident.start_time
+    ).exclude(pk=incident.pk).count()
+    # Also count unresolved at prediction time if the incident is new
+    if concurrent == 0:
+        concurrent = Incident.objects.filter(resolved=False).exclude(
+            pk=incident.pk
+        ).count()
+
     features = {
         "station_id": station.id,
         "information": int(incident.information),
@@ -78,6 +112,9 @@ def predict_duration(incident):
         "crossrail": int(bool(station.crossrail)),
         "overground": int(bool(station.overground)),
         "access_via_lift": int(bool(station.access_via_lift)),
+        "num_reports": num_reports,
+        "days_since_last_incident": round(days_since_last, 2),
+        "concurrent_incidents": concurrent,
         "station_mean_duration": mean_dur,
         "station_median_duration": mean_dur,  # approximation at prediction time
         "station_incident_count": count,

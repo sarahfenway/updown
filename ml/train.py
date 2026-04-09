@@ -43,6 +43,9 @@ FEATURE_COLUMNS = [
     "crossrail",
     "overground",
     "access_via_lift",
+    "num_reports",
+    "days_since_last_incident",
+    "concurrent_incidents",
 ]
 
 TARGET_COLUMN = "duration_minutes"

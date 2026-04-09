@@ -412,6 +412,8 @@ def _prediction_stats(since):
     total_abs_error = timedelta()
     abs_errors = []
     count = 0
+    # Buckets for confidence vs accuracy chart
+    buckets = {}  # confidence_pct -> list of absolute percentage errors
 
     for inc in incidents:
         error = inc.actual_duration - inc.estimated_duration
@@ -420,6 +422,15 @@ def _prediction_stats(since):
         total_abs_error += abs_error
         abs_errors.append(abs_error)
         count += 1
+
+        if inc.prediction_confidence is not None:
+            actual_mins = inc.actual_duration.total_seconds() / 60
+            predicted_mins = inc.estimated_duration.total_seconds() / 60
+            if actual_mins > 0:
+                pct_error = abs(predicted_mins - actual_mins) / actual_mins
+                # Bucket by confidence in 10% bands
+                bucket = min(9, int(inc.prediction_confidence * 10)) * 10
+                buckets.setdefault(bucket, []).append(pct_error)
 
     abs_errors.sort()
     median_abs_error = abs_errors[len(abs_errors) // 2]
@@ -442,11 +453,43 @@ def _prediction_stats(since):
             return f"{hours}h {minutes}m"
         return f"{minutes}m"
 
+    # Build chart data: for each confidence bucket, median percentage error
+    chart_height = 160
+    chart_data = []
+    for i, bucket in enumerate(range(0, 100, 10)):
+        errors = buckets.get(bucket, [])
+        x = 60 + i * 43
+        if errors:
+            errors.sort()
+            median_pct = errors[len(errors) // 2]
+            accuracy = round(max(0, 1 - median_pct) * 100)
+            bar_h = round(accuracy / 100 * chart_height)
+            chart_data.append({
+                "label": f"{bucket}-{bucket + 10}%",
+                "accuracy": accuracy,
+                "count": len(errors),
+                "x": x,
+                "y": 20 + chart_height - bar_h,
+                "h": bar_h,
+                "text_x": x + 17,
+            })
+        else:
+            chart_data.append({
+                "label": f"{bucket}-{bucket + 10}%",
+                "accuracy": None,
+                "count": 0,
+                "x": x,
+                "y": 170,
+                "h": 10,
+                "text_x": x + 17,
+            })
+
     return {
         "prediction_count": count,
         "prediction_mean_error": _fmt_signed_duration(mean_error),
         "prediction_mean_abs_error": _fmt_duration(mean_abs_error),
         "prediction_median_abs_error": _fmt_duration(median_abs_error),
+        "confidence_chart": chart_data,
     }
 
 
@@ -490,11 +533,15 @@ def api_training_data(request):
     if key != settings.FUNCTIONS_SECRET_KEY:
         return HttpResponseNotFound()
 
-    incidents = (
+    incidents = list(
         Incident.objects.filter(resolved=True, end_time__isnull=False)
         .select_related("station")
-        .order_by("-start_time")
+        .prefetch_related("reports")
+        .order_by("start_time")
     )
+
+    # Pre-compute per-incident: days since last incident at same station
+    last_incident_at_station = {}  # station_id -> most recent start_time
 
     data = []
     for incident in incidents:
@@ -504,6 +551,22 @@ def api_training_data(request):
 
         station = incident.station
         text = incident.text.lower()
+
+        # Days since last incident at this station
+        prev_time = last_incident_at_station.get(station.id)
+        if prev_time:
+            days_since_last = (incident.start_time - prev_time).total_seconds() / 86400
+        else:
+            days_since_last = -1  # no prior incident
+        last_incident_at_station[station.id] = incident.start_time
+
+        # Concurrent incidents at start time
+        concurrent = sum(
+            1 for other in incidents
+            if other.id != incident.id
+            and other.start_time <= incident.start_time
+            and (other.end_time is None or other.end_time > incident.start_time)
+        )
 
         data.append(
             {
@@ -531,6 +594,9 @@ def api_training_data(request):
                 "crossrail": bool(station.crossrail),
                 "overground": bool(station.overground),
                 "access_via_lift": bool(station.access_via_lift),
+                "num_reports": incident.reports.count(),
+                "days_since_last_incident": round(days_since_last, 2),
+                "concurrent_incidents": concurrent,
                 "estimated_duration_minutes": (
                     incident.estimated_duration.total_seconds() / 60
                     if incident.estimated_duration
