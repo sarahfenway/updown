@@ -464,6 +464,10 @@ class UploadModelView(View):
         if not model_file:
             return JsonResponse({"error": "No model file provided"}, status=400)
 
+        max_size = 10 * 1024 * 1024  # 10 MB
+        if model_file.size > max_size:
+            return JsonResponse({"error": "Model file too large"}, status=400)
+
         model_path = os.path.join(settings.BASE_DIR, "ml_model.joblib")
         with open(model_path, "wb") as f:
             for chunk in model_file.chunks():
