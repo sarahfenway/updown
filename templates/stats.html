@@ -47,7 +47,17 @@
             <h2>Planned Maintenance</h2>
             <p>Count: {{ planned_maintenance_count }} ({{ planned_maintenance_count_percentage }}%)</p>
             <p>Duration: {{ planned_maintenance_delays }} ({{ planned_maintenance_delays_percentage }}%)</p>
-            
+
+            <h2>Duration Predictions (BETA)</h2>
+            {% if prediction_count %}
+                <p>Predictions made: {{ prediction_count }}</p>
+                <p>Mean error: {{ prediction_mean_error }} <i>(positive = overestimate)</i></p>
+                <p>Mean absolute error: {{ prediction_mean_abs_error }}</p>
+                <p>Median absolute error: {{ prediction_median_abs_error }}</p>
+            {% else %}
+                <p>No prediction data available yet.</p>
+            {% endif %}
+
         </div>
     </div>
     <hr>

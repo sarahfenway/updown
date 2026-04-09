@@ -1,11 +1,15 @@
+from datetime import timedelta
+
 from django.core.management.base import BaseCommand
+from django.db.models import Q
+from django.utils import timezone
 
 from incidents.models import Incident
 from incidents.ml import predict_duration
 
 
 class Command(BaseCommand):
-    help = "Add or update ML duration predictions for open incidents"
+    help = "Add or update ML duration predictions for open and recently resolved incidents"
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -15,7 +19,10 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        incidents = Incident.objects.filter(resolved=False)
+        incidents = Incident.objects.filter(
+            Q(resolved=False)
+            | Q(resolved=True, end_time__gte=timezone.now() - timedelta(days=1))
+        )
         if not options["overwrite"]:
             incidents = incidents.filter(estimated_duration__isnull=True)
 

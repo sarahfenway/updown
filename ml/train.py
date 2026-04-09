@@ -18,9 +18,11 @@ import argparse
 import sys
 
 import joblib
+import numpy as np
 import pandas as pd
 import requests
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, median_absolute_error
 
@@ -87,13 +89,20 @@ def prepare_features(df):
     )
     df = df.merge(station_stats, on="station_id", how="left")
 
+    # TF-IDF on incident text
+    vectorizer = TfidfVectorizer(max_features=50, stop_words="english")
+    tfidf_matrix = vectorizer.fit_transform(df["text"].fillna(""))
+    tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
+    tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index)
+    df = pd.concat([df, tfidf_df], axis=1)
+
     feature_cols = FEATURE_COLUMNS + [
         "station_mean_duration",
         "station_median_duration",
         "station_incident_count",
-    ]
+    ] + tfidf_cols
 
-    return df, feature_cols
+    return df, feature_cols, vectorizer
 
 
 def train_model(df, feature_cols):
@@ -149,9 +158,9 @@ def train_model(df, feature_cols):
     return model
 
 
-def upload_model(model, upload_url, key):
+def upload_model(model, vectorizer, upload_url, key):
     model_path = "ml_model.joblib"
-    joblib.dump(model, model_path)
+    joblib.dump({"model": model, "vectorizer": vectorizer}, model_path)
     print(f"\nModel saved locally to {model_path}")
 
     print(f"Uploading model to {upload_url}...")
@@ -163,6 +172,59 @@ def upload_model(model, upload_url, key):
         )
     response.raise_for_status()
     print("Model uploaded successfully.")
+
+
+def calibration_report(df):
+    predicted = df["estimated_duration_minutes"]
+    actual = df["duration_minutes"]
+    has_prediction = predicted.notna()
+
+    n_with = has_prediction.sum()
+    n_total = len(df)
+    print(f"\nCalibration report ({n_with}/{n_total} incidents had predictions)")
+
+    if n_with == 0:
+        print("  No previous predictions to evaluate.")
+        return
+
+    predicted = predicted[has_prediction]
+    actual = actual[has_prediction]
+    error = predicted - actual  # positive = overestimate
+
+    print(f"  Mean error:            {error.mean():+.1f} min (positive = overestimate)")
+    print(f"  Mean absolute error:   {error.abs().mean():.1f} min")
+    print(f"  Median absolute error: {error.abs().median():.1f} min")
+
+    # Breakdown by incident type
+    categories = {
+        "Faulty lift": df.loc[has_prediction, "has_faulty_lift"].astype(bool),
+        "Planned maintenance": df.loc[has_prediction, "has_planned_maintenance"].astype(bool),
+        "Staff issue": df.loc[has_prediction, "has_staff_issue"].astype(bool),
+    }
+    print("\n  By category:")
+    for label, mask in categories.items():
+        if mask.sum() == 0:
+            continue
+        cat_error = error[mask]
+        print(
+            f"    {label} (n={mask.sum()}): "
+            f"mean error {cat_error.mean():+.1f} min, "
+            f"MAE {cat_error.abs().mean():.1f} min"
+        )
+
+    # Breakdown by station network
+    networks = ["tube", "dlr", "national_rail", "crossrail", "overground"]
+    print("\n  By network:")
+    for net in networks:
+        mask = df.loc[has_prediction, net].astype(bool)
+        if mask.sum() == 0:
+            continue
+        net_error = error[mask]
+        print(
+            f"    {net} (n={mask.sum()}): "
+            f"mean error {net_error.mean():+.1f} min, "
+            f"MAE {net_error.abs().mean():.1f} min"
+        )
 
 
 def main():
@@ -187,12 +249,13 @@ def main():
     args = parser.parse_args()
 
     df = fetch_training_data(args.api_url, args.key)
-    df, feature_cols = prepare_features(df)
+    calibration_report(df)
+    df, feature_cols, vectorizer = prepare_features(df)
 
     print(f"\nTraining on {len(df)} incidents with {len(feature_cols)} features...")
     model = train_model(df, feature_cols)
 
-    upload_model(model, args.upload_url, args.key)
+    upload_model(model, vectorizer, args.upload_url, args.key)
 
 
 if __name__ == "__main__":

@@ -11,16 +11,20 @@ from django.db.models.functions import Extract
 def _load_model():
     model_path = os.path.join(settings.BASE_DIR, "ml_model.joblib")
     if not os.path.exists(model_path):
-        return None
+        return None, None
     try:
         import joblib
     except ImportError:
-        return None
-    return joblib.load(model_path)
+        return None, None
+    data = joblib.load(model_path)
+    # Support both old (bare model) and new (dict with vectorizer) formats
+    if isinstance(data, dict):
+        return data["model"], data.get("vectorizer")
+    return data, None
 
 
 def predict_duration(incident):
-    model = _load_model()
+    model, vectorizer = _load_model()
     if model is None:
         return None
 
@@ -69,6 +73,14 @@ def predict_duration(incident):
         return None
 
     df = pd.DataFrame([features])
+
+    # Add TF-IDF features if vectorizer is available
+    if vectorizer is not None:
+        tfidf_matrix = vectorizer.transform([incident.text or ""])
+        tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
+        tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index)
+        df = pd.concat([df, tfidf_df], axis=1)
+
     predicted_minutes = model.predict(df)[0]
 
     # Clamp to reasonable range: 5 minutes to 30 days

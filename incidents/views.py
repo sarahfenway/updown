@@ -383,8 +383,66 @@ def stats(request):
                 planned_maintenance_delays, total_delays
             ),
             "last_updated": get_last_updated(),
+            **_prediction_stats(thirty),
         },
     )
+
+
+def _prediction_stats(since):
+    incidents = Incident.objects.filter(
+        resolved=True,
+        end_time__gt=since,
+        estimated_duration__isnull=False,
+    ).annotate(
+        actual_duration=ExpressionWrapper(
+            F("end_time") - F("start_time"),
+            output_field=DurationField(),
+        )
+    )
+
+    if not incidents.exists():
+        return {"prediction_count": 0}
+
+    total_error = timedelta()
+    total_abs_error = timedelta()
+    abs_errors = []
+    count = 0
+
+    for inc in incidents:
+        error = inc.actual_duration - inc.estimated_duration
+        total_error += error
+        abs_error = abs(error)
+        total_abs_error += abs_error
+        abs_errors.append(abs_error)
+        count += 1
+
+    abs_errors.sort()
+    median_abs_error = abs_errors[len(abs_errors) // 2]
+
+    mean_error = total_error / count
+    mean_abs_error = total_abs_error / count
+
+    def _fmt_signed_duration(td):
+        total_minutes = int(abs(td.total_seconds())) // 60
+        hours, minutes = divmod(total_minutes, 60)
+        sign = "+" if td.total_seconds() >= 0 else "-"
+        if hours:
+            return f"{sign}{hours}h {minutes}m"
+        return f"{sign}{minutes}m"
+
+    def _fmt_duration(td):
+        total_minutes = int(td.total_seconds()) // 60
+        hours, minutes = divmod(total_minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        return f"{minutes}m"
+
+    return {
+        "prediction_count": count,
+        "prediction_mean_error": _fmt_signed_duration(mean_error),
+        "prediction_mean_abs_error": _fmt_duration(mean_abs_error),
+        "prediction_median_abs_error": _fmt_duration(median_abs_error),
+    }
 
 
 def alexa(request):
@@ -463,6 +521,11 @@ def api_training_data(request):
                 "crossrail": bool(station.crossrail),
                 "overground": bool(station.overground),
                 "access_via_lift": bool(station.access_via_lift),
+                "estimated_duration_minutes": (
+                    incident.estimated_duration.total_seconds() / 60
+                    if incident.estimated_duration
+                    else None
+                ),
             }
         )
 
