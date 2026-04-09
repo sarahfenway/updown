@@ -533,18 +533,34 @@ def api_training_data(request):
     if key != settings.FUNCTIONS_SECRET_KEY:
         return HttpResponseNotFound()
 
-    incidents = list(
+    incidents = (
         Incident.objects.filter(resolved=True, end_time__isnull=False)
         .select_related("station")
-        .prefetch_related("reports")
+        .annotate(num_reports=Count("reports"))
         .order_by("start_time")
     )
 
-    # Pre-compute per-incident: days since last incident at same station
+    # Pre-compute concurrent incidents with a sweep line (O(n log n))
+    # Build sorted event list: +1 at start_time, -1 at end_time
+    events = []
+    for inc in incidents.values_list("id", "start_time", "end_time"):
+        events.append((inc[1], 1, inc[0]))   # start
+        events.append((inc[2], -1, inc[0]))   # end
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    concurrent_at = {}  # incident_id -> concurrent count at start
+    active = 0
+    for timestamp, delta, inc_id in events:
+        if delta == 1:
+            concurrent_at[inc_id] = active  # others already active
+            active += 1
+        else:
+            active -= 1
+
     last_incident_at_station = {}  # station_id -> most recent start_time
 
     data = []
-    for incident in incidents:
+    for incident in incidents.iterator():
         duration = (incident.end_time - incident.start_time).total_seconds()
         if duration <= 0:
             continue
@@ -559,14 +575,6 @@ def api_training_data(request):
         else:
             days_since_last = -1  # no prior incident
         last_incident_at_station[station.id] = incident.start_time
-
-        # Concurrent incidents at start time
-        concurrent = sum(
-            1 for other in incidents
-            if other.id != incident.id
-            and other.start_time <= incident.start_time
-            and (other.end_time is None or other.end_time > incident.start_time)
-        )
 
         data.append(
             {
@@ -594,9 +602,9 @@ def api_training_data(request):
                 "crossrail": bool(station.crossrail),
                 "overground": bool(station.overground),
                 "access_via_lift": bool(station.access_via_lift),
-                "num_reports": incident.reports.count(),
+                "num_reports": incident.num_reports,
                 "days_since_last_incident": round(days_since_last, 2),
-                "concurrent_incidents": concurrent,
+                "concurrent_incidents": concurrent_at.get(incident.id, 0),
                 "estimated_duration_minutes": (
                     incident.estimated_duration.total_seconds() / 60
                     if incident.estimated_duration
