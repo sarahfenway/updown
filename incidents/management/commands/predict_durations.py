@@ -36,14 +36,15 @@ class Command(BaseCommand):
         updated = 0
         for incident in incidents:
             try:
-                duration = predict_duration(incident)
+                duration, confidence = predict_duration(incident)
             except Exception as e:
                 self.stderr.write(f"  {incident.station.name}: {e}")
                 continue
 
             if duration is not None:
                 incident.estimated_duration = duration
-                incident.save(update_fields=["estimated_duration"])
+                incident.prediction_confidence = confidence
+                incident.save(update_fields=["estimated_duration", "prediction_confidence"])
                 updated += 1
 
         self.stdout.write(self.style.SUCCESS(f"Updated {updated} incident(s)"))

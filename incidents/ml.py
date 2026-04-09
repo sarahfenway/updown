@@ -11,22 +11,37 @@ from django.db.models.functions import Extract
 def _load_model():
     model_path = os.path.join(settings.BASE_DIR, "ml_model.joblib")
     if not os.path.exists(model_path):
-        return None, None
+        return None
     try:
         import joblib
     except ImportError:
-        return None, None
+        return None
     data = joblib.load(model_path)
-    # Support both old (bare model) and new (dict with vectorizer) formats
-    if isinstance(data, dict):
-        return data["model"], data.get("vectorizer")
-    return data, None
+    # Support old (bare model) format
+    if not isinstance(data, dict):
+        return {"model": data}
+    return data
+
+
+def _is_planned_work(incident):
+    text = incident.text.lower()
+    return "planned" in text or "until " in text or incident.information
 
 
 def predict_duration(incident):
-    model, vectorizer = _load_model()
-    if model is None:
-        return None
+    """Returns (timedelta, confidence) or (None, None)."""
+    data = _load_model()
+    if data is None:
+        return None, None
+
+    # Skip planned work — duration is in the text
+    if _is_planned_work(incident):
+        return None, None
+
+    model = data["model"]
+    vectorizer = data.get("vectorizer")
+    model_lower = data.get("model_lower")
+    model_upper = data.get("model_upper")
 
     from incidents.models import Incident
 
@@ -56,11 +71,7 @@ def predict_duration(incident):
         "has_faulty_lift": int("faulty lift" in text),
         "has_planned_maintenance": int("planned maintenance" in text),
         "has_staff_issue": int("staff" in text),
-        "is_planned_work": int(
-            "planned" in text
-            or "until " in text
-            or incident.information
-        ),
+        "is_planned_work": 0,  # always 0 — we skip planned work above
         "tube": int(bool(station.tube)),
         "dlr": int(bool(station.dlr)),
         "national_rail": int(bool(station.national_rail)),
@@ -75,7 +86,7 @@ def predict_duration(incident):
     try:
         import pandas as pd
     except ImportError:
-        return None
+        return None, None
 
     df = pd.DataFrame([features])
 
@@ -94,7 +105,18 @@ def predict_duration(incident):
     # Clamp to reasonable range: 5 minutes to 30 days
     predicted_minutes = max(5, min(predicted_minutes, 60 * 24 * 30))
 
-    return timedelta(minutes=predicted_minutes)
+    # Compute confidence from quantile interval width
+    confidence = None
+    if model_lower is not None and model_upper is not None:
+        lower = np.expm1(model_lower.predict(df)[0])
+        upper = np.expm1(model_upper.predict(df)[0])
+        if predicted_minutes > 0:
+            # Narrow interval relative to prediction = high confidence
+            spread = max(0, upper - lower)
+            confidence = max(0.05, min(0.95, 1 - spread / predicted_minutes))
+            confidence = round(confidence, 2)
+
+    return timedelta(minutes=predicted_minutes), confidence
 
 
 # Allow cache clearing when a new model is uploaded

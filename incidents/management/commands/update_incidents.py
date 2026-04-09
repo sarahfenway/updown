@@ -36,7 +36,9 @@ def consolidate_incidents():
                 resolved=report.resolved,
             )
             try:
-                incident.estimated_duration = predict_duration(incident)
+                duration, confidence = predict_duration(incident)
+                incident.estimated_duration = duration
+                incident.prediction_confidence = confidence
             except Exception:
                 pass
             incident.save()

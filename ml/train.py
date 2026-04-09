@@ -66,6 +66,11 @@ def fetch_training_data(api_url, key):
 
 
 def prepare_features(df):
+    # Exclude planned work — duration is in the text, no point predicting
+    planned_count = df["is_planned_work"].sum()
+    df = df[~df["is_planned_work"].astype(bool)].copy()
+    print(f"Excluded {planned_count} planned work incidents, {len(df)} remaining.")
+
     # Convert booleans to ints
     bool_columns = [
         "information",
@@ -153,6 +158,20 @@ def train_model(df, feature_cols):
     # Train final model on all data
     model.fit(X, y_log)
 
+    # Train quantile models for confidence intervals
+    model_lower = GradientBoostingRegressor(
+        n_estimators=200, max_depth=5, learning_rate=0.1,
+        min_samples_leaf=5, random_state=42,
+        loss="quantile", alpha=0.25,
+    )
+    model_upper = GradientBoostingRegressor(
+        n_estimators=200, max_depth=5, learning_rate=0.1,
+        min_samples_leaf=5, random_state=42,
+        loss="quantile", alpha=0.75,
+    )
+    model_lower.fit(X, y_log)
+    model_upper.fit(X, y_log)
+
     # Feature importance
     print("\nFeature importance:")
     importances = sorted(
@@ -163,12 +182,17 @@ def train_model(df, feature_cols):
     for name, importance in importances:
         print(f"  {name}: {importance:.4f}")
 
-    return model
+    return model, model_lower, model_upper
 
 
-def upload_model(model, vectorizer, upload_url, key):
+def upload_model(model, model_lower, model_upper, vectorizer, upload_url, key):
     model_path = "ml_model.joblib"
-    joblib.dump({"model": model, "vectorizer": vectorizer}, model_path)
+    joblib.dump({
+        "model": model,
+        "model_lower": model_lower,
+        "model_upper": model_upper,
+        "vectorizer": vectorizer,
+    }, model_path)
     print(f"\nModel saved locally to {model_path}")
 
     print(f"Uploading model to {upload_url}...")
@@ -261,9 +285,9 @@ def main():
     df, feature_cols, vectorizer = prepare_features(df)
 
     print(f"\nTraining on {len(df)} incidents with {len(feature_cols)} features...")
-    model = train_model(df, feature_cols)
+    model, model_lower, model_upper = train_model(df, feature_cols)
 
-    upload_model(model, vectorizer, args.upload_url, args.key)
+    upload_model(model, model_lower, model_upper, vectorizer, args.upload_url, args.key)
 
 
 if __name__ == "__main__":

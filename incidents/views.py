@@ -74,6 +74,11 @@ def _prepare_incidents(queryset):
         else:
             incident.expected_end_time = None
 
+        if incident.prediction_confidence is not None:
+            incident.confidence_pct = int(incident.prediction_confidence * 100)
+        else:
+            incident.confidence_pct = None
+
         if incident.resolved and incident.end_time and incident.start_time and incident.estimated_duration:
             actual = incident.end_time - incident.start_time
             diff = actual - incident.estimated_duration

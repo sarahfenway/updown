@@ -15,6 +15,11 @@ class Incident(models.Model):
         blank=True,
         help_text="ML-predicted duration for this incident",
     )
+    prediction_confidence = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="ML prediction confidence (0-1)",
+    )
 
     def __str__(self):
         if hasattr(self, "reports_count"):
