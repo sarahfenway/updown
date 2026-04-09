@@ -69,6 +69,10 @@ def _prepare_incidents(queryset):
         incident.single_user_report_end_time = (
             reports[0].end_time if incident.is_single_user_report else None
         )
+        if incident.start_time and incident.estimated_duration:
+            incident.expected_end_time = incident.start_time + incident.estimated_duration
+        else:
+            incident.expected_end_time = None
 
     return incidents
 
