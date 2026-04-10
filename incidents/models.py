@@ -2,6 +2,26 @@ from django.db import models
 from django.utils import timezone
 
 
+class MLModel(models.Model):
+    """Trained ML model bytes, stored in the database.
+
+    Heroku's filesystem is ephemeral — every deploy or dyno restart wipes
+    anything written to disk, including an uploaded ``ml_model.joblib``.
+    Stashing the joblib bytes in a single DB row means the model survives
+    restarts and is visible to every dyno at the same time.
+    """
+
+    data = models.BinaryField()
+    size_bytes = models.PositiveIntegerField()
+    uploaded_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-id"]
+
+    def __str__(self):
+        return f"MLModel #{self.pk} ({self.size_bytes} bytes @ {self.uploaded_at:%Y-%m-%d %H:%M})"
+
+
 class Incident(models.Model):
     information = models.BooleanField(help_text="Is this information only?")
     station = models.ForeignKey("stations.Station", on_delete=models.DO_NOTHING)

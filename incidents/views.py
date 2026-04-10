@@ -641,12 +641,25 @@ class UploadModelView(View):
         if model_file.size > max_size:
             return JsonResponse({"error": "Model file too large"}, status=400)
 
-        model_path = os.path.join(settings.BASE_DIR, "ml_model.joblib")
-        with open(model_path, "wb") as f:
-            for chunk in model_file.chunks():
-                f.write(chunk)
+        # Read the whole upload into memory — capped at 10 MB above so this
+        # is safe — and stash it in a new MLModel row. We keep historic rows
+        # around rather than overwriting, so rollbacks are trivial: just
+        # delete the bad row and _load_model() picks up the previous one.
+        from incidents.models import MLModel
 
-        # Clear the cached model so it's reloaded on next prediction
+        raw = b"".join(model_file.chunks())
+        MLModel.objects.create(data=raw, size_bytes=len(raw))
+
+        # Prune: keep the last 5 uploads, drop the rest.
+        old_ids = list(
+            MLModel.objects.order_by("-id").values_list("id", flat=True)[5:]
+        )
+        if old_ids:
+            MLModel.objects.filter(id__in=old_ids).delete()
+
+        # Invalidate this process's cache so the new model is picked up.
+        # Other dynos will pick it up on their next _load_model() call,
+        # because that checks for the latest row id.
         predict_duration.cache_clear()
 
-        return JsonResponse({"status": "ok"})
+        return JsonResponse({"status": "ok", "size_bytes": len(raw)})

@@ -1,9 +1,13 @@
+import io
+import logging
 import os
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta
-from functools import lru_cache
 
 from django.conf import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -114,19 +118,65 @@ def format_block_slot(slot, now):
 # ---------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=1)
+# Process-local cache so we don't redeserialize on every prediction. We
+# additionally remember the id of the MLModel row we deserialized, so that a
+# fresh upload is picked up by long-running processes (e.g. the web dyno) on
+# the next call without needing to restart.
+_cached_model = None
+_cached_model_row_id = None
+
+
 def _load_model():
-    model_path = os.path.join(settings.BASE_DIR, "ml_model.joblib")
-    if not os.path.exists(model_path):
-        return None
+    global _cached_model, _cached_model_row_id
+
     try:
         import joblib
     except ImportError:
+        logger.warning("joblib not installed — predictions disabled")
         return None
-    data = joblib.load(model_path)
+
+    from incidents.models import MLModel
+
+    latest = MLModel.objects.order_by("-id").values("id").first()
+    if latest is None:
+        # Fall back to an on-disk file if one happens to exist (legacy path
+        # and local dev convenience). In production this will normally miss.
+        model_path = os.path.join(settings.BASE_DIR, "ml_model.joblib")
+        if os.path.exists(model_path):
+            if _cached_model_row_id != ("file", os.path.getmtime(model_path)):
+                data = joblib.load(model_path)
+                if not isinstance(data, dict):
+                    data = {"model": data}
+                _cached_model = data
+                _cached_model_row_id = ("file", os.path.getmtime(model_path))
+            return _cached_model
+        _cached_model = None
+        _cached_model_row_id = None
+        return None
+
+    latest_id = latest["id"]
+    if latest_id == _cached_model_row_id:
+        return _cached_model
+
+    # New (or first) model — pull the bytes and deserialize.
+    row = MLModel.objects.only("data").get(pk=latest_id)
+    raw = bytes(row.data)
+    try:
+        data = joblib.load(io.BytesIO(raw))
+    except Exception:
+        logger.exception("Failed to deserialize MLModel row %s", latest_id)
+        return None
     if not isinstance(data, dict):
-        return {"model": data}
-    return data
+        data = {"model": data}
+    _cached_model = data
+    _cached_model_row_id = latest_id
+    return _cached_model
+
+
+def _clear_model_cache():
+    global _cached_model, _cached_model_row_id
+    _cached_model = None
+    _cached_model_row_id = None
 
 
 def _is_planned_work(incident):
@@ -140,6 +190,23 @@ def _is_planned_work(incident):
 
 
 def predict_duration(incident):
+    """Public entry point. Wraps :func:`_predict_duration` in a broad
+    try/except so a single misbehaving prediction can never crash a cron
+    worker or a web request. On any failure we log with traceback and
+    return ``(None, None)`` so callers treat it as "no prediction".
+    """
+    try:
+        return _predict_duration(incident)
+    except Exception:
+        logger.exception(
+            "predict_duration failed for incident %s at %s",
+            getattr(incident, "pk", None),
+            getattr(getattr(incident, "station", None), "name", "?"),
+        )
+        return None, None
+
+
+def _predict_duration(incident):
     """Returns (timedelta, confidence) or (None, None).
 
     The model is a classifier over "block offset" — how many coarse time
@@ -304,4 +371,4 @@ def predict_duration(incident):
 
 
 # Allow cache clearing when a new model is uploaded
-predict_duration.cache_clear = _load_model.cache_clear
+predict_duration.cache_clear = _clear_model_cache
