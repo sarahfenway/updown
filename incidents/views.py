@@ -541,6 +541,15 @@ def api_training_data(request):
         s.id: s for s in Station.objects.all()
     }
 
+    # Resolve each station to its "effective" (parent if present, else self)
+    # station. All training signals are keyed by this — a station like Bank
+    # has one record per line but should be treated as one place for
+    # predictions.
+    def _effective(station):
+        if station.parent_station_id and station.parent_station_id in station_cache:
+            return station_cache[station.parent_station_id]
+        return station
+
     last_incident_at_station = {}
 
     def generate():
@@ -558,17 +567,18 @@ def api_training_data(request):
             if duration <= 0:
                 continue
 
-            station = station_cache.get(incident.station_id)
-            if station is None:
+            raw_station = station_cache.get(incident.station_id)
+            if raw_station is None:
                 continue
+            station = _effective(raw_station)
             text = incident.text.lower()
 
-            prev_time = last_incident_at_station.get(incident.station_id)
+            prev_time = last_incident_at_station.get(station.id)
             if prev_time:
                 days_since_last = (incident.start_time - prev_time).total_seconds() / 86400
             else:
                 days_since_last = -1
-            last_incident_at_station[incident.station_id] = incident.start_time
+            last_incident_at_station[station.id] = incident.start_time
 
             row = {
                 "station_id": station.id,

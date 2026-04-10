@@ -9,23 +9,74 @@ Usage:
         --key YOUR_FUNCTIONS_SECRET_KEY
 
 This script:
-1. Pulls training data from the Up Down London API
-2. Trains a gradient-boosted regression model to predict incident duration
-3. Uploads the trained model back to the server
+1. Pulls training data from the Up Down London API.
+2. Trains a classifier that predicts which coarse time block an incident
+   will be resolved in ("block offset" from the start block).
+3. Uploads the trained model back to the server.
+
+The classifier directly optimises for the metric we care about (did the
+prediction land in the right block?), instead of regressing on minutes and
+hoping the boundary doesn't get crossed.
 """
 
 import argparse
 import sys
+from datetime import date as date_cls
+from datetime import datetime, time, timedelta
 
 import joblib
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error, median_absolute_error
+from sklearn.utils.class_weight import compute_sample_weight
 
+
+# ---------------------------------------------------------------------------
+# Block helpers — kept in sync with incidents/ml.py
+# ---------------------------------------------------------------------------
+
+BLOCK_MORNING = 0
+BLOCK_DAYTIME = 1
+BLOCK_EVENING = 2
+BLOCK_OVERNIGHT = 3
+BLOCKS_PER_DAY = 4
+BLOCK_NAMES = ["morning", "daytime", "evening", "overnight"]
+MAX_OFFSET_CLASS = 20
+
+
+def block_index(dt):
+    hour = dt.hour
+    if hour < 5:
+        return (dt.date() - timedelta(days=1)).toordinal() * BLOCKS_PER_DAY + BLOCK_OVERNIGHT
+    if hour < 10:
+        return dt.date().toordinal() * BLOCKS_PER_DAY + BLOCK_MORNING
+    if hour < 15:
+        return dt.date().toordinal() * BLOCKS_PER_DAY + BLOCK_DAYTIME
+    if hour < 20:
+        return dt.date().toordinal() * BLOCKS_PER_DAY + BLOCK_EVENING
+    return dt.date().toordinal() * BLOCKS_PER_DAY + BLOCK_OVERNIGHT
+
+
+def block_start_end(index):
+    date_ord, block_num = divmod(index, BLOCKS_PER_DAY)
+    day = date_cls.fromordinal(date_ord)
+    if block_num == BLOCK_MORNING:
+        return datetime.combine(day, time(5, 0)), datetime.combine(day, time(10, 0))
+    if block_num == BLOCK_DAYTIME:
+        return datetime.combine(day, time(10, 0)), datetime.combine(day, time(15, 0))
+    if block_num == BLOCK_EVENING:
+        return datetime.combine(day, time(15, 0)), datetime.combine(day, time(20, 0))
+    start = datetime.combine(day, time(20, 0))
+    return start, start + timedelta(hours=9)
+
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
 
 FEATURE_COLUMNS = [
     "station_id",
@@ -33,10 +84,11 @@ FEATURE_COLUMNS = [
     "hour_of_day",
     "day_of_week",
     "month",
+    "is_weekend",
+    "start_block",
     "has_faulty_lift",
     "has_planned_maintenance",
     "has_staff_issue",
-    "is_planned_work",
     "tube",
     "dlr",
     "national_rail",
@@ -48,7 +100,12 @@ FEATURE_COLUMNS = [
     "concurrent_incidents",
 ]
 
-TARGET_COLUMN = "duration_minutes"
+TARGET_COLUMN = "block_offset"
+
+
+# ---------------------------------------------------------------------------
+# Data fetching
+# ---------------------------------------------------------------------------
 
 
 def fetch_training_data(api_url, key):
@@ -68,19 +125,45 @@ def fetch_training_data(api_url, key):
     return df
 
 
+LOCAL_TZ = "Europe/London"
+
+
 def prepare_features(df):
-    # Exclude planned work — duration is in the text, no point predicting
-    planned_count = df["is_planned_work"].sum()
+    # Parse datetime columns and convert to local time. Blocks are defined
+    # in London time, not UTC — otherwise the boundaries drift by an hour
+    # during BST.
+    df["start_time"] = pd.to_datetime(df["start_time"], utc=True).dt.tz_convert(LOCAL_TZ)
+    df["end_time"] = pd.to_datetime(df["end_time"], utc=True).dt.tz_convert(LOCAL_TZ)
+
+    # Drop planned work — duration is in the text, no point predicting
+    planned_count = df["is_planned_work"].astype(bool).sum()
     df = df[~df["is_planned_work"].astype(bool)].copy()
     print(f"Excluded {planned_count} planned work incidents, {len(df)} remaining.")
 
-    # Convert booleans to ints
+    # Compute block indices and offset target
+    df["start_block_idx"] = df["start_time"].apply(block_index)
+    df["end_block_idx"] = df["end_time"].apply(block_index)
+    df["block_offset_raw"] = df["end_block_idx"] - df["start_block_idx"]
+
+    # Drop obviously bad rows
+    before = len(df)
+    df = df[df["block_offset_raw"] >= 0].copy()
+    dropped = before - len(df)
+    if dropped:
+        print(f"Dropped {dropped} rows with negative block offset (bad data).")
+
+    # Cap into a finite class set
+    df[TARGET_COLUMN] = df["block_offset_raw"].clip(upper=MAX_OFFSET_CLASS).astype(int)
+
+    # Derived features
+    df["start_block"] = (df["start_block_idx"] % BLOCKS_PER_DAY).astype(int)
+    df["is_weekend"] = (df["start_time"].dt.weekday >= 5).astype(int)
+
     bool_columns = [
         "information",
         "has_faulty_lift",
         "has_planned_maintenance",
         "has_staff_issue",
-        "is_planned_work",
         "tube",
         "dlr",
         "national_rail",
@@ -91,11 +174,15 @@ def prepare_features(df):
     for col in bool_columns:
         df[col] = df[col].astype(int)
 
-    # Add per-station historical features
-    station_stats = df.groupby("station_id")[TARGET_COLUMN].agg(
-        station_mean_duration="mean",
-        station_median_duration="median",
-        station_incident_count="count",
+    # Per-station historical aggregates. The raw station_id is also fed in
+    # as a categorical so the tree model can learn per-station behaviour
+    # directly ("this manager is shit"). These aggregates give a smoother
+    # fallback for stations with too few incidents for the tree to learn
+    # anything station-specific.
+    station_stats = df.groupby("station_id").agg(
+        station_mean_duration=("duration_minutes", "mean"),
+        station_incident_count=("duration_minutes", "count"),
+        station_mean_offset=(TARGET_COLUMN, "mean"),
     )
     df = df.merge(station_stats, on="station_id", how="left")
 
@@ -103,97 +190,114 @@ def prepare_features(df):
     vectorizer = TfidfVectorizer(max_features=50, stop_words="english")
     tfidf_matrix = vectorizer.fit_transform(df["text"].fillna(""))
     tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
-    tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index)
+    tfidf_df = pd.DataFrame(
+        tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index
+    )
     df = pd.concat([df, tfidf_df], axis=1)
 
-    feature_cols = FEATURE_COLUMNS + [
-        "station_mean_duration",
-        "station_median_duration",
-        "station_incident_count",
-    ] + tfidf_cols
+    feature_cols = (
+        FEATURE_COLUMNS
+        + ["station_mean_duration", "station_incident_count", "station_mean_offset"]
+        + tfidf_cols
+    )
 
     return df, feature_cols, vectorizer
 
 
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+
+def _describe_class_distribution(y):
+    counts = y.value_counts().sort_index()
+    total = len(y)
+    print("\nBlock offset class distribution:")
+    for cls, n in counts.items():
+        pct = n / total * 100
+        print(f"  offset {cls:>2}: {n:>5} ({pct:.1f}%)")
+
+
 def train_model(df, feature_cols):
-    # Sort by start_time for proper time-series splitting
     df = df.sort_values("start_time").reset_index(drop=True)
 
     X = df[feature_cols]
-    # Log-transform target so the model optimises for relative error,
-    # not absolute minutes — stops long planned outages dominating training
-    y_log = np.log1p(df[TARGET_COLUMN])
+    y = df[TARGET_COLUMN]
 
-    model = GradientBoostingRegressor(
-        n_estimators=200,
-        max_depth=5,
-        learning_rate=0.1,
-        min_samples_leaf=5,
-        random_state=42,
-    )
+    _describe_class_distribution(y)
 
-    # Evaluate with time-series cross-validation
+    # Class-balanced sample weights so the classifier doesn't just learn
+    # "always say offset=X" for the most common class.
+    class_weights = compute_sample_weight(class_weight="balanced", y=y)
+
+    # Additionally weight recent data more heavily. Linear ramp from 1.0
+    # (oldest) to 3.0 (newest) so the last few months matter more.
+    n = len(df)
+    recency_weights = np.linspace(1.0, 3.0, n)
+    sample_weights = class_weights * recency_weights
+
+    # Treat station_id as a proper categorical so the tree model can learn
+    # per-station behaviour directly, instead of treating it as an ordinal
+    # number that happens to sit next to other station IDs.
+    categorical_mask = [col == "station_id" for col in feature_cols]
+
+    def _fresh_model():
+        return HistGradientBoostingClassifier(
+            max_iter=300,
+            max_depth=6,
+            learning_rate=0.08,
+            min_samples_leaf=20,
+            l2_regularization=0.5,
+            categorical_features=categorical_mask,
+            random_state=42,
+        )
+
+    # Time-series cross-validation on block accuracy.
     tscv = TimeSeriesSplit(n_splits=3)
-    mae_scores = []
-    median_ae_scores = []
-
+    fold_scores = []
     for train_idx, test_idx in tscv.split(X):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y_log.iloc[train_idx], y_log.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        sw_train = sample_weights[train_idx]
 
-        model.fit(X_train, y_train)
-        preds_log = model.predict(X_test)
+        cv_model = _fresh_model()
+        cv_model.fit(X_train, y_train, sample_weight=sw_train)
+        preds = cv_model.predict(X_test)
 
-        # Convert back to minutes for reporting
-        preds = np.expm1(preds_log)
-        y_actual = np.expm1(y_test)
-
-        mae_scores.append(mean_absolute_error(y_actual, preds))
-        median_ae_scores.append(median_absolute_error(y_actual, preds))
+        exact = accuracy_score(y_test, preds)
+        # "Within ±1 block" is a softer success criterion — useful sanity check
+        within_one = np.mean(np.abs(preds - y_test.values) <= 1)
+        fold_scores.append((exact, within_one))
 
     print(f"\nCross-validation results ({tscv.n_splits} splits):")
-    print(f"  Mean Absolute Error:   {sum(mae_scores)/len(mae_scores):.1f} minutes")
+    for i, (exact, within_one) in enumerate(fold_scores):
+        print(
+            f"  fold {i + 1}: exact block {exact * 100:.1f}%, "
+            f"within ±1 block {within_one * 100:.1f}%"
+        )
+    mean_exact = sum(s[0] for s in fold_scores) / len(fold_scores)
+    mean_within = sum(s[1] for s in fold_scores) / len(fold_scores)
     print(
-        f"  Median Absolute Error: "
-        f"{sum(median_ae_scores)/len(median_ae_scores):.1f} minutes"
+        f"  mean:   exact block {mean_exact * 100:.1f}%, "
+        f"within ±1 block {mean_within * 100:.1f}%"
     )
 
     # Train final model on all data
-    model.fit(X, y_log)
+    model = _fresh_model()
+    model.fit(X, y, sample_weight=sample_weights)
 
-    # Train quantile models for confidence intervals
-    model_lower = GradientBoostingRegressor(
-        n_estimators=200, max_depth=5, learning_rate=0.1,
-        min_samples_leaf=5, random_state=42,
-        loss="quantile", alpha=0.25,
-    )
-    model_upper = GradientBoostingRegressor(
-        n_estimators=200, max_depth=5, learning_rate=0.1,
-        min_samples_leaf=5, random_state=42,
-        loss="quantile", alpha=0.75,
-    )
-    model_lower.fit(X, y_log)
-    model_upper.fit(X, y_log)
-
-    # Feature importance
-    print("\nFeature importance:")
-    importances = sorted(
-        zip(feature_cols, model.feature_importances_),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    for name, importance in importances:
-        print(f"  {name}: {importance:.4f}")
-
-    return model, model_lower, model_upper
+    return model
 
 
-def upload_model(model, model_lower, model_upper, vectorizer, upload_url, key):
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+
+
+def upload_model(model, vectorizer, upload_url, key):
     model_path = "ml_model.joblib"
     joblib.dump({
         "model": model,
-        "model_lower": model_lower,
-        "model_upper": model_upper,
         "vectorizer": vectorizer,
     }, model_path)
     print(f"\nModel saved locally to {model_path}")
@@ -209,12 +313,22 @@ def upload_model(model, model_lower, model_upper, vectorizer, upload_url, key):
     print("Model uploaded successfully.")
 
 
-def calibration_report(df):
-    predicted = df["estimated_duration_minutes"]
-    actual = df["duration_minutes"]
-    has_prediction = predicted.notna()
+# ---------------------------------------------------------------------------
+# Calibration — how well did the *previous* model do?
+# ---------------------------------------------------------------------------
 
-    n_with = has_prediction.sum()
+
+def calibration_report(df):
+    """Compare stored predictions to actuals using block accuracy."""
+    if "estimated_duration_minutes" not in df.columns:
+        return
+
+    df = df.copy()
+    df["start_time_dt"] = pd.to_datetime(df["start_time"], utc=True).dt.tz_convert(LOCAL_TZ)
+    df["end_time_dt"] = pd.to_datetime(df["end_time"], utc=True).dt.tz_convert(LOCAL_TZ)
+
+    has_prediction = df["estimated_duration_minutes"].notna()
+    n_with = int(has_prediction.sum())
     n_total = len(df)
     print(f"\nCalibration report ({n_with}/{n_total} incidents had predictions)")
 
@@ -222,44 +336,47 @@ def calibration_report(df):
         print("  No previous predictions to evaluate.")
         return
 
-    predicted = predicted[has_prediction]
-    actual = actual[has_prediction]
-    error = predicted - actual  # positive = overestimate
+    sub = df[has_prediction].copy()
+    sub["predicted_end"] = sub["start_time_dt"] + pd.to_timedelta(
+        sub["estimated_duration_minutes"], unit="m"
+    )
+    sub["predicted_block_idx"] = sub["predicted_end"].apply(block_index)
+    sub["actual_block_idx"] = sub["end_time_dt"].apply(block_index)
+    sub["correct"] = sub["predicted_block_idx"] == sub["actual_block_idx"]
+    sub["offset_error"] = (
+        sub["predicted_block_idx"] - sub["actual_block_idx"]
+    ).abs()
 
-    print(f"  Mean error:            {error.mean():+.1f} min (positive = overestimate)")
-    print(f"  Mean absolute error:   {error.abs().mean():.1f} min")
-    print(f"  Median absolute error: {error.abs().median():.1f} min")
+    acc = sub["correct"].mean()
+    within_one = (sub["offset_error"] <= 1).mean()
+    print(f"  Exact block:       {acc * 100:.1f}%")
+    print(f"  Within ±1 block:   {within_one * 100:.1f}%")
 
-    # Breakdown by incident type
     categories = {
-        "Faulty lift": df.loc[has_prediction, "has_faulty_lift"].astype(bool),
-        "Planned maintenance": df.loc[has_prediction, "has_planned_maintenance"].astype(bool),
-        "Staff issue": df.loc[has_prediction, "has_staff_issue"].astype(bool),
+        "Faulty lift": sub["has_faulty_lift"].astype(bool),
+        "Planned maintenance": sub["has_planned_maintenance"].astype(bool),
+        "Staff issue": sub["has_staff_issue"].astype(bool),
     }
     print("\n  By category:")
     for label, mask in categories.items():
         if mask.sum() == 0:
             continue
-        cat_error = error[mask]
-        print(
-            f"    {label} (n={mask.sum()}): "
-            f"mean error {cat_error.mean():+.1f} min, "
-            f"MAE {cat_error.abs().mean():.1f} min"
-        )
+        cat_acc = sub.loc[mask, "correct"].mean()
+        print(f"    {label} (n={int(mask.sum())}): {cat_acc * 100:.1f}% exact")
 
-    # Breakdown by station network
     networks = ["tube", "dlr", "national_rail", "crossrail", "overground"]
     print("\n  By network:")
     for net in networks:
-        mask = df.loc[has_prediction, net].astype(bool)
+        mask = sub[net].astype(bool)
         if mask.sum() == 0:
             continue
-        net_error = error[mask]
-        print(
-            f"    {net} (n={mask.sum()}): "
-            f"mean error {net_error.mean():+.1f} min, "
-            f"MAE {net_error.abs().mean():.1f} min"
-        )
+        net_acc = sub.loc[mask, "correct"].mean()
+        print(f"    {net} (n={int(mask.sum())}): {net_acc * 100:.1f}% exact")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -288,9 +405,9 @@ def main():
     df, feature_cols, vectorizer = prepare_features(df)
 
     print(f"\nTraining on {len(df)} incidents with {len(feature_cols)} features...")
-    model, model_lower, model_upper = train_model(df, feature_cols)
+    model = train_model(df, feature_cols)
 
-    upload_model(model, model_lower, model_upper, vectorizer, args.upload_url, args.key)
+    upload_model(model, vectorizer, args.upload_url, args.key)
 
 
 if __name__ == "__main__":

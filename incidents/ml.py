@@ -1,24 +1,87 @@
 import os
-from datetime import timedelta
+from datetime import date as date_cls
+from datetime import datetime, time, timedelta
 from functools import lru_cache
 
+from django.conf import settings
 
-# Coarse time-of-day buckets we predict into. Overnight spans 20:00–05:00,
-# which is awkward because it straddles midnight — we anchor the slot to the
-# day the block *starts*, so an actual end_time at 02:00 resolves to
-# (previous date, "overnight"), matching a prediction at 23:00 the night before.
-def time_block_slot(dt):
-    """Return a (date, block_name) tuple identifying a coarse time slot."""
+
+# ---------------------------------------------------------------------------
+# Time-of-day blocks
+# ---------------------------------------------------------------------------
+#
+# Incidents are predicted into one of four coarse blocks per day:
+#   morning   05:00 – 10:00
+#   daytime   10:00 – 15:00
+#   evening   15:00 – 20:00
+#   overnight 20:00 – 05:00 (next day)
+#
+# Every (date, block) pair has a unique integer ``block_index`` computed as
+# ``date.toordinal() * 4 + block_number``.  Overnight is anchored to the date
+# the block *starts*, so 22:00 Monday and 02:00 Tuesday share the same index.
+
+BLOCK_MORNING = 0
+BLOCK_DAYTIME = 1
+BLOCK_EVENING = 2
+BLOCK_OVERNIGHT = 3
+BLOCKS_PER_DAY = 4
+BLOCK_NAMES = ["morning", "daytime", "evening", "overnight"]
+
+# Everything at or beyond this many blocks from the start is lumped into one
+# "long tail" class during training. Five days is plenty of detail; beyond
+# that we barely have the data to distinguish blocks anyway.
+MAX_OFFSET_CLASS = 20
+
+
+def _to_local(dt):
+    """Return ``dt`` expressed in the project's configured timezone.
+
+    Blocks are defined in local (London) time, but Django stores everything
+    as UTC. Without this conversion morning/daytime/etc. boundaries shift by
+    an hour during BST.
+    """
+    from django.utils import timezone as tz_module
+
+    if tz_module.is_aware(dt):
+        return tz_module.localtime(dt)
+    return dt
+
+
+def block_index(dt):
+    """Monotonic integer identifying the (date, block) slot containing ``dt``."""
+    dt = _to_local(dt)
     hour = dt.hour
     if hour < 5:
-        return (dt.date() - timedelta(days=1), "overnight")
+        return (dt.date() - timedelta(days=1)).toordinal() * BLOCKS_PER_DAY + BLOCK_OVERNIGHT
     if hour < 10:
-        return (dt.date(), "morning")
+        return dt.date().toordinal() * BLOCKS_PER_DAY + BLOCK_MORNING
     if hour < 15:
-        return (dt.date(), "daytime")
+        return dt.date().toordinal() * BLOCKS_PER_DAY + BLOCK_DAYTIME
     if hour < 20:
-        return (dt.date(), "evening")
-    return (dt.date(), "overnight")
+        return dt.date().toordinal() * BLOCKS_PER_DAY + BLOCK_EVENING
+    return dt.date().toordinal() * BLOCKS_PER_DAY + BLOCK_OVERNIGHT
+
+
+def block_start_end(index):
+    """Return (naive start_dt, naive end_dt) for the block at ``index``."""
+    date_ord, block_num = divmod(index, BLOCKS_PER_DAY)
+    day = date_cls.fromordinal(date_ord)
+    if block_num == BLOCK_MORNING:
+        return datetime.combine(day, time(5, 0)), datetime.combine(day, time(10, 0))
+    if block_num == BLOCK_DAYTIME:
+        return datetime.combine(day, time(10, 0)), datetime.combine(day, time(15, 0))
+    if block_num == BLOCK_EVENING:
+        return datetime.combine(day, time(15, 0)), datetime.combine(day, time(20, 0))
+    # overnight: 20:00 → 05:00 next day
+    start = datetime.combine(day, time(20, 0))
+    return start, start + timedelta(hours=9)
+
+
+def time_block_slot(dt):
+    """Return a (date, block_name) tuple identifying a coarse time slot."""
+    idx = block_index(dt)
+    date_ord, block_num = divmod(idx, BLOCKS_PER_DAY)
+    return (date_cls.fromordinal(date_ord), BLOCK_NAMES[block_num])
 
 
 def format_block_slot(slot, now):
@@ -45,9 +108,10 @@ def format_block_slot(slot, now):
         return f"last {date.strftime('%A')} {block}"
     return f"{date.strftime('%-d %b')} {block}"
 
-from django.conf import settings
-from django.db.models import Avg, Count, F
-from django.db.models.functions import Extract
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
 
 @lru_cache(maxsize=1)
@@ -60,7 +124,6 @@ def _load_model():
     except ImportError:
         return None
     data = joblib.load(model_path)
-    # Support old (bare model) format
     if not isinstance(data, dict):
         return {"model": data}
     return data
@@ -71,43 +134,66 @@ def _is_planned_work(incident):
     return "planned" in text or "until " in text or incident.information
 
 
+# ---------------------------------------------------------------------------
+# Prediction
+# ---------------------------------------------------------------------------
+
+
 def predict_duration(incident):
-    """Returns (timedelta, confidence) or (None, None)."""
+    """Returns (timedelta, confidence) or (None, None).
+
+    The model is a classifier over "block offset" — how many coarse time
+    blocks after the incident's start block we expect it to be fixed in.
+    We decode the predicted class back into a representative timedelta so
+    callers keep getting a duration.
+    """
     data = _load_model()
     if data is None:
         return None, None
 
-    # Skip planned work — duration is in the text
     if _is_planned_work(incident):
         return None, None
 
     model = data["model"]
     vectorizer = data.get("vectorizer")
-    model_lower = data.get("model_lower")
-    model_upper = data.get("model_upper")
 
-    from django.utils import timezone as tz
+    from django.db.models import Q
+    from django.utils import timezone as tz_module
 
     from incidents.models import Incident
 
-    station = incident.station
+    # Roll the station up to its parent — a station like "Bank" has
+    # separate child records per line but is one place from the user's
+    # point of view, and that's where the station-manager-level signal lives.
+    station = incident.station.parent_station or incident.station
     text = incident.text.lower()
 
-    # Compute per-station historical stats from resolved incidents
-    station_stats = (
-        Incident.objects.filter(
-            station=station, resolved=True, end_time__isnull=False
-        )
-        .annotate(dur_seconds=Extract(F("end_time") - F("start_time"), "epoch"))
-        .aggregate(
-            station_mean_duration=Avg("dur_seconds"),
-            station_incident_count=Count("id"),
-        )
-    )
-    mean_dur = (station_stats["station_mean_duration"] or 0) / 60
-    count = station_stats["station_incident_count"] or 0
+    # Historical filter: the effective station itself, or any of its
+    # children. Covers both possibilities regardless of which record the
+    # incident was originally filed against.
+    station_filter = Q(station=station) | Q(station__parent_station=station)
 
-    # Number of reports on this incident
+    # Per-station historical stats from resolved incidents. We pull the raw
+    # start/end times so we can compute both mean duration and mean block
+    # offset in a single query — the training pipeline uses the same two
+    # features, so they have to match.
+    past = list(
+        Incident.objects.filter(
+            station_filter, resolved=True, end_time__isnull=False
+        ).values_list("start_time", "end_time")
+    )
+    count = len(past)
+    if count:
+        mean_dur = sum((e - s).total_seconds() for s, e in past) / count / 60
+        offsets = [
+            max(0, min(MAX_OFFSET_CLASS, block_index(e) - block_index(s)))
+            for s, e in past
+        ]
+        mean_offset = sum(offsets) / count
+    else:
+        mean_dur = 0
+        mean_offset = 0
+
     if hasattr(incident, "prefetched_reports"):
         num_reports = len(incident.prefetched_reports)
     elif incident.pk:
@@ -115,10 +201,9 @@ def predict_duration(incident):
     else:
         num_reports = 1
 
-    # Days since last incident at this station
     prev = (
         Incident.objects.filter(
-            station=station, start_time__lt=incident.start_time
+            station_filter, start_time__lt=incident.start_time
         )
         .order_by("-start_time")
         .values_list("start_time", flat=True)
@@ -129,15 +214,16 @@ def predict_duration(incident):
     else:
         days_since_last = -1
 
-    # Concurrent incidents at start time
     concurrent = Incident.objects.filter(
         resolved=False, start_time__lte=incident.start_time
     ).exclude(pk=incident.pk).count()
-    # Also count unresolved at prediction time if the incident is new
     if concurrent == 0:
         concurrent = Incident.objects.filter(resolved=False).exclude(
             pk=incident.pk
         ).count()
+
+    start_idx = block_index(incident.start_time)
+    start_block_num = start_idx % BLOCKS_PER_DAY
 
     features = {
         "station_id": station.id,
@@ -145,10 +231,11 @@ def predict_duration(incident):
         "hour_of_day": incident.start_time.hour,
         "day_of_week": incident.start_time.weekday(),
         "month": incident.start_time.month,
+        "is_weekend": int(incident.start_time.weekday() >= 5),
+        "start_block": start_block_num,
         "has_faulty_lift": int("faulty lift" in text),
         "has_planned_maintenance": int("planned maintenance" in text),
         "has_staff_issue": int("staff" in text),
-        "is_planned_work": 0,  # always 0 — we skip planned work above
         "tube": int(bool(station.tube)),
         "dlr": int(bool(station.dlr)),
         "national_rail": int(bool(station.national_rail)),
@@ -159,42 +246,61 @@ def predict_duration(incident):
         "days_since_last_incident": round(days_since_last, 2),
         "concurrent_incidents": concurrent,
         "station_mean_duration": mean_dur,
-        "station_median_duration": mean_dur,  # approximation at prediction time
         "station_incident_count": count,
+        "station_mean_offset": mean_offset,
     }
 
     try:
+        import numpy as np
         import pandas as pd
     except ImportError:
         return None, None
 
     df = pd.DataFrame([features])
 
-    # Add TF-IDF features if vectorizer is available
     if vectorizer is not None:
         tfidf_matrix = vectorizer.transform([incident.text or ""])
         tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
-        tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index)
+        tfidf_df = pd.DataFrame(
+            tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index
+        )
         df = pd.concat([df, tfidf_df], axis=1)
 
-    import numpy as np
+    # Classifier predicts a block offset; confidence is the class probability.
+    probs = model.predict_proba(df)[0]
+    pred_pos = int(np.argmax(probs))
+    pred_offset = int(model.classes_[pred_pos])
+    confidence = float(probs[pred_pos])
+    confidence = max(0.05, min(0.95, confidence))
 
-    # Model predicts log1p(minutes), so inverse transform
-    predicted_minutes = np.expm1(model.predict(df)[0])
+    # Decode offset → representative end datetime. block_start_end returns
+    # naive datetimes in local (London) time, so attach the project's
+    # configured timezone before doing any arithmetic with the incident's
+    # (UTC-stored) start_time.
+    end_idx = start_idx + pred_offset
+    block_start_naive, block_end_naive = block_start_end(end_idx)
+    local_tz = tz_module.get_default_timezone()
+    block_start_dt = block_start_naive.replace(tzinfo=local_tz)
+    block_end_dt = block_end_naive.replace(tzinfo=local_tz)
 
-    # Clamp to reasonable range: 5 minutes to 30 days
-    predicted_minutes = max(5, min(predicted_minutes, 60 * 24 * 30))
+    if pred_offset == 0:
+        # Same block as the start — midpoint between now and block end.
+        end_time = incident.start_time + (block_end_dt - incident.start_time) / 2
+    else:
+        end_time = block_start_dt + (block_end_dt - block_start_dt) / 2
 
-    # Compute confidence from quantile interval ratio
-    confidence = None
-    if model_lower is not None and model_upper is not None:
-        lower = max(1, np.expm1(model_lower.predict(df)[0]))
-        upper = max(1, np.expm1(model_upper.predict(df)[0]))
-        # Ratio of lower/upper: close to 1 = tight interval = confident
-        confidence = max(0.05, min(0.95, lower / upper))
-        confidence = round(confidence, 2)
+    # Guarantee strictly positive duration of at least 5 minutes.
+    min_end = incident.start_time + timedelta(minutes=5)
+    if end_time < min_end:
+        end_time = min_end
 
-    return timedelta(minutes=predicted_minutes), confidence
+    duration = end_time - incident.start_time
+    # Clamp to 30-day ceiling like before.
+    max_duration = timedelta(days=30)
+    if duration > max_duration:
+        duration = max_duration
+
+    return duration, round(confidence, 2)
 
 
 # Allow cache clearing when a new model is uploaded
