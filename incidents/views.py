@@ -19,7 +19,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from incidents.models import Incident, Report
 from incidents.utils import get_last_updated
-from incidents.ml import predict_duration
+from incidents.ml import predict_duration, time_block_slot, format_block_slot
 from stations.models import Station
 
 
@@ -59,6 +59,7 @@ def _incident_queryset():
 
 def _prepare_incidents(queryset):
     incidents = list(queryset)
+    now = timezone.now()
 
     for incident in incidents:
         reports = getattr(incident, "prefetched_reports", [])
@@ -69,31 +70,36 @@ def _prepare_incidents(queryset):
         incident.single_user_report_end_time = (
             reports[0].end_time if incident.is_single_user_report else None
         )
+
         if incident.start_time and incident.estimated_duration:
             incident.expected_end_time = incident.start_time + incident.estimated_duration
+            incident.expected_block = format_block_slot(
+                time_block_slot(incident.expected_end_time), now
+            )
         else:
             incident.expected_end_time = None
+            incident.expected_block = None
 
         if incident.prediction_confidence is not None:
             incident.confidence_pct = int(incident.prediction_confidence * 100)
         else:
             incident.confidence_pct = None
 
-        if incident.resolved and incident.end_time and incident.start_time and incident.estimated_duration:
-            actual = incident.end_time - incident.start_time
-            diff = actual - incident.estimated_duration
-            total_minutes = abs(int(diff.total_seconds())) // 60
-            hours, minutes = divmod(total_minutes, 60)
-            if hours:
-                duration_str = f"{hours}h {minutes}m"
-            else:
-                duration_str = f"{minutes}m"
-            if diff.total_seconds() > 0:
-                incident.duration_vs_expected = f"{duration_str} longer than expected"
-            else:
-                incident.duration_vs_expected = f"{duration_str} shorter than expected"
+        if (
+            incident.resolved
+            and incident.end_time
+            and incident.start_time
+            and incident.estimated_duration
+        ):
+            predicted_slot = time_block_slot(
+                incident.start_time + incident.estimated_duration
+            )
+            actual_slot = time_block_slot(incident.end_time)
+            incident.prediction_was_correct = predicted_slot == actual_slot
+            incident.actual_block = format_block_slot(actual_slot, now)
         else:
-            incident.duration_vs_expected = None
+            incident.prediction_was_correct = None
+            incident.actual_block = None
 
     return incidents
 
@@ -398,78 +404,48 @@ def _prediction_stats(since):
         resolved=True,
         end_time__gt=since,
         estimated_duration__isnull=False,
-    ).annotate(
-        actual_duration=ExpressionWrapper(
-            F("end_time") - F("start_time"),
-            output_field=DurationField(),
-        )
+        start_time__isnull=False,
+        end_time__isnull=False,
     )
 
-    if not incidents.exists():
-        return {"prediction_count": 0}
-
-    total_error = timedelta()
-    total_abs_error = timedelta()
-    abs_errors = []
     count = 0
-    # Buckets for confidence vs accuracy chart
-    buckets = {}  # confidence_pct -> list of absolute error in hours
+    correct = 0
+    # confidence bucket (0, 10, …, 90) -> [total, correct]
+    buckets = {}
 
     for inc in incidents:
-        error = inc.actual_duration - inc.estimated_duration
-        total_error += error
-        abs_error = abs(error)
-        total_abs_error += abs_error
-        abs_errors.append(abs_error)
+        predicted_slot = time_block_slot(inc.start_time + inc.estimated_duration)
+        actual_slot = time_block_slot(inc.end_time)
+        is_correct = predicted_slot == actual_slot
         count += 1
+        if is_correct:
+            correct += 1
 
         if inc.prediction_confidence is not None:
-            abs_error_hours = abs_error.total_seconds() / 3600
             bucket = min(9, int(inc.prediction_confidence * 10)) * 10
-            buckets.setdefault(bucket, []).append(abs_error_hours)
+            entry = buckets.setdefault(bucket, [0, 0])
+            entry[0] += 1
+            if is_correct:
+                entry[1] += 1
 
-    abs_errors.sort()
-    median_abs_error = abs_errors[len(abs_errors) // 2]
+    if count == 0:
+        return {"prediction_count": 0}
 
-    mean_error = total_error / count
-    mean_abs_error = total_abs_error / count
+    accuracy_pct = round(correct / count * 100)
 
-    def _fmt_signed_duration(td):
-        total_minutes = int(abs(td.total_seconds())) // 60
-        hours, minutes = divmod(total_minutes, 60)
-        sign = "+" if td.total_seconds() >= 0 else "-"
-        if hours:
-            return f"{sign}{hours}h {minutes}m"
-        return f"{sign}{minutes}m"
-
-    def _fmt_duration(td):
-        total_minutes = int(td.total_seconds()) // 60
-        hours, minutes = divmod(total_minutes, 60)
-        if hours:
-            return f"{hours}h {minutes}m"
-        return f"{minutes}m"
-
-    # Build chart data: for each confidence bucket, median absolute error in hours
+    # Build chart data: % correct per confidence bucket, 0–100 on Y axis.
     chart_height = 160
-    # Find max median error across buckets for scaling
-    medians = {}
-    for bucket in range(0, 100, 10):
-        errors = buckets.get(bucket, [])
-        if errors:
-            errors.sort()
-            medians[bucket] = errors[len(errors) // 2]
-    max_hours = max(medians.values()) if medians else 1
-
     chart_data = []
     for i, bucket in enumerate(range(0, 100, 10)):
         x = 60 + i * 43
-        if bucket in medians:
-            median_hrs = medians[bucket]
-            bar_h = round(median_hrs / max_hours * chart_height)
+        entry = buckets.get(bucket)
+        if entry and entry[0] > 0:
+            pct = entry[1] / entry[0] * 100
+            bar_h = round(pct / 100 * chart_height)
             chart_data.append({
                 "label": f"{bucket}-{bucket + 10}%",
-                "median_hours": round(median_hrs, 1),
-                "count": len(buckets[bucket]),
+                "accuracy_pct": round(pct),
+                "count": entry[0],
                 "x": x,
                 "y": 20 + chart_height - bar_h,
                 "h": bar_h,
@@ -478,22 +454,19 @@ def _prediction_stats(since):
         else:
             chart_data.append({
                 "label": f"{bucket}-{bucket + 10}%",
-                "median_hours": None,
+                "accuracy_pct": None,
                 "count": 0,
                 "x": x,
                 "y": 170,
                 "h": 10,
                 "text_x": x + 17,
             })
-    chart_max_hours = round(max_hours, 1)
 
     return {
         "prediction_count": count,
-        "prediction_mean_error": _fmt_signed_duration(mean_error),
-        "prediction_mean_abs_error": _fmt_duration(mean_abs_error),
-        "prediction_median_abs_error": _fmt_duration(median_abs_error),
+        "prediction_correct_count": correct,
+        "prediction_accuracy_pct": accuracy_pct,
         "confidence_chart": chart_data,
-        "chart_max_hours": chart_max_hours,
     }
 
 

@@ -51,30 +51,30 @@
             <h2>Duration Predictions (BETA)</h2>
             {% if prediction_count %}
                 <p>Predictions made: {{ prediction_count }}</p>
-                <p>Mean error: {{ prediction_mean_error }} <i>(positive = overestimate)</i></p>
-                <p>Mean absolute error: {{ prediction_mean_abs_error }}</p>
-                <p>Median absolute error: {{ prediction_median_abs_error }}</p>
+                <p>Correct block: {{ prediction_correct_count }} / {{ prediction_count }} ({{ prediction_accuracy_pct }}%)</p>
+                <p><i>A prediction is "correct" if the actual fix happened in the same time block (morning / daytime / evening / overnight) on the same day we predicted.</i></p>
 
                 {% if confidence_chart %}
-                <h3>Confidence vs Median Error</h3>
-                <p><i>Shorter bars = better predictions. Does higher confidence mean smaller errors?</i></p>
+                <h3>Confidence vs Accuracy</h3>
+                <p><i>Taller bars = more accurate. Does higher confidence mean more correct predictions?</i></p>
                 <svg viewBox="0 0 500 220" style="width:100%;max-width:500px;font-family:Montserrat,sans-serif;font-size:11px">
                     <!-- Y axis -->
-                    <text x="0" y="10" fill="#333">Median error</text>
+                    <text x="0" y="10" fill="#333">% correct</text>
                     <line x1="60" y1="20" x2="490" y2="20" stroke="#eee"/>
-                    <text x="45" y="24" text-anchor="end" fill="#999">{{ chart_max_hours }}h</text>
+                    <text x="45" y="24" text-anchor="end" fill="#999">100%</text>
                     <line x1="60" y1="100" x2="490" y2="100" stroke="#eee"/>
+                    <text x="45" y="104" text-anchor="end" fill="#999">50%</text>
                     <line x1="60" y1="180" x2="490" y2="180" stroke="#ccc"/>
-                    <text x="45" y="184" text-anchor="end" fill="#999">0h</text>
+                    <text x="45" y="184" text-anchor="end" fill="#999">0%</text>
                     <!-- X axis label -->
                     <text x="275" y="210" text-anchor="middle" fill="#333">Confidence bucket</text>
                     <!-- Bars -->
                     {% for bucket in confidence_chart %}
-                        {% if bucket.median_hours != None %}
+                        {% if bucket.accuracy_pct != None %}
                             <rect x="{{ bucket.x }}" y="{{ bucket.y }}"
                                   width="35" height="{{ bucket.h }}" rx="2"
-                                  fill="#d9534f" opacity="0.8">
-                                <title>{{ bucket.label }}: {{ bucket.median_hours }}h median error (n={{ bucket.count }})</title>
+                                  fill="#5cb85c" opacity="0.8">
+                                <title>{{ bucket.label }}: {{ bucket.accuracy_pct }}% correct (n={{ bucket.count }})</title>
                             </rect>
                         {% else %}
                             <rect x="{{ bucket.x }}" y="{{ bucket.y }}"

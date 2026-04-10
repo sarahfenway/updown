@@ -2,6 +2,49 @@ import os
 from datetime import timedelta
 from functools import lru_cache
 
+
+# Coarse time-of-day buckets we predict into. Overnight spans 20:00–05:00,
+# which is awkward because it straddles midnight — we anchor the slot to the
+# day the block *starts*, so an actual end_time at 02:00 resolves to
+# (previous date, "overnight"), matching a prediction at 23:00 the night before.
+def time_block_slot(dt):
+    """Return a (date, block_name) tuple identifying a coarse time slot."""
+    hour = dt.hour
+    if hour < 5:
+        return (dt.date() - timedelta(days=1), "overnight")
+    if hour < 10:
+        return (dt.date(), "morning")
+    if hour < 15:
+        return (dt.date(), "daytime")
+    if hour < 20:
+        return (dt.date(), "evening")
+    return (dt.date(), "overnight")
+
+
+def format_block_slot(slot, now):
+    """Human-friendly label for a (date, block) slot relative to ``now``."""
+    date, block = slot
+    today = now.date()
+    delta = (date - today).days
+    if delta == 0:
+        return {
+            "morning": "this morning",
+            "daytime": "this afternoon",
+            "evening": "this evening",
+            "overnight": "tonight",
+        }[block]
+    if delta == 1:
+        if block == "overnight":
+            return "tomorrow night"
+        return f"tomorrow {block}"
+    if delta == -1:
+        return f"yesterday {block}"
+    if 1 < delta < 7:
+        return f"{date.strftime('%A')} {block}"
+    if -7 < delta < -1:
+        return f"last {date.strftime('%A')} {block}"
+    return f"{date.strftime('%-d %b')} {block}"
+
 from django.conf import settings
 from django.db.models import Avg, Count, F
 from django.db.models.functions import Extract

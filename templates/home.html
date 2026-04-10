@@ -40,8 +40,8 @@
                                         {% endif %}
                                         {% if issue.start_time %}
                                             <br>
-                                            {% if issue.expected_end_time %}
-                                                <span title="BETA: Expected to last until {{ issue.expected_end_time|date:'H:i, d M' }}{% if issue.confidence_pct %} ({{ issue.confidence_pct }}% certain){% endif %}">{{ issue.start_time }}</span>
+                                            {% if issue.expected_block %}
+                                                <span title="BETA: Expected to be fixed {{ issue.expected_block }}{% if issue.confidence_pct %} ({{ issue.confidence_pct }}% certain){% endif %}">{{ issue.start_time }}</span>
                                             {% else %}
                                                 {{ issue.start_time }}
                                             {% endif %}
@@ -80,8 +80,8 @@
                                 {% endif %}
                                 <i>
                                     {% if issue.end_time %}
-                                        {% if issue.duration_vs_expected %}
-                                            <span title="BETA: Lasted {{ issue.duration_vs_expected }}{% if issue.confidence_pct %} (we were {{ issue.confidence_pct }}% certain){% endif %}">{{ issue.end_time }}</span>
+                                        {% if issue.prediction_was_correct is not None %}
+                                            <span title="BETA: {% if issue.prediction_was_correct %}We correctly predicted this would be fixed {{ issue.expected_block }}{% else %}Fixed {{ issue.actual_block }}, we predicted {{ issue.expected_block }}{% endif %}{% if issue.confidence_pct %} (we were {{ issue.confidence_pct }}% certain){% endif %}">{{ issue.end_time }}</span>
                                         {% else %}
                                             {{ issue.end_time }}
                                         {% endif %}
