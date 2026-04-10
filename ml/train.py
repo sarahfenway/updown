@@ -20,6 +20,8 @@ hoping the boundary doesn't get crossed.
 """
 
 import argparse
+import heapq
+import re
 import sys
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta
@@ -32,7 +34,6 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.utils.class_weight import compute_sample_weight
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +127,66 @@ def fetch_training_data(api_url, key):
 
 
 LOCAL_TZ = "Europe/London"
+PHONE_NUMBER_RE = re.compile(r"0[38]43\s*222\s*1234")
+
+
+def normalise_incident_text(text):
+    if not text:
+        return ""
+
+    text = PHONE_NUMBER_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def add_causal_station_history(df):
+    """Add station history features using only incidents already resolved."""
+    df = df.sort_values(["start_time", "end_time", "station_id"]).reset_index(drop=True)
+
+    station_count = {}
+    station_duration_sum = {}
+    station_offset_sum = {}
+    pending = []
+
+    mean_durations = []
+    incident_counts = []
+    mean_offsets = []
+
+    for seq, row in enumerate(df.itertuples(index=False), start=1):
+        while pending and pending[0][0] <= row.start_time:
+            _, _, station_id, duration_minutes, block_offset = heapq.heappop(pending)
+            station_count[station_id] = station_count.get(station_id, 0) + 1
+            station_duration_sum[station_id] = (
+                station_duration_sum.get(station_id, 0.0) + duration_minutes
+            )
+            station_offset_sum[station_id] = (
+                station_offset_sum.get(station_id, 0.0) + block_offset
+            )
+
+        count = station_count.get(row.station_id, 0)
+        incident_counts.append(count)
+
+        if count:
+            mean_durations.append(station_duration_sum[row.station_id] / count)
+            mean_offsets.append(station_offset_sum[row.station_id] / count)
+        else:
+            mean_durations.append(0.0)
+            mean_offsets.append(0.0)
+
+        heapq.heappush(
+            pending,
+            (
+                row.end_time,
+                seq,
+                row.station_id,
+                row.duration_minutes,
+                row.block_offset,
+            ),
+        )
+
+    df["station_mean_duration"] = mean_durations
+    df["station_incident_count"] = incident_counts
+    df["station_mean_offset"] = mean_offsets
+    return df
 
 
 def prepare_features(df):
@@ -159,7 +220,11 @@ def prepare_features(df):
     # Cap into a finite class set
     df[TARGET_COLUMN] = df["block_offset_raw"].clip(upper=MAX_OFFSET_CLASS).astype(int)
 
-    # Derived features
+    # Derived features are all based on local time so they line up with the
+    # block target we are predicting.
+    df["hour_of_day"] = df["start_time"].dt.hour.astype(int)
+    df["day_of_week"] = df["start_time"].dt.weekday.astype(int)
+    df["month"] = df["start_time"].dt.month.astype(int)
     df["start_block"] = (df["start_block_idx"] % BLOCKS_PER_DAY).astype(int)
     df["is_weekend"] = (df["start_time"].dt.weekday >= 5).astype(int)
 
@@ -178,17 +243,13 @@ def prepare_features(df):
     for col in bool_columns:
         df[col] = df[col].astype(int)
 
-    # Per-station historical aggregates. The raw station_id is also fed in
-    # as a categorical so the tree model can learn per-station behaviour
-    # directly ("this manager is shit"). These aggregates give a smoother
-    # fallback for stations with too few incidents for the tree to learn
-    # anything station-specific.
-    station_stats = df.groupby("station_id").agg(
-        station_mean_duration=("duration_minutes", "mean"),
-        station_incident_count=("duration_minutes", "count"),
-        station_mean_offset=(TARGET_COLUMN, "mean"),
-    )
-    df = df.merge(station_stats, on="station_id", how="left")
+    # Keep text noise down so the TF-IDF branch does not spend capacity on
+    # TfL boilerplate like the phone number.
+    df["text"] = df["text"].fillna("").map(normalise_incident_text)
+
+    # Use only already-ended incidents when building station history so the
+    # training features match what we can know at prediction time.
+    df = add_causal_station_history(df)
 
     # TF-IDF on incident text
     vectorizer = TfidfVectorizer(max_features=50, stop_words="english")
@@ -230,15 +291,11 @@ def train_model(df, feature_cols):
 
     _describe_class_distribution(y)
 
-    # Class-balanced sample weights so the classifier doesn't just learn
-    # "always say offset=X" for the most common class.
-    class_weights = compute_sample_weight(class_weight="balanced", y=y)
-
-    # Additionally weight recent data more heavily. Linear ramp from 1.0
-    # (oldest) to 3.0 (newest) so the last few months matter more.
+    # Weight recent data a bit more heavily, but keep the ramp gentle so we
+    # do not overfit to the latest slice at the expense of the dominant
+    # short-duration classes.
     n = len(df)
-    recency_weights = np.linspace(1.0, 3.0, n)
-    sample_weights = class_weights * recency_weights
+    sample_weights = np.linspace(1.0, 1.5, n)
 
     # Treat station_id as a proper categorical so the tree model can learn
     # per-station behaviour directly, instead of treating it as an ordinal
@@ -303,6 +360,9 @@ def upload_model(model, vectorizer, upload_url, key):
     joblib.dump({
         "model": model,
         "vectorizer": vectorizer,
+        "metadata": {
+            "feature_version": 2,
+        },
     }, model_path)
     print(f"\nModel saved locally to {model_path}")
 

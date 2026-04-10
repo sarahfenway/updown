@@ -20,6 +20,7 @@ from django.views.decorators.csrf import csrf_exempt
 from incidents.models import Incident, Report
 from incidents.utils import get_last_updated
 from incidents.ml import predict_duration, time_block_slot, format_block_slot
+from incidents.text_features import normalise_incident_text
 from stations.models import Station
 
 
@@ -571,7 +572,9 @@ def api_training_data(request):
             if raw_station is None:
                 continue
             station = _effective(raw_station)
-            text = incident.text.lower()
+            start_time_local = timezone.localtime(incident.start_time)
+            text = normalise_incident_text(incident.text)
+            text_lower = text.lower()
 
             prev_time = last_incident_at_station.get(station.id)
             if prev_time:
@@ -587,16 +590,16 @@ def api_training_data(request):
                 "start_time": incident.start_time.isoformat(),
                 "end_time": incident.end_time.isoformat(),
                 "duration_minutes": duration / 60,
-                "hour_of_day": incident.start_time.hour,
-                "day_of_week": incident.start_time.weekday(),
-                "month": incident.start_time.month,
-                "text": incident.text,
-                "has_faulty_lift": "faulty lift" in text,
-                "has_planned_maintenance": "planned maintenance" in text,
-                "has_staff_issue": "staff" in text,
+                "hour_of_day": start_time_local.hour,
+                "day_of_week": start_time_local.weekday(),
+                "month": start_time_local.month,
+                "text": text,
+                "has_faulty_lift": "faulty lift" in text_lower,
+                "has_planned_maintenance": "planned maintenance" in text_lower,
+                "has_staff_issue": "staff" in text_lower,
                 "is_planned_work": (
-                    "planned" in text
-                    or "until " in text
+                    "planned" in text_lower
+                    or "until " in text_lower
                     or incident.information
                 ),
                 "tube": bool(station.tube),

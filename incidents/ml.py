@@ -6,6 +6,8 @@ from datetime import datetime, time, timedelta
 
 from django.conf import settings
 
+from incidents.text_features import normalise_incident_text
+
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +182,7 @@ def _clear_model_cache():
 
 
 def _is_planned_work(incident):
-    text = incident.text.lower()
+    text = normalise_incident_text(incident.text).lower()
     return "planned" in text or "until " in text or incident.information
 
 
@@ -223,6 +225,9 @@ def _predict_duration(incident):
 
     model = data["model"]
     vectorizer = data.get("vectorizer")
+    metadata = data.get("metadata") or {}
+    feature_version = metadata.get("feature_version", 1)
+    use_v2_features = feature_version >= 2
 
     from django.db.models import Q
     from django.utils import timezone as tz_module
@@ -233,7 +238,9 @@ def _predict_duration(incident):
     # separate child records per line but is one place from the user's
     # point of view, and that's where the station-manager-level signal lives.
     station = incident.station.parent_station or incident.station
-    text = incident.text.lower()
+    feature_text = normalise_incident_text(incident.text) if use_v2_features else (incident.text or "")
+    text = feature_text.lower()
+    start_time_local = _to_local(incident.start_time) if use_v2_features else incident.start_time
 
     # Historical filter: the effective station itself, or any of its
     # children. Covers both possibilities regardless of which record the
@@ -244,11 +251,14 @@ def _predict_duration(incident):
     # start/end times so we can compute both mean duration and mean block
     # offset in a single query — the training pipeline uses the same two
     # features, so they have to match.
-    past = list(
-        Incident.objects.filter(
-            station_filter, resolved=True, end_time__isnull=False
-        ).values_list("start_time", "end_time")
+    past_qs = Incident.objects.filter(
+        station_filter,
+        resolved=True,
+        end_time__isnull=False,
     )
+    if use_v2_features:
+        past_qs = past_qs.filter(end_time__lte=incident.start_time)
+    past = list(past_qs.values_list("start_time", "end_time"))
     count = len(past)
     if count:
         mean_dur = sum((e - s).total_seconds() for s, e in past) / count / 60
@@ -281,13 +291,20 @@ def _predict_duration(incident):
     else:
         days_since_last = -1
 
-    concurrent = Incident.objects.filter(
-        resolved=False, start_time__lte=incident.start_time
-    ).exclude(pk=incident.pk).count()
-    if concurrent == 0:
-        concurrent = Incident.objects.filter(resolved=False).exclude(
-            pk=incident.pk
-        ).count()
+    if use_v2_features:
+        concurrent = Incident.objects.filter(
+            start_time__lte=incident.start_time,
+        ).filter(
+            Q(resolved=False) | Q(end_time__gt=incident.start_time)
+        ).exclude(pk=incident.pk).count()
+    else:
+        concurrent = Incident.objects.filter(
+            resolved=False, start_time__lte=incident.start_time
+        ).exclude(pk=incident.pk).count()
+        if concurrent == 0:
+            concurrent = Incident.objects.filter(resolved=False).exclude(
+                pk=incident.pk
+            ).count()
 
     start_idx = block_index(incident.start_time)
     start_block_num = start_idx % BLOCKS_PER_DAY
@@ -295,10 +312,10 @@ def _predict_duration(incident):
     features = {
         "station_id": station.id,
         "information": int(incident.information),
-        "hour_of_day": incident.start_time.hour,
-        "day_of_week": incident.start_time.weekday(),
-        "month": incident.start_time.month,
-        "is_weekend": int(incident.start_time.weekday() >= 5),
+        "hour_of_day": start_time_local.hour,
+        "day_of_week": start_time_local.weekday(),
+        "month": start_time_local.month,
+        "is_weekend": int(start_time_local.weekday() >= 5),
         "start_block": start_block_num,
         "has_faulty_lift": int("faulty lift" in text),
         "has_planned_maintenance": int("planned maintenance" in text),
@@ -326,12 +343,15 @@ def _predict_duration(incident):
     df = pd.DataFrame([features])
 
     if vectorizer is not None:
-        tfidf_matrix = vectorizer.transform([incident.text or ""])
+        tfidf_matrix = vectorizer.transform([feature_text])
         tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
         tfidf_df = pd.DataFrame(
             tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index
         )
         df = pd.concat([df, tfidf_df], axis=1)
+
+    expected_cols = list(getattr(model, "feature_names_in_", df.columns))
+    df = df.reindex(columns=expected_cols, fill_value=0)
 
     # Classifier predicts a block offset; confidence is the class probability.
     probs = model.predict_proba(df)[0]

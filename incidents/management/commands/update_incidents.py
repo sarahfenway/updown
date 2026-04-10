@@ -10,6 +10,13 @@ from incidents.utils import send_tweet, update_last_updated, send_bluesky
 from incidents.ml import predict_duration
 
 
+def refresh_prediction(incident):
+    duration, confidence = predict_duration(incident)
+    incident.estimated_duration = duration
+    incident.prediction_confidence = confidence
+    incident.save(update_fields=["estimated_duration", "prediction_confidence"])
+
+
 def consolidate_incidents():
     # Take all the reports and consolidate them into incidents
     for report in Report.objects.filter(resolved=False):
@@ -35,12 +42,6 @@ def consolidate_incidents():
                 end_time=report.end_time,
                 resolved=report.resolved,
             )
-            try:
-                duration, confidence = predict_duration(incident)
-                incident.estimated_duration = duration
-                incident.prediction_confidence = confidence
-            except Exception:
-                pass
             incident.save()
 
             tweet = f"{incident.station.name}: {incident.text}"
@@ -71,6 +72,7 @@ def consolidate_incidents():
 
         # Add the report to the incident
         incident.reports.add(report)
+        refresh_prediction(incident)
 
     for incident in Incident.objects.filter(resolved=False):
         # Resolve user generated reports

@@ -1,10 +1,16 @@
 import arrow
+import json
 import os
 import tempfile
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from io import StringIO
 from unittest.mock import MagicMock, patch
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - local test env may not have ML deps
+    np = None
 
 from django.core.management import CommandError, call_command
 from django.db import connection
@@ -13,6 +19,7 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from incidents.management.commands.update_incidents import consolidate_incidents
+from incidents.ml import predict_duration
 from incidents.models import Incident, Report
 from incidents.sources import tflapiv1, tflapiv2
 from incidents.utils import (
@@ -520,6 +527,127 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
             "Step free access has been restored at Victoria"
         )
 
+    def test_consolidate_refreshes_prediction_after_attaching_report(self):
+        parent = self.create_parent_station("Green Park")
+        first_report = self.create_report(
+            parent,
+            text="Lift unavailable on the northbound platform",
+            start_time=timezone.now() - timedelta(hours=4),
+        )
+        incident = self.create_incident(
+            parent,
+            reports=[first_report],
+            text=first_report.text,
+            start_time=first_report.start_time,
+            estimated_duration=timedelta(minutes=30),
+            prediction_confidence=0.1,
+        )
+        self.create_report(
+            parent,
+            text="Lift unavailable on the northbound platform.",
+            source=Report.SOURCE_TFLAPI_V2,
+            start_time=timezone.now() - timedelta(hours=1),
+        )
+
+        observed = {}
+
+        def fake_predict(updated_incident):
+            observed["reports_count"] = updated_incident.reports.count()
+            return timedelta(hours=4), 0.8
+
+        with patch(
+            "incidents.management.commands.update_incidents.predict_duration",
+            side_effect=fake_predict,
+        ), patch(
+            "incidents.management.commands.update_incidents.send_tweet"
+        ) as send_tweet_mock, patch(
+            "incidents.management.commands.update_incidents.send_bluesky"
+        ) as send_bluesky_mock:
+            consolidate_incidents()
+
+        incident.refresh_from_db()
+        self.assertEqual(observed["reports_count"], 2)
+        self.assertEqual(incident.estimated_duration, timedelta(hours=4))
+        self.assertEqual(incident.prediction_confidence, 0.8)
+        send_tweet_mock.assert_not_called()
+        send_bluesky_mock.assert_not_called()
+
+
+class PredictionFeatureTests(StationFactoryMixin, TestCase):
+    def test_predict_duration_uses_local_time_and_prior_station_history(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+
+        parent = self.create_parent_station("Canary Wharf")
+        self.create_incident(
+            parent,
+            text="Earlier outage",
+            resolved=True,
+            start_time=datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc),
+            end_time=datetime(2026, 7, 1, 8, 0, tzinfo=dt_timezone.utc),
+        )
+        incident = Incident(
+            station=parent,
+            text="Faulty lift. Call 0343 222 1234 for help.",
+            information=False,
+            start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
+            resolved=False,
+        )
+
+        captured = {}
+
+        class FakeModel:
+            classes_ = np.array([0])
+            feature_names_in_ = np.array(
+                [
+                    "station_id",
+                    "information",
+                    "hour_of_day",
+                    "day_of_week",
+                    "month",
+                    "is_weekend",
+                    "start_block",
+                    "has_faulty_lift",
+                    "has_planned_maintenance",
+                    "has_staff_issue",
+                    "tube",
+                    "dlr",
+                    "national_rail",
+                    "crossrail",
+                    "overground",
+                    "access_via_lift",
+                    "num_reports",
+                    "days_since_last_incident",
+                    "concurrent_incidents",
+                    "station_mean_duration",
+                    "station_incident_count",
+                    "station_mean_offset",
+                ],
+                dtype=object,
+            )
+
+            def predict_proba(self, df):
+                captured["features"] = df.iloc[0].to_dict()
+                return np.array([[1.0]])
+
+        with patch(
+            "incidents.ml._load_model",
+            return_value={"model": FakeModel(), "metadata": {"feature_version": 2}},
+        ):
+            duration, confidence = predict_duration(incident)
+
+        self.assertEqual(duration, timedelta(minutes=135))
+        self.assertEqual(confidence, 0.95)
+        self.assertEqual(captured["features"]["hour_of_day"], 10)
+        self.assertEqual(captured["features"]["month"], 7)
+        self.assertEqual(captured["features"]["start_block"], 1)
+        self.assertEqual(captured["features"]["has_faulty_lift"], 1)
+        self.assertEqual(captured["features"]["station_incident_count"], 1)
+        self.assertEqual(captured["features"]["station_mean_duration"], 60.0)
+        self.assertEqual(captured["features"]["station_mean_offset"], 0.0)
+        self.assertEqual(captured["features"]["num_reports"], 1)
+        self.assertEqual(captured["features"]["concurrent_incidents"], 0)
+
 
 @override_settings(ROOT_URLCONF="updown.urls")
 class ViewAndCommandTests(StationFactoryMixin, TestCase):
@@ -615,6 +743,25 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(payload["issues"][0]["station_naptan"], "WAT")
         self.assertEqual(len(payload["resolved"]), 1)
         self.assertEqual(len(payload["information"]), 1)
+
+    def test_api_training_data_uses_local_time_and_clean_text(self):
+        parent = self.create_parent_station("Liverpool Street", naptan_id="LST")
+        self.create_incident(
+            parent,
+            text="Faulty lift. Call 0343 222 1234 for help.",
+            resolved=True,
+            start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
+            end_time=datetime(2026, 7, 1, 11, 0, tzinfo=dt_timezone.utc),
+        )
+
+        response = self.client.get("/api/training-data/?key=verysecret")
+        payload = json.loads(b"".join(response.streaming_content).decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["incidents"][0]["hour_of_day"], 10)
+        self.assertEqual(payload["incidents"][0]["month"], 7)
+        self.assertNotIn("0343 222 1234", payload["incidents"][0]["text"])
+        self.assertTrue(payload["incidents"][0]["has_faulty_lift"])
 
     def test_detail_and_api_exclude_resolved_incidents_older_than_twelve_hours(self):
         parent = self.create_parent_station("Tottenham Court Road", naptan_id="TCR")
