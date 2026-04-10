@@ -132,8 +132,12 @@ def prepare_features(df):
     # Parse datetime columns and convert to local time. Blocks are defined
     # in London time, not UTC — otherwise the boundaries drift by an hour
     # during BST.
-    df["start_time"] = pd.to_datetime(df["start_time"], utc=True).dt.tz_convert(LOCAL_TZ)
-    df["end_time"] = pd.to_datetime(df["end_time"], utc=True).dt.tz_convert(LOCAL_TZ)
+    df["start_time"] = pd.to_datetime(
+        df["start_time"], utc=True, format="ISO8601"
+    ).dt.tz_convert(LOCAL_TZ)
+    df["end_time"] = pd.to_datetime(
+        df["end_time"], utc=True, format="ISO8601"
+    ).dt.tz_convert(LOCAL_TZ)
 
     # Drop planned work — duration is in the text, no point predicting
     planned_count = df["is_planned_work"].astype(bool).sum()
@@ -324,8 +328,12 @@ def calibration_report(df):
         return
 
     df = df.copy()
-    df["start_time_dt"] = pd.to_datetime(df["start_time"], utc=True).dt.tz_convert(LOCAL_TZ)
-    df["end_time_dt"] = pd.to_datetime(df["end_time"], utc=True).dt.tz_convert(LOCAL_TZ)
+    df["start_time_dt"] = pd.to_datetime(
+        df["start_time"], utc=True, format="ISO8601"
+    ).dt.tz_convert(LOCAL_TZ)
+    df["end_time_dt"] = pd.to_datetime(
+        df["end_time"], utc=True, format="ISO8601"
+    ).dt.tz_convert(LOCAL_TZ)
 
     has_prediction = df["estimated_duration_minutes"].notna()
     n_with = int(has_prediction.sum())
