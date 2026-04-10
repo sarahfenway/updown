@@ -40,8 +40,8 @@
                                         {% endif %}
                                         {% if issue.start_time %}
                                             <br>
-                                            {% if issue.expected_block %}
-                                                <span title="BETA: Expected to be fixed {{ issue.expected_block }}{% if issue.confidence_pct %} ({{ issue.confidence_pct }}% certain){% endif %}">{{ issue.start_time }}</span>
+                                            {% if issue.show_prediction %}
+                                                <span title="BETA: {{ issue.prediction_label|capfirst }} to be fixed {{ issue.expected_block }}{% if issue.prediction_accuracy_pct %} (recently similar predictions were right {{ issue.prediction_accuracy_pct }}% of the time){% endif %}">{{ issue.start_time }}</span>
                                             {% else %}
                                                 {{ issue.start_time }}
                                             {% endif %}
@@ -80,8 +80,8 @@
                                 {% endif %}
                                 <i>
                                     {% if issue.end_time %}
-                                        {% if issue.prediction_was_correct is not None %}
-                                            <span title="BETA: {% if issue.prediction_was_correct %}We correctly predicted this would be fixed {{ issue.expected_block }}{% else %}Fixed {{ issue.actual_block }}, we predicted {{ issue.expected_block }}{% endif %}{% if issue.confidence_pct %} (we were {{ issue.confidence_pct }}% certain){% endif %}">{{ issue.end_time }}</span>
+                                        {% if issue.show_prediction and issue.prediction_was_correct is not None %}
+                                            <span title="BETA: {% if issue.prediction_outcome == 'exact' %}We correctly thought it was {{ issue.prediction_label }} to be fixed {{ issue.expected_block }}{% elif issue.prediction_outcome == 'near' %}We were nearly right: fixed {{ issue.actual_block }}, just outside our predicted {{ issue.expected_block }} window{% else %}Fixed {{ issue.actual_block }}, we had thought it was {{ issue.prediction_label }} to be fixed {{ issue.expected_block }}{% endif %}{% if issue.prediction_accuracy_pct %} (recently similar predictions were right {{ issue.prediction_accuracy_pct }}% of the time){% endif %}">{{ issue.end_time }}</span>
                                         {% else %}
                                             {{ issue.end_time }}
                                         {% endif %}

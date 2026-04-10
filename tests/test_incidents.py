@@ -19,7 +19,7 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from incidents.management.commands.update_incidents import consolidate_incidents
-from incidents.ml import predict_duration
+from incidents.ml import predict_duration, prediction_outcome
 from incidents.models import Incident, Report
 from incidents.sources import tflapiv1, tflapiv2
 from incidents.utils import (
@@ -31,6 +31,11 @@ from incidents.utils import (
     send_bluesky,
     send_tweet,
     update_last_updated,
+)
+from incidents.views import (
+    _prediction_bucket_metrics,
+    _prediction_confidence_label,
+    _prepare_incidents,
 )
 from stations.models import Station
 
@@ -108,6 +113,39 @@ class StationFactoryMixin:
 
 
 class UtilityTests(SimpleTestCase):
+    def test_prediction_confidence_labels_are_conservative(self):
+        self.assertIsNone(_prediction_confidence_label(None))
+        self.assertEqual(_prediction_confidence_label(0.55), "maybe")
+        self.assertEqual(_prediction_confidence_label(0.69), "maybe")
+        self.assertEqual(_prediction_confidence_label(0.70), "likely")
+        self.assertEqual(_prediction_confidence_label(0.84), "likely")
+        self.assertEqual(_prediction_confidence_label(0.85), "very likely")
+
+    def test_prediction_outcome_treats_small_boundary_miss_as_near(self):
+        predicted_end = datetime(2026, 1, 1, 14, 0, tzinfo=dt_timezone.utc)
+
+        self.assertEqual(
+            prediction_outcome(
+                predicted_end,
+                datetime(2026, 1, 1, 14, 30, tzinfo=dt_timezone.utc),
+            ),
+            "exact",
+        )
+        self.assertEqual(
+            prediction_outcome(
+                predicted_end,
+                datetime(2026, 1, 1, 15, 1, tzinfo=dt_timezone.utc),
+            ),
+            "near",
+        )
+        self.assertEqual(
+            prediction_outcome(
+                predicted_end,
+                datetime(2026, 1, 1, 16, 0, tzinfo=dt_timezone.utc),
+            ),
+            "miss",
+        )
+
     def test_remove_tfl_specifics_and_grammar_cleanup(self):
         cleaned = remove_tfl_specifics(
             "Call our Travel Information Centre on 0343 222 1234 for further help. "
@@ -651,6 +689,68 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
 
 @override_settings(ROOT_URLCONF="updown.urls")
 class ViewAndCommandTests(StationFactoryMixin, TestCase):
+    def test_prepare_incidents_only_shows_predictions_from_stronger_buckets(self):
+        parent = self.create_parent_station("Waterloo")
+        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+
+        for i in range(15):
+            self.create_incident(
+                parent,
+                text=f"Resolved good {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i),
+                end_time=base + timedelta(days=i, hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+        for i in range(3):
+            self.create_incident(
+                parent,
+                text=f"Resolved missed {i}",
+                resolved=True,
+                start_time=base + timedelta(days=20 + i),
+                end_time=base + timedelta(days=20 + i, hours=1),
+                estimated_duration=timedelta(hours=12),
+                prediction_confidence=0.65,
+            )
+        for i in range(15):
+            self.create_incident(
+                parent,
+                text=f"Resolved bad {i}",
+                resolved=True,
+                start_time=base + timedelta(days=40 + i),
+                end_time=base + timedelta(days=40 + i, hours=1),
+                estimated_duration=timedelta(hours=12),
+                prediction_confidence=0.45,
+            )
+
+        low = self.create_incident(
+            parent,
+            text="Low confidence outage",
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.45,
+        )
+        high = self.create_incident(
+            parent,
+            text="High confidence outage",
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.65,
+        )
+        policy = _prediction_bucket_metrics(
+            timezone.now() - timedelta(days=365)
+        )["buckets"]
+
+        incidents = _prepare_incidents(
+            Incident.objects.filter(id__in=[low.id, high.id]).order_by("id"),
+            prediction_policy=policy,
+        )
+
+        self.assertFalse(incidents[0].show_prediction)
+        self.assertIsNone(incidents[0].prediction_label)
+        self.assertTrue(incidents[1].show_prediction)
+        self.assertEqual(incidents[1].prediction_label, "likely")
+        self.assertEqual(incidents[1].prediction_accuracy_pct, 83)
+
     def test_detail_renders_home_lists(self):
         parent = self.create_parent_station("Bank")
         active = self.create_incident(parent, text="Active outage", resolved=False)

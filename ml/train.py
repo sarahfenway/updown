@@ -47,6 +47,7 @@ BLOCK_OVERNIGHT = 3
 BLOCKS_PER_DAY = 4
 BLOCK_NAMES = ["morning", "daytime", "evening", "overnight"]
 MAX_OFFSET_CLASS = 20
+PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 
 
 def block_index(dt):
@@ -73,6 +74,20 @@ def block_start_end(index):
         return datetime.combine(day, time(15, 0)), datetime.combine(day, time(20, 0))
     start = datetime.combine(day, time(20, 0))
     return start, start + timedelta(hours=9)
+
+
+def block_distance_from_index(dt, index):
+    block_start_dt, block_end_dt = block_start_end(index)
+
+    if dt < block_start_dt:
+        return block_start_dt - dt
+    if dt > block_end_dt:
+        return dt - block_end_dt
+    return timedelta(0)
+
+
+def prediction_is_close_enough(predicted_block_idx, actual_dt, grace=PREDICTION_BOUNDARY_GRACE):
+    return block_distance_from_index(actual_dt, predicted_block_idx) <= grace
 
 
 # ---------------------------------------------------------------------------
@@ -326,20 +341,31 @@ def train_model(df, feature_cols):
         preds = cv_model.predict(X_test)
 
         exact = accuracy_score(y_test, preds)
+        predicted_block_idx = df.iloc[test_idx]["start_block_idx"].values + preds
+        actual_end_times = df.iloc[test_idx]["end_time"].tolist()
+        boundary_grace = np.mean(
+            [
+                prediction_is_close_enough(pred_idx, actual_dt)
+                for pred_idx, actual_dt in zip(predicted_block_idx, actual_end_times)
+            ]
+        )
         # "Within ±1 block" is a softer success criterion — useful sanity check
         within_one = np.mean(np.abs(preds - y_test.values) <= 1)
-        fold_scores.append((exact, within_one))
+        fold_scores.append((exact, boundary_grace, within_one))
 
     print(f"\nCross-validation results ({tscv.n_splits} splits):")
-    for i, (exact, within_one) in enumerate(fold_scores):
+    for i, (exact, boundary_grace, within_one) in enumerate(fold_scores):
         print(
             f"  fold {i + 1}: exact block {exact * 100:.1f}%, "
+            f"within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m of block {boundary_grace * 100:.1f}%, "
             f"within ±1 block {within_one * 100:.1f}%"
         )
     mean_exact = sum(s[0] for s in fold_scores) / len(fold_scores)
-    mean_within = sum(s[1] for s in fold_scores) / len(fold_scores)
+    mean_boundary = sum(s[1] for s in fold_scores) / len(fold_scores)
+    mean_within = sum(s[2] for s in fold_scores) / len(fold_scores)
     print(
         f"  mean:   exact block {mean_exact * 100:.1f}%, "
+        f"within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m of block {mean_boundary * 100:.1f}%, "
         f"within ±1 block {mean_within * 100:.1f}%"
     )
 
@@ -411,13 +437,25 @@ def calibration_report(df):
     sub["predicted_block_idx"] = sub["predicted_end"].apply(block_index)
     sub["actual_block_idx"] = sub["end_time_dt"].apply(block_index)
     sub["correct"] = sub["predicted_block_idx"] == sub["actual_block_idx"]
+    sub["close_enough"] = [
+        prediction_is_close_enough(pred_idx, actual_dt)
+        for pred_idx, actual_dt in zip(
+            sub["predicted_block_idx"].tolist(),
+            sub["end_time_dt"].tolist(),
+        )
+    ]
     sub["offset_error"] = (
         sub["predicted_block_idx"] - sub["actual_block_idx"]
     ).abs()
 
     acc = sub["correct"].mean()
+    close_enough = sub["close_enough"].mean()
     within_one = (sub["offset_error"] <= 1).mean()
     print(f"  Exact block:       {acc * 100:.1f}%")
+    print(
+        f"  Within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m of block: "
+        f"{close_enough * 100:.1f}%"
+    )
     print(f"  Within ±1 block:   {within_one * 100:.1f}%")
 
     categories = {
@@ -429,8 +467,11 @@ def calibration_report(df):
     for label, mask in categories.items():
         if mask.sum() == 0:
             continue
-        cat_acc = sub.loc[mask, "correct"].mean()
-        print(f"    {label} (n={int(mask.sum())}): {cat_acc * 100:.1f}% exact")
+        cat_acc = sub.loc[mask, "close_enough"].mean()
+        print(
+            f"    {label} (n={int(mask.sum())}): "
+            f"{cat_acc * 100:.1f}% within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m"
+        )
 
     networks = ["tube", "dlr", "national_rail", "crossrail", "overground"]
     print("\n  By network:")
@@ -438,8 +479,11 @@ def calibration_report(df):
         mask = sub[net].astype(bool)
         if mask.sum() == 0:
             continue
-        net_acc = sub.loc[mask, "correct"].mean()
-        print(f"    {net} (n={int(mask.sum())}): {net_acc * 100:.1f}% exact")
+        net_acc = sub.loc[mask, "close_enough"].mean()
+        print(
+            f"    {net} (n={int(mask.sum())}): "
+            f"{net_acc * 100:.1f}% within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m"
+        )
 
 
 # ---------------------------------------------------------------------------

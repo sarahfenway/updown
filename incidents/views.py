@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 from datetime import timedelta
+from math import sqrt
 
 from django.conf import settings
 from django.core.management import call_command
@@ -19,9 +20,20 @@ from django.views.decorators.csrf import csrf_exempt
 
 from incidents.models import Incident, Report
 from incidents.utils import get_last_updated
-from incidents.ml import predict_duration, time_block_slot, format_block_slot
+from incidents.ml import (
+    PREDICTION_BOUNDARY_GRACE,
+    format_block_slot,
+    predict_duration,
+    prediction_is_close_enough,
+    prediction_outcome,
+    time_block_slot,
+)
 from incidents.text_features import normalise_incident_text
 from stations.models import Station
+
+PREDICTION_POLICY_WINDOW_DAYS = 30
+PREDICTION_BUCKET_MIN_SAMPLES = 15
+PREDICTION_BUCKET_MIN_LOWER_BOUND = 0.55
 
 
 def _format_duration(duration):
@@ -58,9 +70,108 @@ def _incident_queryset():
     )
 
 
-def _prepare_incidents(queryset):
+def _prediction_confidence_bucket(confidence):
+    if confidence is None:
+        return None
+    return min(9, int(confidence * 10)) * 10
+
+
+def _prediction_confidence_label(accuracy):
+    if accuracy is None:
+        return None
+    if accuracy < 0.7:
+        return "maybe"
+    if accuracy < 0.85:
+        return "likely"
+    return "very likely"
+
+
+def _wilson_lower_bound(successes, total, z=1.96):
+    if total == 0:
+        return 0.0
+
+    phat = successes / total
+    denom = 1 + z * z / total
+    centre = phat + z * z / (2 * total)
+    margin = z * sqrt((phat * (1 - phat) + z * z / (4 * total)) / total)
+    return max(0.0, (centre - margin) / denom)
+
+
+def _prediction_bucket_metrics(since):
+    incidents = Incident.objects.filter(
+        resolved=True,
+        end_time__gt=since,
+        estimated_duration__isnull=False,
+        start_time__isnull=False,
+        end_time__isnull=False,
+    ).only("start_time", "end_time", "estimated_duration", "prediction_confidence")
+
+    count = 0
+    correct = 0
+    buckets = {}
+
+    for inc in incidents:
+        predicted_end = inc.start_time + inc.estimated_duration
+        is_correct = prediction_is_close_enough(predicted_end, inc.end_time)
+        count += 1
+        if is_correct:
+            correct += 1
+
+        bucket = _prediction_confidence_bucket(inc.prediction_confidence)
+        if bucket is None:
+            continue
+
+        entry = buckets.setdefault(bucket, {"count": 0, "correct": 0})
+        entry["count"] += 1
+        if is_correct:
+            entry["correct"] += 1
+
+    for bucket in range(0, 100, 10):
+        entry = buckets.setdefault(bucket, {"count": 0, "correct": 0})
+        if entry["count"] > 0:
+            accuracy = entry["correct"] / entry["count"]
+            lower_bound = _wilson_lower_bound(entry["correct"], entry["count"])
+        else:
+            accuracy = None
+            lower_bound = 0.0
+
+        show_prediction = (
+            entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES
+            and lower_bound >= PREDICTION_BUCKET_MIN_LOWER_BOUND
+        )
+        entry.update(
+            {
+                "bucket": bucket,
+                "accuracy": accuracy,
+                "accuracy_pct": round(accuracy * 100) if accuracy is not None else None,
+                "lower_bound": lower_bound,
+                "lower_bound_pct": round(lower_bound * 100),
+                "show_prediction": show_prediction,
+                "label": (
+                    _prediction_confidence_label(accuracy) if show_prediction else None
+                ),
+            }
+        )
+
+    return {
+        "prediction_count": count,
+        "prediction_correct_count": correct,
+        "prediction_accuracy_pct": round(correct / count * 100) if count else 0,
+        "buckets": buckets,
+    }
+
+
+def _prediction_display_policy(since):
+    return _prediction_bucket_metrics(since)["buckets"]
+
+
+def _prepare_incidents(queryset, prediction_policy=None):
     incidents = list(queryset)
     now = timezone.now()
+    if prediction_policy is None:
+        prediction_policy = _prediction_display_policy(
+            now - timedelta(days=PREDICTION_POLICY_WINDOW_DAYS)
+        )
 
     for incident in incidents:
         reports = getattr(incident, "prefetched_reports", [])
@@ -85,6 +196,13 @@ def _prepare_incidents(queryset):
             incident.confidence_pct = int(incident.prediction_confidence * 100)
         else:
             incident.confidence_pct = None
+        bucket = _prediction_confidence_bucket(incident.prediction_confidence)
+        bucket_policy = prediction_policy.get(bucket, {}) if bucket is not None else {}
+        incident.prediction_label = bucket_policy.get("label")
+        incident.prediction_accuracy_pct = bucket_policy.get("accuracy_pct")
+        incident.show_prediction = bool(
+            incident.expected_block is not None and bucket_policy.get("show_prediction")
+        )
 
         if (
             incident.resolved
@@ -92,14 +210,18 @@ def _prepare_incidents(queryset):
             and incident.start_time
             and incident.estimated_duration
         ):
-            predicted_slot = time_block_slot(
-                incident.start_time + incident.estimated_duration
-            )
+            predicted_end = incident.start_time + incident.estimated_duration
             actual_slot = time_block_slot(incident.end_time)
-            incident.prediction_was_correct = predicted_slot == actual_slot
+            incident.prediction_outcome = prediction_outcome(
+                predicted_end, incident.end_time
+            )
+            incident.prediction_was_correct = incident.prediction_outcome != "miss"
+            incident.prediction_was_nearly_right = incident.prediction_outcome == "near"
             incident.actual_block = format_block_slot(actual_slot, now)
         else:
+            incident.prediction_outcome = None
             incident.prediction_was_correct = None
+            incident.prediction_was_nearly_right = None
             incident.actual_block = None
 
     return incidents
@@ -110,20 +232,26 @@ def detail(request):
     if request.get_host().endswith("isstpthameslinkliftbroken.com"):
         return stp(request)
 
+    prediction_policy = _prediction_display_policy(
+        timezone.now() - timedelta(days=PREDICTION_POLICY_WINDOW_DAYS)
+    )
     issues = _prepare_incidents(
         _incident_queryset()
         .filter(resolved=False, information=False)
-        .order_by("-start_time", "station__parent_station")
+        .order_by("-start_time", "station__parent_station"),
+        prediction_policy=prediction_policy,
     )
     resolved = _prepare_incidents(
         _incident_queryset()
         .filter(resolved=True, end_time__gte=timezone.now() - timedelta(hours=12))
-        .order_by("-start_time", "station__parent_station")
+        .order_by("-start_time", "station__parent_station"),
+        prediction_policy=prediction_policy,
     )
     information = _prepare_incidents(
         _incident_queryset()
         .filter(resolved=False, information=True)
-        .order_by("-start_time", "station__parent_station")
+        .order_by("-start_time", "station__parent_station"),
+        prediction_policy=prediction_policy,
     )
 
     return render(
@@ -295,8 +423,12 @@ def stp(request):
         .first()
     )
     stp = station.parent_station if station else None
+    prediction_policy = _prediction_display_policy(
+        timezone.now() - timedelta(days=PREDICTION_POLICY_WINDOW_DAYS)
+    )
     issues = _prepare_incidents(
-        _incident_queryset().filter(resolved=False, information=False, station=stp)
+        _incident_queryset().filter(resolved=False, information=False, station=stp),
+        prediction_policy=prediction_policy,
     )
 
     yes_or_no = False
@@ -401,38 +533,13 @@ def stats(request):
 
 
 def _prediction_stats(since):
-    incidents = Incident.objects.filter(
-        resolved=True,
-        end_time__gt=since,
-        estimated_duration__isnull=False,
-        start_time__isnull=False,
-        end_time__isnull=False,
-    )
-
-    count = 0
-    correct = 0
-    # confidence bucket (0, 10, …, 90) -> [total, correct]
-    buckets = {}
-
-    for inc in incidents:
-        predicted_slot = time_block_slot(inc.start_time + inc.estimated_duration)
-        actual_slot = time_block_slot(inc.end_time)
-        is_correct = predicted_slot == actual_slot
-        count += 1
-        if is_correct:
-            correct += 1
-
-        if inc.prediction_confidence is not None:
-            bucket = min(9, int(inc.prediction_confidence * 10)) * 10
-            entry = buckets.setdefault(bucket, [0, 0])
-            entry[0] += 1
-            if is_correct:
-                entry[1] += 1
+    metrics = _prediction_bucket_metrics(since)
+    count = metrics["prediction_count"]
+    correct = metrics["prediction_correct_count"]
+    buckets = metrics["buckets"]
 
     if count == 0:
         return {"prediction_count": 0}
-
-    accuracy_pct = round(correct / count * 100)
 
     # Build chart data: % correct per confidence bucket, 0–100 on Y axis.
     chart_height = 160
@@ -440,13 +547,15 @@ def _prediction_stats(since):
     for i, bucket in enumerate(range(0, 100, 10)):
         x = 60 + i * 43
         entry = buckets.get(bucket)
-        if entry and entry[0] > 0:
-            pct = entry[1] / entry[0] * 100
+        if entry and entry["count"] > 0:
+            pct = entry["accuracy"] * 100
             bar_h = round(pct / 100 * chart_height)
             chart_data.append({
                 "label": f"{bucket}-{bucket + 10}%",
                 "accuracy_pct": round(pct),
-                "count": entry[0],
+                "count": entry["count"],
+                "show_prediction": entry["show_prediction"],
+                "prediction_label": entry["label"],
                 "x": x,
                 "y": 20 + chart_height - bar_h,
                 "h": bar_h,
@@ -466,8 +575,15 @@ def _prediction_stats(since):
     return {
         "prediction_count": count,
         "prediction_correct_count": correct,
-        "prediction_accuracy_pct": accuracy_pct,
+        "prediction_accuracy_pct": metrics["prediction_accuracy_pct"],
         "confidence_chart": chart_data,
+        "prediction_boundary_grace_minutes": int(
+            PREDICTION_BOUNDARY_GRACE.total_seconds() / 60
+        ),
+        "prediction_display_min_samples": PREDICTION_BUCKET_MIN_SAMPLES,
+        "prediction_display_min_accuracy_pct": round(
+            PREDICTION_BUCKET_MIN_LOWER_BOUND * 100
+        ),
     }
 
 

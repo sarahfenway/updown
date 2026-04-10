@@ -32,6 +32,7 @@ BLOCK_EVENING = 2
 BLOCK_OVERNIGHT = 3
 BLOCKS_PER_DAY = 4
 BLOCK_NAMES = ["morning", "daytime", "evening", "overnight"]
+PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 
 # Everything at or beyond this many blocks from the start is lumped into one
 # "long tail" class during training. Five days is plenty of detail; beyond
@@ -113,6 +114,41 @@ def format_block_slot(slot, now):
     if -7 < delta < -1:
         return f"last {date.strftime('%A')} {block}"
     return f"{date.strftime('%-d %b')} {block}"
+
+
+def _aware_block_bounds(index):
+    from django.utils import timezone as tz_module
+
+    start_naive, end_naive = block_start_end(index)
+    local_tz = tz_module.get_default_timezone()
+    return start_naive.replace(tzinfo=local_tz), end_naive.replace(tzinfo=local_tz)
+
+
+def block_distance_from_index(dt, index):
+    local_dt = _to_local(dt)
+    block_start_dt, block_end_dt = _aware_block_bounds(index)
+
+    if local_dt < block_start_dt:
+        return block_start_dt - local_dt
+    if local_dt > block_end_dt:
+        return local_dt - block_end_dt
+    return timedelta(0)
+
+
+def prediction_is_close_enough(predicted_dt, actual_dt, grace=PREDICTION_BOUNDARY_GRACE):
+    predicted_idx = block_index(predicted_dt)
+    return block_distance_from_index(actual_dt, predicted_idx) <= grace
+
+
+def prediction_outcome(predicted_dt, actual_dt, grace=PREDICTION_BOUNDARY_GRACE):
+    predicted_idx = block_index(predicted_dt)
+    actual_idx = block_index(actual_dt)
+
+    if predicted_idx == actual_idx:
+        return "exact"
+    if block_distance_from_index(actual_dt, predicted_idx) <= grace:
+        return "near"
+    return "miss"
 
 
 # ---------------------------------------------------------------------------

@@ -51,8 +51,9 @@
             <h2>Duration Predictions (BETA)</h2>
             {% if prediction_count %}
                 <p>Predictions made: {{ prediction_count }}</p>
-                <p>Correct block: {{ prediction_correct_count }} / {{ prediction_count }} ({{ prediction_accuracy_pct }}%)</p>
-                <p><i>A prediction is "correct" if the actual fix happened in the same time block (morning / daytime / evening / overnight) on the same day we predicted.</i></p>
+                <p>Right block or very close: {{ prediction_correct_count }} / {{ prediction_count }} ({{ prediction_accuracy_pct }}%)</p>
+                <p><i>A prediction is "correct" if the actual fix happened in the predicted time block, or within {{ prediction_boundary_grace_minutes }} minutes of that block starting or ending.</i></p>
+                <p><i>User-facing predictions are only shown when a confidence bucket has at least {{ prediction_display_min_samples }} recent examples and a conservative estimated accuracy above {{ prediction_display_min_accuracy_pct }}%.</i></p>
 
                 {% if confidence_chart %}
                 <h3>Confidence vs Accuracy</h3>
@@ -73,8 +74,8 @@
                         {% if bucket.accuracy_pct != None %}
                             <rect x="{{ bucket.x }}" y="{{ bucket.y }}"
                                   width="35" height="{{ bucket.h }}" rx="2"
-                                  fill="#5cb85c" opacity="0.8">
-                                <title>{{ bucket.label }}: {{ bucket.accuracy_pct }}% correct (n={{ bucket.count }})</title>
+                                  fill="{% if bucket.show_prediction %}#5cb85c{% else %}#bbb{% endif %}" opacity="0.8">
+                                <title>{{ bucket.label }}: {{ bucket.accuracy_pct }}% correct (n={{ bucket.count }}){% if bucket.show_prediction and bucket.prediction_label %}; shown as &quot;{{ bucket.prediction_label }}&quot;{% else %}; hidden from users{% endif %}</title>
                             </rect>
                         {% else %}
                             <rect x="{{ bucket.x }}" y="{{ bucket.y }}"
