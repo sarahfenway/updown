@@ -1373,6 +1373,15 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
                 estimated_duration=timedelta(hours=1),
                 prediction_confidence=0.65,
             )
+            self.create_incident(
+                parent,
+                text=f"Resolved weak {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i, hours=3),
+                end_time=base + timedelta(days=i, hours=7),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.25,
+            )
 
         self.create_incident(
             parent,
@@ -1392,11 +1401,19 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         )
         self.create_incident(
             parent,
-            text="Untrusted outage",
+            text="Sparse bucket outage",
             resolved=False,
             start_time=timezone.now() - timedelta(hours=1),
             estimated_duration=timedelta(hours=2),
             prediction_confidence=0.45,
+        )
+        self.create_incident(
+            parent,
+            text="Low accuracy outage",
+            resolved=False,
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.25,
         )
         self.create_incident(
             parent,
@@ -1409,11 +1426,18 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Current Prediction Visibility")
-        self.assertEqual(response.context["current_issue_count"], 4)
+        self.assertContains(response, "Hidden: too few similar examples")
+        self.assertContains(
+            response, "Hidden: similar predictions not accurate enough"
+        )
+        self.assertEqual(response.context["current_issue_count"], 5)
         self.assertEqual(response.context["current_prediction_visible_count"], 1)
         self.assertEqual(response.context["current_prediction_hidden_past_due_count"], 1)
         self.assertEqual(
-            response.context["current_prediction_hidden_untrusted_count"], 1
+            response.context["current_prediction_hidden_sparse_count"], 1
+        )
+        self.assertEqual(
+            response.context["current_prediction_hidden_low_accuracy_count"], 1
         )
         self.assertEqual(response.context["current_prediction_hidden_missing_count"], 1)
 

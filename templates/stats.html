@@ -94,7 +94,7 @@
                 <p><i>For unresolved issues right now, this is why beta predictions are shown or hidden.</i></p>
                 <div class="table-responsive">
                     <table class="table table-striped table-condensed">
-                        <caption class="sr-only">Current unresolved issues split by whether the beta prediction is shown, hidden because the confidence bucket is not trusted, hidden because the predicted time has already passed, or hidden because there is no usable prediction.</caption>
+                        <caption class="sr-only">Current unresolved issues split by whether the beta prediction is shown, hidden because there are too few similar examples, hidden because similar predictions have not been accurate enough, hidden because the predicted time has already passed, or hidden because there is no usable prediction.</caption>
                         <thead>
                             <tr>
                                 <th scope="col">Status</th>
@@ -111,8 +111,12 @@
                                 <td>{{ current_prediction_visible_count }}</td>
                             </tr>
                             <tr>
-                                <td>Hidden: confidence bucket not trusted</td>
-                                <td>{{ current_prediction_hidden_untrusted_count }}</td>
+                                <td>Hidden: too few similar examples</td>
+                                <td>{{ current_prediction_hidden_sparse_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Hidden: similar predictions not accurate enough</td>
+                                <td>{{ current_prediction_hidden_low_accuracy_count }}</td>
                             </tr>
                             <tr>
                                 <td>Hidden: predicted time has passed</td>

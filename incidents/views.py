@@ -144,7 +144,9 @@ def _prediction_hidden_reason(expected_end_time, expected_block, bucket_policy, 
     if expected_end_time is None or expected_block is None:
         return "missing_prediction"
     if not bucket_policy.get("show_prediction"):
-        return "untrusted_bucket"
+        if bucket_policy.get("count", 0) < PREDICTION_BUCKET_MIN_SAMPLES:
+            return "bucket_too_sparse"
+        return "bucket_accuracy_too_low"
     if expected_end_time <= now:
         return "past_due"
     return None
@@ -885,10 +887,15 @@ def _prediction_stats(since):
     current_prediction_visible_count = sum(
         1 for issue in current_issues if issue.show_prediction
     )
-    current_prediction_hidden_untrusted_count = sum(
+    current_prediction_hidden_sparse_count = sum(
         1
         for issue in current_issues
-        if issue.prediction_hidden_reason == "untrusted_bucket"
+        if issue.prediction_hidden_reason == "bucket_too_sparse"
+    )
+    current_prediction_hidden_low_accuracy_count = sum(
+        1
+        for issue in current_issues
+        if issue.prediction_hidden_reason == "bucket_accuracy_too_low"
     )
     current_prediction_hidden_past_due_count = sum(
         1 for issue in current_issues if issue.prediction_hidden_reason == "past_due"
@@ -979,8 +986,11 @@ def _prediction_stats(since):
         ),
         "current_issue_count": len(current_issues),
         "current_prediction_visible_count": current_prediction_visible_count,
-        "current_prediction_hidden_untrusted_count": (
-            current_prediction_hidden_untrusted_count
+        "current_prediction_hidden_sparse_count": (
+            current_prediction_hidden_sparse_count
+        ),
+        "current_prediction_hidden_low_accuracy_count": (
+            current_prediction_hidden_low_accuracy_count
         ),
         "current_prediction_hidden_past_due_count": (
             current_prediction_hidden_past_due_count
