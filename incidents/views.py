@@ -140,6 +140,16 @@ def _beta_resolved_status_title(issue):
     )
 
 
+def _prediction_hidden_reason(expected_end_time, expected_block, bucket_policy, now):
+    if expected_end_time is None or expected_block is None:
+        return "missing_prediction"
+    if not bucket_policy.get("show_prediction"):
+        return "untrusted_bucket"
+    if expected_end_time <= now:
+        return "past_due"
+    return None
+
+
 def _format_absolute_block_slot(slot):
     date, block = slot
     return f"{date.day} {date.strftime('%b')} {block}"
@@ -405,16 +415,18 @@ def _prepare_incidents(queryset, prediction_policy=None):
         bucket_policy = prediction_policy.get(bucket, {}) if bucket is not None else {}
         incident.prediction_label = bucket_policy.get("label")
         incident.prediction_accuracy_pct = bucket_policy.get("accuracy_pct")
-        incident.show_prediction = bool(
-            incident.expected_block is not None
-            and bucket_policy.get("show_prediction")
-            and (
-                incident.resolved
-                or (
-                    incident.expected_end_time is not None
-                    and incident.expected_end_time > now
-                )
+        incident.prediction_hidden_reason = (
+            None
+            if incident.resolved
+            else _prediction_hidden_reason(
+                incident.expected_end_time,
+                incident.expected_block,
+                bucket_policy,
+                now,
             )
+        )
+        incident.show_prediction = bool(
+            incident.resolved or incident.prediction_hidden_reason is None
         )
         incident.beta_current_status = _beta_current_status_text(
             incident.prediction_label,
@@ -852,6 +864,40 @@ def _prediction_stats(since):
     correct = metrics["prediction_correct_count"]
     buckets = metrics["buckets"]
     recent_prediction_rows = []
+    current_issues = _prepare_incidents(
+        Incident.objects.select_related("station", "station__parent_station")
+        .filter(resolved=False, information=False)
+        .only(
+            "id",
+            "station_id",
+            "station__name",
+            "station__parent_station__name",
+            "information",
+            "text",
+            "start_time",
+            "estimated_duration",
+            "prediction_confidence",
+            "resolved",
+        )
+        .order_by("-start_time", "-id"),
+        prediction_policy=display_policy,
+    )
+    current_prediction_visible_count = sum(
+        1 for issue in current_issues if issue.show_prediction
+    )
+    current_prediction_hidden_untrusted_count = sum(
+        1
+        for issue in current_issues
+        if issue.prediction_hidden_reason == "untrusted_bucket"
+    )
+    current_prediction_hidden_past_due_count = sum(
+        1 for issue in current_issues if issue.prediction_hidden_reason == "past_due"
+    )
+    current_prediction_hidden_missing_count = sum(
+        1
+        for issue in current_issues
+        if issue.prediction_hidden_reason == "missing_prediction"
+    )
 
     for incident in incidents:
         if incident.end_time <= since or len(recent_prediction_rows) >= PREDICTION_REVIEW_LIMIT:
@@ -931,6 +977,15 @@ def _prediction_stats(since):
         "prediction_display_fallback_window_days": ", ".join(
             str(days) for days in PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
         ),
+        "current_issue_count": len(current_issues),
+        "current_prediction_visible_count": current_prediction_visible_count,
+        "current_prediction_hidden_untrusted_count": (
+            current_prediction_hidden_untrusted_count
+        ),
+        "current_prediction_hidden_past_due_count": (
+            current_prediction_hidden_past_due_count
+        ),
+        "current_prediction_hidden_missing_count": current_prediction_hidden_missing_count,
         "recent_prediction_rows": recent_prediction_rows,
         "prediction_review_limit": PREDICTION_REVIEW_LIMIT,
     }

@@ -1359,6 +1359,64 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(rows[0]["station_name"], "Green Park")
         self.assertEqual(rows[0]["outcome_text"], "Right")
 
+    def test_stats_includes_current_prediction_visibility_breakdown(self):
+        parent = self.create_parent_station("Green Park")
+        base = timezone.now() - timedelta(days=10)
+
+        for i in range(15):
+            self.create_incident(
+                parent,
+                text=f"Resolved good {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i),
+                end_time=base + timedelta(days=i, hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+
+        self.create_incident(
+            parent,
+            text="Visible outage",
+            resolved=False,
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.65,
+        )
+        self.create_incident(
+            parent,
+            text="Past due outage",
+            resolved=False,
+            start_time=timezone.now() - timedelta(hours=4),
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.65,
+        )
+        self.create_incident(
+            parent,
+            text="Untrusted outage",
+            resolved=False,
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.45,
+        )
+        self.create_incident(
+            parent,
+            text="Missing prediction outage",
+            resolved=False,
+        )
+
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            response = self.client.get("/stats/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Current Prediction Visibility")
+        self.assertEqual(response.context["current_issue_count"], 4)
+        self.assertEqual(response.context["current_prediction_visible_count"], 1)
+        self.assertEqual(response.context["current_prediction_hidden_past_due_count"], 1)
+        self.assertEqual(
+            response.context["current_prediction_hidden_untrusted_count"], 1
+        )
+        self.assertEqual(response.context["current_prediction_hidden_missing_count"], 1)
+
     def test_stats_uses_small_constant_number_of_queries(self):
         parent = self.create_parent_station("Green Park")
         now = timezone.now()
@@ -1389,7 +1447,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
                 response = self.client.get("/stats/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertLessEqual(len(queries), 2)
+        self.assertLessEqual(len(queries), 3)
 
     def test_faq_and_privacy_pages_render(self):
         faq_response = self.client.get("/faq/")

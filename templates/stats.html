@@ -90,6 +90,42 @@
                 </svg>
                 {% endif %}
 
+                <h3>Current Prediction Visibility</h3>
+                <p><i>For unresolved issues right now, this is why beta predictions are shown or hidden.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Current unresolved issues split by whether the beta prediction is shown, hidden because the confidence bucket is not trusted, hidden because the predicted time has already passed, or hidden because there is no usable prediction.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Status</th>
+                                <th scope="col">Count</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Current unresolved issues</td>
+                                <td>{{ current_issue_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Shown in beta</td>
+                                <td>{{ current_prediction_visible_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Hidden: confidence bucket not trusted</td>
+                                <td>{{ current_prediction_hidden_untrusted_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Hidden: predicted time has passed</td>
+                                <td>{{ current_prediction_hidden_past_due_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Hidden: no usable prediction</td>
+                                <td>{{ current_prediction_hidden_missing_count }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
                 {% if recent_prediction_rows %}
                 <h3>Recent Prediction Checks</h3>
                 <p><i>The {{ prediction_review_limit }} most recent resolved incidents with predictions.</i></p>
