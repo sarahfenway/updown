@@ -32,6 +32,7 @@ from incidents.text_features import normalise_incident_text
 from stations.models import Station
 
 PREDICTION_POLICY_WINDOW_DAYS = 30
+PREDICTION_POLICY_FALLBACK_WINDOW_DAYS = (90, 180)
 PREDICTION_BUCKET_MIN_SAMPLES = 15
 PREDICTION_BUCKET_MIN_LOWER_BOUND = 0.55
 BETA_LONG_RANGE_DAYS = 7
@@ -213,17 +214,151 @@ def _prediction_bucket_metrics(since):
     }
 
 
-def _prediction_display_policy(since):
-    return _prediction_bucket_metrics(since)["buckets"]
+def _prediction_window_metrics(now=None, windows=None):
+    if now is None:
+        now = timezone.now()
+    if windows is None:
+        windows = (PREDICTION_POLICY_WINDOW_DAYS,)
+
+    windows = tuple(sorted(set(windows)))
+    oldest_since = now - timedelta(days=windows[-1])
+    incidents = Incident.objects.filter(
+        resolved=True,
+        end_time__gt=oldest_since,
+        estimated_duration__isnull=False,
+        start_time__isnull=False,
+        end_time__isnull=False,
+    ).only("start_time", "end_time", "estimated_duration", "prediction_confidence")
+
+    raw_metrics = {
+        days: {"prediction_count": 0, "prediction_correct_count": 0, "buckets": {}}
+        for days in windows
+    }
+    window_starts = {days: now - timedelta(days=days) for days in windows}
+
+    for inc in incidents:
+        predicted_end = inc.start_time + inc.estimated_duration
+        is_correct = prediction_is_close_enough(predicted_end, inc.end_time)
+        bucket = _prediction_confidence_bucket(inc.prediction_confidence)
+
+        for days in windows:
+            if inc.end_time <= window_starts[days]:
+                continue
+
+            metrics = raw_metrics[days]
+            metrics["prediction_count"] += 1
+            if is_correct:
+                metrics["prediction_correct_count"] += 1
+
+            if bucket is None:
+                continue
+
+            entry = metrics["buckets"].setdefault(bucket, {"count": 0, "correct": 0})
+            entry["count"] += 1
+            if is_correct:
+                entry["correct"] += 1
+
+    finalised = {}
+    for days in windows:
+        metrics = raw_metrics[days]
+        buckets = metrics["buckets"]
+        for bucket in range(0, 100, 10):
+            entry = buckets.setdefault(bucket, {"count": 0, "correct": 0})
+            if entry["count"] > 0:
+                accuracy = entry["correct"] / entry["count"]
+                lower_bound = _wilson_lower_bound(entry["correct"], entry["count"])
+            else:
+                accuracy = None
+                lower_bound = 0.0
+
+            show_prediction = (
+                entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES
+                and lower_bound >= PREDICTION_BUCKET_MIN_LOWER_BOUND
+            )
+            entry.update(
+                {
+                    "bucket": bucket,
+                    "accuracy": accuracy,
+                    "accuracy_pct": (
+                        round(accuracy * 100) if accuracy is not None else None
+                    ),
+                    "lower_bound": lower_bound,
+                    "lower_bound_pct": round(lower_bound * 100),
+                    "show_prediction": show_prediction,
+                    "label": (
+                        _prediction_confidence_label(accuracy)
+                        if show_prediction
+                        else None
+                    ),
+                }
+            )
+
+        count = metrics["prediction_count"]
+        correct = metrics["prediction_correct_count"]
+        finalised[days] = {
+            "prediction_count": count,
+            "prediction_correct_count": correct,
+            "prediction_accuracy_pct": round(correct / count * 100) if count else 0,
+            "buckets": buckets,
+        }
+
+    return finalised
+
+
+def _prediction_display_policy_from_window_metrics(metrics_by_window):
+    windows = (PREDICTION_POLICY_WINDOW_DAYS,) + PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
+    policy = {}
+
+    for bucket in range(0, 100, 10):
+        selected_window_days = windows[-1]
+        selected_entry = metrics_by_window[selected_window_days]["buckets"][bucket]
+        primary_entry = metrics_by_window[PREDICTION_POLICY_WINDOW_DAYS]["buckets"][bucket]
+
+        if primary_entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES:
+            selected_window_days = PREDICTION_POLICY_WINDOW_DAYS
+            selected_entry = primary_entry
+        else:
+            for days in PREDICTION_POLICY_FALLBACK_WINDOW_DAYS:
+                entry = metrics_by_window[days]["buckets"][bucket]
+                if entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES:
+                    selected_window_days = days
+                    selected_entry = entry
+                    break
+
+        show_prediction = (
+            selected_entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES
+            and selected_entry["lower_bound"] >= PREDICTION_BUCKET_MIN_LOWER_BOUND
+        )
+        policy[bucket] = {
+            **selected_entry,
+            "bucket": bucket,
+            "window_days": selected_window_days,
+            "used_fallback_window": selected_window_days != PREDICTION_POLICY_WINDOW_DAYS,
+            "show_prediction": show_prediction,
+            "label": (
+                _prediction_confidence_label(selected_entry["accuracy"])
+                if show_prediction
+                else None
+            ),
+        }
+
+    return policy
+
+
+def _prediction_display_policy(now=None):
+    if now is None:
+        now = timezone.now()
+
+    windows = (PREDICTION_POLICY_WINDOW_DAYS,) + PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
+    metrics_by_window = _prediction_window_metrics(now, windows)
+    return _prediction_display_policy_from_window_metrics(metrics_by_window)
 
 
 def _prepare_incidents(queryset, prediction_policy=None):
     incidents = list(queryset)
     now = timezone.now()
     if prediction_policy is None:
-        prediction_policy = _prediction_display_policy(
-            now - timedelta(days=PREDICTION_POLICY_WINDOW_DAYS)
-        )
+        prediction_policy = _prediction_display_policy(now)
 
     for incident in incidents:
         reports = getattr(incident, "prefetched_reports", [])
@@ -361,9 +496,7 @@ def _beta_status_copy(issues, resolved, information):
 
 
 def _status_page_context():
-    prediction_policy = _prediction_display_policy(
-        timezone.now() - timedelta(days=PREDICTION_POLICY_WINDOW_DAYS)
-    )
+    prediction_policy = _prediction_display_policy(timezone.now())
     issues = _prepare_incidents(
         _incident_queryset()
         .filter(resolved=False, information=False)
@@ -563,9 +696,7 @@ def stp(request):
         .first()
     )
     stp = station.parent_station if station else None
-    prediction_policy = _prediction_display_policy(
-        timezone.now() - timedelta(days=PREDICTION_POLICY_WINDOW_DAYS)
-    )
+    prediction_policy = _prediction_display_policy(timezone.now())
     issues = _prepare_incidents(
         _incident_queryset().filter(resolved=False, information=False, station=stp),
         prediction_policy=prediction_policy,
@@ -673,7 +804,11 @@ def stats(request):
 
 
 def _prediction_stats(since):
-    metrics = _prediction_bucket_metrics(since)
+    now = timezone.now()
+    windows = (PREDICTION_POLICY_WINDOW_DAYS,) + PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
+    window_metrics = _prediction_window_metrics(now, windows)
+    metrics = window_metrics[PREDICTION_POLICY_WINDOW_DAYS]
+    display_policy = _prediction_display_policy_from_window_metrics(window_metrics)
     count = metrics["prediction_count"]
     correct = metrics["prediction_correct_count"]
     buckets = metrics["buckets"]
@@ -687,6 +822,7 @@ def _prediction_stats(since):
     for i, bucket in enumerate(range(0, 100, 10)):
         x = 60 + i * 43
         entry = buckets.get(bucket)
+        display_entry = display_policy.get(bucket, {})
         if entry and entry["count"] > 0:
             pct = entry["accuracy"] * 100
             bar_h = round(pct / 100 * chart_height)
@@ -694,8 +830,12 @@ def _prediction_stats(since):
                 "label": f"{bucket}-{bucket + 10}%",
                 "accuracy_pct": round(pct),
                 "count": entry["count"],
-                "show_prediction": entry["show_prediction"],
-                "prediction_label": entry["label"],
+                "show_prediction": display_entry.get("show_prediction", False),
+                "prediction_label": display_entry.get("label"),
+                "policy_window_days": display_entry.get("window_days"),
+                "used_fallback_window": display_entry.get(
+                    "used_fallback_window", False
+                ),
                 "x": x,
                 "y": 20 + chart_height - bar_h,
                 "h": bar_h,
@@ -723,6 +863,10 @@ def _prediction_stats(since):
         "prediction_display_min_samples": PREDICTION_BUCKET_MIN_SAMPLES,
         "prediction_display_min_accuracy_pct": round(
             PREDICTION_BUCKET_MIN_LOWER_BOUND * 100
+        ),
+        "prediction_display_primary_window_days": PREDICTION_POLICY_WINDOW_DAYS,
+        "prediction_display_fallback_window_days": ", ".join(
+            str(days) for days in PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
         ),
     }
 

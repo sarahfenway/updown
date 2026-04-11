@@ -35,6 +35,7 @@ from incidents.utils import (
 from incidents.views import (
     _prediction_bucket_metrics,
     _prediction_confidence_label,
+    _prediction_display_policy,
     _prepare_incidents,
 )
 from stations.models import Station
@@ -750,6 +751,72 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertTrue(incidents[1].show_prediction)
         self.assertEqual(incidents[1].prediction_label, "likely")
         self.assertEqual(incidents[1].prediction_accuracy_pct, 83)
+
+    def test_prediction_display_policy_falls_back_when_recent_bucket_is_sparse(self):
+        parent = self.create_parent_station("Waterloo")
+        now = timezone.now()
+
+        for i in range(10):
+            start_time = now - timedelta(days=10 + i, hours=2)
+            self.create_incident(
+                parent,
+                text=f"Recent good {i}",
+                resolved=True,
+                start_time=start_time,
+                end_time=start_time + timedelta(hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+        for i in range(5):
+            start_time = now - timedelta(days=40 + i, hours=2)
+            self.create_incident(
+                parent,
+                text=f"Fallback good {i}",
+                resolved=True,
+                start_time=start_time,
+                end_time=start_time + timedelta(hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+
+        policy = _prediction_display_policy(now)
+
+        self.assertTrue(policy[60]["show_prediction"])
+        self.assertEqual(policy[60]["window_days"], 90)
+        self.assertTrue(policy[60]["used_fallback_window"])
+
+    def test_prediction_display_policy_keeps_recent_bad_bucket_hidden(self):
+        parent = self.create_parent_station("Waterloo")
+        now = timezone.now()
+
+        for i in range(15):
+            start_time = now - timedelta(days=10 + i, hours=2)
+            self.create_incident(
+                parent,
+                text=f"Recent miss {i}",
+                resolved=True,
+                start_time=start_time,
+                end_time=start_time + timedelta(hours=1),
+                estimated_duration=timedelta(hours=12),
+                prediction_confidence=0.65,
+            )
+        for i in range(20):
+            start_time = now - timedelta(days=60 + i, hours=2)
+            self.create_incident(
+                parent,
+                text=f"Older good {i}",
+                resolved=True,
+                start_time=start_time,
+                end_time=start_time + timedelta(hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+
+        policy = _prediction_display_policy(now)
+
+        self.assertFalse(policy[60]["show_prediction"])
+        self.assertEqual(policy[60]["window_days"], 30)
+        self.assertFalse(policy[60]["used_fallback_window"])
 
     def test_prepare_incidents_hides_overdue_current_prediction(self):
         parent = self.create_parent_station("Bank")
