@@ -309,6 +309,8 @@ def _predict_duration(incident):
 
     if hasattr(incident, "prefetched_reports"):
         num_reports = len(incident.prefetched_reports)
+    elif hasattr(incident, "num_reports"):
+        num_reports = incident.num_reports or 0
     elif incident.pk:
         num_reports = incident.reports.count()
     else:

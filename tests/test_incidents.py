@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover - local test env may not have ML deps
 
 from django.core.management import CommandError, call_command
 from django.db import connection
+from django.db.models import Count
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -687,9 +688,101 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
         self.assertEqual(captured["features"]["num_reports"], 1)
         self.assertEqual(captured["features"]["concurrent_incidents"], 0)
 
+    def test_predict_duration_uses_annotated_num_reports(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+
+        parent = self.create_parent_station("Canary Wharf")
+        report_one = self.create_report(parent, text="Lift unavailable")
+        report_two = self.create_report(parent, text="Second report")
+        incident = self.create_incident(
+            parent,
+            text="Faulty lift",
+            reports=[report_one, report_two],
+        )
+        incident = Incident.objects.annotate(
+            num_reports=Count("reports", distinct=True)
+        ).get(pk=incident.pk)
+
+        captured = {}
+
+        class FakeModel:
+            classes_ = np.array([0])
+            feature_names_in_ = np.array(
+                [
+                    "station_id",
+                    "information",
+                    "hour_of_day",
+                    "day_of_week",
+                    "month",
+                    "is_weekend",
+                    "start_block",
+                    "has_faulty_lift",
+                    "has_planned_maintenance",
+                    "has_staff_issue",
+                    "tube",
+                    "dlr",
+                    "national_rail",
+                    "crossrail",
+                    "overground",
+                    "access_via_lift",
+                    "num_reports",
+                    "days_since_last_incident",
+                    "concurrent_incidents",
+                    "station_mean_duration",
+                    "station_incident_count",
+                    "station_mean_offset",
+                ],
+                dtype=object,
+            )
+
+            def predict_proba(self, df):
+                captured["features"] = df.iloc[0].to_dict()
+                return np.array([[1.0]])
+
+        with patch(
+            "incidents.ml._load_model",
+            return_value={"model": FakeModel(), "metadata": {"feature_version": 2}},
+        ):
+            predict_duration(incident)
+
+        self.assertEqual(captured["features"]["num_reports"], 2)
+
 
 @override_settings(ROOT_URLCONF="updown.urls")
 class ViewAndCommandTests(StationFactoryMixin, TestCase):
+    def test_predict_durations_command_can_resume_in_small_batches(self):
+        parent = self.create_parent_station("Bank")
+        first = self.create_incident(parent, text="First outage", resolved=False)
+        second = self.create_incident(parent, text="Second outage", resolved=False)
+        stdout = StringIO()
+
+        with patch(
+            "incidents.management.commands.predict_durations._load_model",
+            return_value=object(),
+        ), patch(
+            "incidents.management.commands.predict_durations.predict_duration",
+            return_value=(timedelta(minutes=30), 0.7),
+        ):
+            call_command(
+                "predict_durations",
+                "--overwrite",
+                "--after-id",
+                str(first.id),
+                "--limit",
+                "1",
+                "--chunk-size",
+                "1",
+                stdout=stdout,
+            )
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertIsNone(first.estimated_duration)
+        self.assertEqual(second.estimated_duration, timedelta(minutes=30))
+        self.assertEqual(second.prediction_confidence, 0.7)
+        self.assertIn(f"Last processed incident id: {second.id}", stdout.getvalue())
+
     def test_prepare_incidents_only_shows_predictions_from_stronger_buckets(self):
         parent = self.create_parent_station("Waterloo")
         base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
@@ -1068,12 +1161,33 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_api_training_data_uses_local_time_and_clean_text(self):
         parent = self.create_parent_station("Liverpool Street", naptan_id="LST")
+        report_one = self.create_report(
+            parent,
+            start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
+            end_time=datetime(2026, 7, 1, 11, 0, tzinfo=dt_timezone.utc),
+            resolved=True,
+        )
+        report_two = self.create_report(
+            parent,
+            text="Second report",
+            start_time=datetime(2026, 7, 1, 9, 35, tzinfo=dt_timezone.utc),
+            end_time=datetime(2026, 7, 1, 11, 0, tzinfo=dt_timezone.utc),
+            resolved=True,
+        )
         self.create_incident(
             parent,
             text="Faulty lift. Call 0343 222 1234 for help.",
             resolved=True,
             start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
             end_time=datetime(2026, 7, 1, 11, 0, tzinfo=dt_timezone.utc),
+            reports=[report_one, report_two],
+        )
+        self.create_incident(
+            parent,
+            text="Staff helping passengers",
+            resolved=True,
+            start_time=datetime(2026, 7, 1, 10, 0, tzinfo=dt_timezone.utc),
+            end_time=datetime(2026, 7, 1, 12, 0, tzinfo=dt_timezone.utc),
         )
 
         response = self.client.get("/api/training-data/?key=verysecret")
@@ -1084,6 +1198,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(payload["incidents"][0]["month"], 7)
         self.assertNotIn("0343 222 1234", payload["incidents"][0]["text"])
         self.assertTrue(payload["incidents"][0]["has_faulty_lift"])
+        self.assertEqual(payload["incidents"][0]["num_reports"], 2)
+        self.assertEqual(payload["incidents"][0]["concurrent_incidents"], 0)
+        self.assertEqual(payload["incidents"][1]["concurrent_incidents"], 1)
 
     def test_detail_and_api_exclude_resolved_incidents_older_than_twelve_hours(self):
         parent = self.create_parent_station("Tottenham Court Road", naptan_id="TCR")

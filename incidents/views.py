@@ -972,6 +972,7 @@ class UpdateIncidentsView(View):
 
 
 def api_training_data(request):
+    import heapq
     import json
 
     key = request.GET.get("key")
@@ -979,28 +980,6 @@ def api_training_data(request):
         return HttpResponseNotFound()
 
     base_qs = Incident.objects.filter(resolved=True, end_time__isnull=False)
-
-    # Pre-compute concurrent incidents with a sweep line using lightweight query
-    events = []
-    for inc_id, start, end in base_qs.values_list("id", "start_time", "end_time"):
-        events.append((start, 1, inc_id))
-        events.append((end, -1, inc_id))
-    events.sort(key=lambda e: (e[0], e[1]))
-
-    concurrent_at = {}
-    active = 0
-    for _, delta, inc_id in events:
-        if delta == 1:
-            concurrent_at[inc_id] = active
-            active += 1
-        else:
-            active -= 1
-    del events
-
-    # Pre-compute report counts
-    report_counts = dict(
-        base_qs.annotate(n=Count("reports")).values_list("id", "n")
-    )
 
     # Cache stations to avoid repeated lookups
     station_cache = {
@@ -1017,43 +996,65 @@ def api_training_data(request):
         return station
 
     last_incident_at_station = {}
+    active_end_times = []
+    incident_rows = (
+        base_qs.annotate(num_reports=Count("reports"))
+        .order_by("start_time", "id")
+        .values_list(
+            "id",
+            "station_id",
+            "information",
+            "text",
+            "start_time",
+            "end_time",
+            "estimated_duration",
+            "num_reports",
+        )
+    )
 
     def generate():
         yield '{"incidents":['
         first = True
-        for incident in (
-            base_qs.order_by("start_time")
-            .only(
-                "id", "station_id", "information", "text",
-                "start_time", "end_time", "estimated_duration",
-            )
-            .iterator(chunk_size=500)
-        ):
-            duration = (incident.end_time - incident.start_time).total_seconds()
+        for (
+            _inc_id,
+            station_id,
+            information,
+            raw_text,
+            start_time,
+            end_time,
+            estimated_duration,
+            num_reports,
+        ) in incident_rows.iterator(chunk_size=500):
+            duration = (end_time - start_time).total_seconds()
             if duration <= 0:
                 continue
 
-            raw_station = station_cache.get(incident.station_id)
+            while active_end_times and active_end_times[0] <= start_time:
+                heapq.heappop(active_end_times)
+            concurrent = len(active_end_times)
+            heapq.heappush(active_end_times, end_time)
+
+            raw_station = station_cache.get(station_id)
             if raw_station is None:
                 continue
             station = _effective(raw_station)
-            start_time_local = timezone.localtime(incident.start_time)
-            text = normalise_incident_text(incident.text)
+            start_time_local = timezone.localtime(start_time)
+            text = normalise_incident_text(raw_text)
             text_lower = text.lower()
 
             prev_time = last_incident_at_station.get(station.id)
             if prev_time:
-                days_since_last = (incident.start_time - prev_time).total_seconds() / 86400
+                days_since_last = (start_time - prev_time).total_seconds() / 86400
             else:
                 days_since_last = -1
-            last_incident_at_station[station.id] = incident.start_time
+            last_incident_at_station[station.id] = start_time
 
             row = {
                 "station_id": station.id,
                 "station_name": station.name,
-                "information": incident.information,
-                "start_time": incident.start_time.isoformat(),
-                "end_time": incident.end_time.isoformat(),
+                "information": information,
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
                 "duration_minutes": duration / 60,
                 "hour_of_day": start_time_local.hour,
                 "day_of_week": start_time_local.weekday(),
@@ -1065,7 +1066,7 @@ def api_training_data(request):
                 "is_planned_work": (
                     "planned" in text_lower
                     or "until " in text_lower
-                    or incident.information
+                    or information
                 ),
                 "tube": bool(station.tube),
                 "dlr": bool(station.dlr),
@@ -1073,12 +1074,12 @@ def api_training_data(request):
                 "crossrail": bool(station.crossrail),
                 "overground": bool(station.overground),
                 "access_via_lift": bool(station.access_via_lift),
-                "num_reports": report_counts.get(incident.id, 0),
+                "num_reports": num_reports,
                 "days_since_last_incident": round(days_since_last, 2),
-                "concurrent_incidents": concurrent_at.get(incident.id, 0),
+                "concurrent_incidents": concurrent,
                 "estimated_duration_minutes": (
-                    incident.estimated_duration.total_seconds() / 60
-                    if incident.estimated_duration
+                    estimated_duration.total_seconds() / 60
+                    if estimated_duration
                     else None
                 ),
             }
