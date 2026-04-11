@@ -38,6 +38,21 @@ PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 # "long tail" class during training. Five days is plenty of detail; beyond
 # that we barely have the data to distinguish blocks anyway.
 MAX_OFFSET_CLASS = 20
+NETWORK_FIELDS = ("tube", "dlr", "national_rail", "crossrail", "overground")
+BASELINE_CATEGORY_OTHER = "other"
+HISTORICAL_BASELINE_DEFAULTS = {
+    "global_weight": 1.0,
+    "category_weight": 1.0,
+    "network_category_weight": 0.5,
+    "station_weight": 0.75,
+    "station_category_weight": 1.25,
+    "category_min_count": 8,
+    "network_category_min_count": 8,
+    "station_min_count": 5,
+    "station_category_min_count": 3,
+    "blend_max_weight": 0.35,
+    "blend_count_scale": 25.0,
+}
 
 
 def _to_local(dt):
@@ -222,6 +237,123 @@ def _is_planned_work(incident):
     return "planned" in text or "until " in text or incident.information
 
 
+def _prediction_category_from_text(text):
+    text = (text or "").lower()
+    if "faulty lift" in text:
+        return "faulty_lift"
+    if "planned maintenance" in text:
+        return "planned_maintenance"
+    if "staff" in text:
+        return "staff_issue"
+    return BASELINE_CATEGORY_OTHER
+
+
+def _station_networks(station):
+    return [network for network in NETWORK_FIELDS if getattr(station, network, False)]
+
+
+def _apply_baseline_component(combined_counts, entry, weight, min_count):
+    if not entry or entry.get("count", 0) < min_count:
+        return 0.0
+
+    import numpy as np
+
+    combined_counts += np.asarray(entry["counts"], dtype=float) * weight
+    return entry["count"] * weight
+
+
+def _historical_baseline_probs(historical_baselines, station, text, classes):
+    if not historical_baselines or not historical_baselines.get("global"):
+        return None, 0.0
+
+    try:
+        import numpy as np
+    except ImportError:
+        return None, 0.0
+
+    config = {
+        **HISTORICAL_BASELINE_DEFAULTS,
+        **(historical_baselines.get("config") or {}),
+    }
+
+    combined_counts = (
+        np.asarray(historical_baselines["global"]["counts"], dtype=float)
+        * config["global_weight"]
+    )
+    evidence = 0.0
+    category = _prediction_category_from_text(text)
+
+    evidence += _apply_baseline_component(
+        combined_counts,
+        historical_baselines.get("category", {}).get(category),
+        config["category_weight"],
+        config["category_min_count"],
+    )
+    evidence += _apply_baseline_component(
+        combined_counts,
+        historical_baselines.get("station", {}).get(station.id),
+        config["station_weight"],
+        config["station_min_count"],
+    )
+    evidence += _apply_baseline_component(
+        combined_counts,
+        historical_baselines.get("station_category", {}).get((station.id, category)),
+        config["station_category_weight"],
+        config["station_category_min_count"],
+    )
+
+    network_entries = [
+        historical_baselines.get("network_category", {}).get((network, category))
+        for network in _station_networks(station)
+    ]
+    network_entries = [
+        entry
+        for entry in network_entries
+        if entry and entry.get("count", 0) >= config["network_category_min_count"]
+    ]
+    if network_entries:
+        avg_counts = sum(
+            np.asarray(entry["counts"], dtype=float) for entry in network_entries
+        ) / len(network_entries)
+        combined_counts += avg_counts * config["network_category_weight"]
+        evidence += (
+            sum(entry["count"] for entry in network_entries) / len(network_entries)
+        ) * config["network_category_weight"]
+
+    full_total = combined_counts.sum()
+    if full_total <= 0:
+        return None, evidence
+
+    full_probs = combined_counts / full_total
+    aligned = np.asarray(
+        [
+            full_probs[int(cls)] if 0 <= int(cls) < len(full_probs) else 0.0
+            for cls in classes
+        ],
+        dtype=float,
+    )
+    aligned_total = aligned.sum()
+    if aligned_total <= 0:
+        return None, evidence
+    return aligned / aligned_total, evidence
+
+
+def _blend_prediction_probs(model_probs, baseline_probs, baseline_evidence, config=None):
+    if baseline_probs is None or baseline_evidence <= 0:
+        return model_probs
+
+    config = {**HISTORICAL_BASELINE_DEFAULTS, **(config or {})}
+    baseline_weight = min(
+        config["blend_max_weight"],
+        baseline_evidence / (baseline_evidence + config["blend_count_scale"]),
+    )
+    blended = (1 - baseline_weight) * model_probs + baseline_weight * baseline_probs
+    total = blended.sum()
+    if total <= 0:
+        return model_probs
+    return blended / total
+
+
 # ---------------------------------------------------------------------------
 # Prediction
 # ---------------------------------------------------------------------------
@@ -261,6 +393,7 @@ def _predict_duration(incident):
 
     model = data["model"]
     vectorizer = data.get("vectorizer")
+    historical_baselines = data.get("historical_baselines")
     metadata = data.get("metadata") or {}
     feature_version = metadata.get("feature_version", 1)
     use_v2_features = feature_version >= 2
@@ -393,6 +526,18 @@ def _predict_duration(incident):
 
     # Classifier predicts a block offset; confidence is the class probability.
     probs = model.predict_proba(df)[0]
+    baseline_probs, baseline_evidence = _historical_baseline_probs(
+        historical_baselines,
+        station,
+        feature_text,
+        model.classes_,
+    )
+    probs = _blend_prediction_probs(
+        probs,
+        baseline_probs,
+        baseline_evidence,
+        historical_baselines.get("config") if historical_baselines else None,
+    )
     pred_pos = int(np.argmax(probs))
     pred_offset = int(model.classes_[pred_pos])
     confidence = float(probs[pred_pos])

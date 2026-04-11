@@ -126,6 +126,24 @@ FEATURE_COLUMNS = [
 ]
 
 TARGET_COLUMN = "block_offset"
+NETWORK_COLUMNS = ["tube", "dlr", "national_rail", "crossrail", "overground"]
+
+BASELINE_CATEGORY_OTHER = "other"
+BASELINE_COMPONENT_WEIGHTS = {
+    "global_weight": 1.0,
+    "category_weight": 1.0,
+    "network_category_weight": 0.5,
+    "station_weight": 0.75,
+    "station_category_weight": 1.25,
+}
+BASELINE_COMPONENT_MIN_COUNTS = {
+    "category_min_count": 8,
+    "network_category_min_count": 8,
+    "station_min_count": 5,
+    "station_category_min_count": 3,
+}
+BASELINE_BLEND_MAX_WEIGHT = 0.35
+BASELINE_BLEND_COUNT_SCALE = 25.0
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +311,177 @@ def prepare_features(df):
     return df, feature_cols, vectorizer
 
 
+def _incident_category_from_flags(has_faulty_lift, has_planned_maintenance, has_staff_issue):
+    if has_faulty_lift:
+        return "faulty_lift"
+    if has_planned_maintenance:
+        return "planned_maintenance"
+    if has_staff_issue:
+        return "staff_issue"
+    return BASELINE_CATEGORY_OTHER
+
+
+def _row_networks(row):
+    return [network for network in NETWORK_COLUMNS if bool(getattr(row, network))]
+
+
+def _increment_counts(store, key, target):
+    counts = store.setdefault(key, np.zeros(MAX_OFFSET_CLASS + 1, dtype=float))
+    counts[target] += 1
+
+
+def build_historical_baselines(df):
+    global_counts = np.zeros(MAX_OFFSET_CLASS + 1, dtype=float)
+    category_counts = {}
+    network_category_counts = {}
+    station_counts = {}
+    station_category_counts = {}
+
+    for row in df.itertuples(index=False):
+        target = int(getattr(row, TARGET_COLUMN))
+        station_id = int(row.station_id)
+        category = _incident_category_from_flags(
+            bool(row.has_faulty_lift),
+            bool(row.has_planned_maintenance),
+            bool(row.has_staff_issue),
+        )
+
+        global_counts[target] += 1
+        _increment_counts(category_counts, category, target)
+        _increment_counts(station_counts, station_id, target)
+        _increment_counts(station_category_counts, (station_id, category), target)
+
+        for network in _row_networks(row):
+            _increment_counts(network_category_counts, (network, category), target)
+
+    def _serialise(store):
+        return {
+            key: {
+                "count": int(counts.sum()),
+                "counts": counts.tolist(),
+            }
+            for key, counts in store.items()
+        }
+
+    return {
+        "num_classes": MAX_OFFSET_CLASS + 1,
+        "config": {
+            **BASELINE_COMPONENT_WEIGHTS,
+            **BASELINE_COMPONENT_MIN_COUNTS,
+            "blend_max_weight": BASELINE_BLEND_MAX_WEIGHT,
+            "blend_count_scale": BASELINE_BLEND_COUNT_SCALE,
+        },
+        "global": {
+            "count": int(global_counts.sum()),
+            "counts": global_counts.tolist(),
+        },
+        "category": _serialise(category_counts),
+        "network_category": _serialise(network_category_counts),
+        "station": _serialise(station_counts),
+        "station_category": _serialise(station_category_counts),
+    }
+
+
+def _apply_baseline_component(combined_counts, entry, weight, min_count):
+    if not entry or entry["count"] < min_count:
+        return 0.0
+
+    combined_counts += np.asarray(entry["counts"], dtype=float) * weight
+    return entry["count"] * weight
+
+
+def historical_baseline_for_row(row, baselines):
+    if not baselines or not baselines.get("global"):
+        return None, 0.0
+
+    config = baselines["config"]
+    combined_counts = (
+        np.asarray(baselines["global"]["counts"], dtype=float)
+        * config["global_weight"]
+    )
+    evidence = 0.0
+    category = _incident_category_from_flags(
+        bool(getattr(row, "has_faulty_lift")),
+        bool(getattr(row, "has_planned_maintenance")),
+        bool(getattr(row, "has_staff_issue")),
+    )
+    station_id = int(getattr(row, "station_id"))
+
+    evidence += _apply_baseline_component(
+        combined_counts,
+        baselines["category"].get(category),
+        config["category_weight"],
+        config["category_min_count"],
+    )
+    evidence += _apply_baseline_component(
+        combined_counts,
+        baselines["station"].get(station_id),
+        config["station_weight"],
+        config["station_min_count"],
+    )
+    evidence += _apply_baseline_component(
+        combined_counts,
+        baselines["station_category"].get((station_id, category)),
+        config["station_category_weight"],
+        config["station_category_min_count"],
+    )
+
+    network_entries = [
+        baselines["network_category"].get((network, category))
+        for network in _row_networks(row)
+    ]
+    network_entries = [
+        entry
+        for entry in network_entries
+        if entry and entry["count"] >= config["network_category_min_count"]
+    ]
+    if network_entries:
+        avg_counts = sum(
+            np.asarray(entry["counts"], dtype=float) for entry in network_entries
+        ) / len(network_entries)
+        combined_counts += avg_counts * config["network_category_weight"]
+        evidence += (
+            sum(entry["count"] for entry in network_entries) / len(network_entries)
+        ) * config["network_category_weight"]
+
+    total = combined_counts.sum()
+    if total <= 0:
+        return None, evidence
+    return combined_counts / total, evidence
+
+
+def align_baseline_probs(full_probs, classes):
+    if full_probs is None:
+        return None
+
+    aligned = np.asarray(
+        [
+            full_probs[int(cls)] if 0 <= int(cls) < len(full_probs) else 0.0
+            for cls in classes
+        ],
+        dtype=float,
+    )
+    total = aligned.sum()
+    if total <= 0:
+        return None
+    return aligned / total
+
+
+def blend_prediction_probs(model_probs, baseline_probs, baseline_evidence, config):
+    if baseline_probs is None or baseline_evidence <= 0:
+        return model_probs
+
+    baseline_weight = min(
+        config["blend_max_weight"],
+        baseline_evidence / (baseline_evidence + config["blend_count_scale"]),
+    )
+    blended = (1 - baseline_weight) * model_probs + baseline_weight * baseline_probs
+    total = blended.sum()
+    if total <= 0:
+        return model_probs
+    return blended / total
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -344,14 +533,37 @@ def train_model(df, feature_cols):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         sw_train = sample_weights[train_idx]
+        train_df = df.iloc[train_idx]
+        test_df = df.iloc[test_idx]
+        baselines = build_historical_baselines(train_df)
 
         cv_model = _fresh_model()
         cv_model.fit(X_train, y_train, sample_weight=sw_train)
-        preds = cv_model.predict(X_test)
+        model_probs = cv_model.predict_proba(X_test)
+        preds = []
+        for row, row_model_probs in zip(
+            test_df.itertuples(index=False), model_probs
+        ):
+            baseline_full_probs, baseline_evidence = historical_baseline_for_row(
+                row, baselines
+            )
+            baseline_probs = align_baseline_probs(
+                baseline_full_probs,
+                cv_model.classes_,
+            )
+            blended_probs = blend_prediction_probs(
+                row_model_probs,
+                baseline_probs,
+                baseline_evidence,
+                baselines["config"],
+            )
+            pred_pos = int(np.argmax(blended_probs))
+            preds.append(int(cv_model.classes_[pred_pos]))
+        preds = np.asarray(preds, dtype=int)
 
         exact = accuracy_score(y_test, preds)
-        predicted_block_idx = df.iloc[test_idx]["start_block_idx"].values + preds
-        actual_end_times = df.iloc[test_idx]["end_time"].tolist()
+        predicted_block_idx = test_df["start_block_idx"].values + preds
+        actual_end_times = test_df["end_time"].tolist()
         boundary_grace = np.mean(
             [
                 prediction_is_close_enough(pred_idx, actual_dt)
@@ -362,7 +574,9 @@ def train_model(df, feature_cols):
         within_one = np.mean(np.abs(preds - y_test.values) <= 1)
         fold_scores.append((exact, boundary_grace, within_one))
 
-    print(f"\nCross-validation results ({tscv.n_splits} splits):")
+    print(
+        f"\nCross-validation results ({tscv.n_splits} splits, model + historical baselines):"
+    )
     for i, (exact, boundary_grace, within_one) in enumerate(fold_scores):
         print(
             f"  fold {i + 1}: exact block {exact * 100:.1f}%, "
@@ -382,7 +596,8 @@ def train_model(df, feature_cols):
     model = _fresh_model()
     model.fit(X, y, sample_weight=sample_weights)
 
-    return model
+    historical_baselines = build_historical_baselines(df)
+    return model, historical_baselines
 
 
 # ---------------------------------------------------------------------------
@@ -390,13 +605,14 @@ def train_model(df, feature_cols):
 # ---------------------------------------------------------------------------
 
 
-def upload_model(model, vectorizer, upload_url, key):
+def upload_model(model, vectorizer, historical_baselines, upload_url, key):
     model_path = "ml_model.joblib"
     joblib.dump({
         "model": model,
         "vectorizer": vectorizer,
+        "historical_baselines": historical_baselines,
         "metadata": {
-            "feature_version": 2,
+            "feature_version": 3,
         },
     }, model_path)
     print(f"\nModel saved locally to {model_path}")
@@ -526,9 +742,15 @@ def main():
     df, feature_cols, vectorizer = prepare_features(df)
 
     print(f"\nTraining on {len(df)} incidents with {len(feature_cols)} features...")
-    model = train_model(df, feature_cols)
+    model, historical_baselines = train_model(df, feature_cols)
 
-    upload_model(model, vectorizer, args.upload_url, args.key)
+    upload_model(
+        model,
+        vectorizer,
+        historical_baselines,
+        args.upload_url,
+        args.key,
+    )
 
 
 if __name__ == "__main__":

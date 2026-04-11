@@ -749,6 +749,83 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
 
         self.assertEqual(captured["features"]["num_reports"], 2)
 
+    def test_predict_duration_blends_in_historical_station_baseline(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+
+        parent = self.create_parent_station("Roding Valley")
+        incident = Incident(
+            station=parent,
+            text="Faulty lift",
+            information=False,
+            start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
+            resolved=False,
+        )
+
+        class FakeModel:
+            classes_ = np.array([0, 1])
+            feature_names_in_ = np.array(
+                [
+                    "station_id",
+                    "information",
+                    "hour_of_day",
+                    "day_of_week",
+                    "month",
+                    "is_weekend",
+                    "start_block",
+                    "has_faulty_lift",
+                    "has_planned_maintenance",
+                    "has_staff_issue",
+                    "tube",
+                    "dlr",
+                    "national_rail",
+                    "crossrail",
+                    "overground",
+                    "access_via_lift",
+                    "num_reports",
+                    "days_since_last_incident",
+                    "concurrent_incidents",
+                    "station_mean_duration",
+                    "station_incident_count",
+                    "station_mean_offset",
+                ],
+                dtype=object,
+            )
+
+            def predict_proba(self, df):
+                return np.array([[0.45, 0.55]])
+
+        empty_tail = [0] * 19
+        historical_baselines = {
+            "global": {"count": 20, "counts": [10, 10, *empty_tail]},
+            "category": {
+                "faulty_lift": {"count": 10, "counts": [9, 1, *empty_tail]}
+            },
+            "network_category": {},
+            "station": {
+                parent.id: {"count": 20, "counts": [20, 0, *empty_tail]}
+            },
+            "station_category": {
+                (parent.id, "faulty_lift"): {
+                    "count": 12,
+                    "counts": [12, 0, *empty_tail],
+                }
+            },
+        }
+
+        with patch(
+            "incidents.ml._load_model",
+            return_value={
+                "model": FakeModel(),
+                "metadata": {"feature_version": 3},
+                "historical_baselines": historical_baselines,
+            },
+        ):
+            duration, confidence = predict_duration(incident)
+
+        self.assertEqual(duration, timedelta(minutes=135))
+        self.assertEqual(confidence, 0.58)
+
 
 @override_settings(ROOT_URLCONF="updown.urls")
 class ViewAndCommandTests(StationFactoryMixin, TestCase):
