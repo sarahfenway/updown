@@ -1,6 +1,6 @@
 {% load static %}
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <title>{% block title %}{% endblock %}Up Down London</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -27,7 +27,8 @@
     {% endif %}
     <link href='https://fonts.googleapis.com/css?family=Montserrat:400,700' rel='stylesheet' type='text/css'>
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
+<a href="#main-content" class="skip-link">Skip to main content</a>
 <div class="container">
     <div class="row header-box">
         <div class="col-md-6 col-md-offset-3">
@@ -41,9 +42,11 @@
     {% block menu %}
 
     {% endblock %}
-    <div class="row">
-        {% block content %}{% endblock %}
-    </div>
+    <main id="main-content" tabindex="-1">
+        <div class="row">
+            {% block content %}{% endblock %}
+        </div>
+    </main>
 
     <hr>
     <div class="row">

@@ -77,6 +77,15 @@ def block_start_end(index):
 
 
 def block_distance_from_index(dt, index):
+    # Blocks are defined in local wall-clock time. The training data has
+    # already been converted into Europe/London, so strip timezone info here
+    # before comparing against naive block boundaries.
+    if getattr(dt, "tzinfo", None) is not None:
+        if hasattr(dt, "tz_localize"):
+            dt = dt.tz_localize(None)
+        else:
+            dt = dt.replace(tzinfo=None)
+
     block_start_dt, block_end_dt = block_start_end(index)
 
     if dt < block_start_dt:

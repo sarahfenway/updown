@@ -86,6 +86,22 @@ def _prediction_confidence_label(accuracy):
     return "very likely"
 
 
+def _beta_current_status_text(label, expected_block):
+    if not label or not expected_block:
+        return None
+    return f"{label.capitalize()} {expected_block}"
+
+
+def _beta_resolved_status_text(issue):
+    if not issue.show_prediction:
+        return None
+    if issue.prediction_outcome == "exact":
+        return "Right"
+    if issue.prediction_outcome == "near":
+        return "Nearly right"
+    return f"Predicted {issue.expected_block}"
+
+
 def _wilson_lower_bound(successes, total, z=1.96):
     if total == 0:
         return 0.0
@@ -203,6 +219,18 @@ def _prepare_incidents(queryset, prediction_policy=None):
         incident.show_prediction = bool(
             incident.expected_block is not None and bucket_policy.get("show_prediction")
         )
+        incident.beta_current_status = _beta_current_status_text(
+            incident.prediction_label,
+            incident.expected_block,
+        )
+        incident.beta_accuracy_text = (
+            (
+                "Recently similar AI predictions were right "
+                f"{incident.prediction_accuracy_pct}% of the time"
+            )
+            if incident.prediction_accuracy_pct is not None
+            else None
+        )
 
         if (
             incident.resolved
@@ -218,20 +246,77 @@ def _prepare_incidents(queryset, prediction_policy=None):
             incident.prediction_was_correct = incident.prediction_outcome != "miss"
             incident.prediction_was_nearly_right = incident.prediction_outcome == "near"
             incident.actual_block = format_block_slot(actual_slot, now)
+            incident.beta_resolved_status = _beta_resolved_status_text(incident)
         else:
             incident.prediction_outcome = None
             incident.prediction_was_correct = None
             incident.prediction_was_nearly_right = None
             incident.actual_block = None
+            incident.beta_resolved_status = None
 
     return incidents
 
 
-@never_cache
-def detail(request):
-    if request.get_host().endswith("isstpthameslinkliftbroken.com"):
-        return stp(request)
+def _beta_status_copy(issues, resolved, information):
+    current_issue_count = len(issues)
+    affected_station_count = len({issue.station_id for issue in issues})
+    predicted_issue_count = sum(1 for issue in issues if issue.show_prediction)
+    resolved_count = len(resolved)
+    information_count = len(information)
 
+    if current_issue_count == 0:
+        heading = "No reported step-free access issues"
+        summary = (
+            "We currently have no reports of step-free access problems on the "
+            "tracked TfL networks."
+        )
+        if resolved_count:
+            summary += (
+                f" {resolved_count} issue{' has' if resolved_count == 1 else 's have'} "
+                "been resolved in the last 12 hours."
+            )
+        if information_count:
+            summary += (
+                f" There {'is' if information_count == 1 else 'are'} "
+                f"{information_count} information notice"
+                f"{'' if information_count == 1 else 's'} to check."
+            )
+        tone = "clear"
+    else:
+        heading = (
+            f"{current_issue_count} current step-free access issue"
+            f"{'' if current_issue_count == 1 else 's'}"
+        )
+        summary = (
+            f"Affecting {affected_station_count} station"
+            f"{'' if affected_station_count == 1 else 's'} right now."
+        )
+        if predicted_issue_count:
+            summary += (
+                f" Estimated fix windows are shown for {predicted_issue_count} "
+                f"issue{'' if predicted_issue_count == 1 else 's'}."
+            )
+        if information_count:
+            summary += (
+                f" There {'is' if information_count == 1 else 'are'} "
+                f"{information_count} information notice"
+                f"{'' if information_count == 1 else 's'} as well."
+            )
+        tone = "alert"
+
+    return {
+        "current_issue_count": current_issue_count,
+        "affected_station_count": affected_station_count,
+        "predicted_issue_count": predicted_issue_count,
+        "resolved_recent_count": resolved_count,
+        "information_count": information_count,
+        "beta_status_heading": heading,
+        "beta_status_summary": summary,
+        "beta_status_tone": tone,
+    }
+
+
+def _status_page_context():
     prediction_policy = _prediction_display_policy(
         timezone.now() - timedelta(days=PREDICTION_POLICY_WINDOW_DAYS)
     )
@@ -254,16 +339,27 @@ def detail(request):
         prediction_policy=prediction_policy,
     )
 
-    return render(
-        request,
-        "home.html",
-        {
-            "issues": issues,
-            "resolved": resolved,
-            "information": information,
-            "last_updated": get_last_updated(),
-        },
-    )
+    context = {
+        "issues": issues,
+        "resolved": resolved,
+        "information": information,
+        "last_updated": get_last_updated(),
+    }
+    context.update(_beta_status_copy(issues, resolved, information))
+    return context
+
+
+@never_cache
+def detail(request):
+    if request.get_host().endswith("isstpthameslinkliftbroken.com"):
+        return stp(request)
+
+    return render(request, "home.html", _status_page_context())
+
+
+@never_cache
+def beta_detail(request):
+    return render(request, "beta.html", _status_page_context())
 
 
 @never_cache

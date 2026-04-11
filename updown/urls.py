@@ -6,6 +6,7 @@ from incidents.views import (
     UpdateIncidentsView,
     UploadModelView,
     alexa,
+    beta_detail,
     stp,
     stats,
     api_incidents,
@@ -17,6 +18,7 @@ from pages.views import FAQPageView, PrivacyPageView
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("", detail, name="home"),
+    path("beta/", beta_detail, name="beta_home"),
     path("api/incidents/", api_incidents, name="incidents"),
     path("api/stations/", api_stations, name="stations"),
     path("problems.txt", alexa),

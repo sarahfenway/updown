@@ -776,6 +776,57 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(list(response.context["information"]), [information])
         self.assertEqual(response.context["last_updated"], "09:15 26 Mar")
 
+    def test_beta_renders_inline_status_next_to_event_time(self):
+        parent = self.create_parent_station("Bank")
+        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        for i in range(15):
+            self.create_incident(
+                parent,
+                text=f"Resolved good {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i),
+                end_time=base + timedelta(days=i, hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+
+        active = self.create_incident(
+            parent,
+            text="Active outage",
+            resolved=False,
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.65,
+        )
+        resolved = self.create_incident(
+            parent,
+            text="Resolved outage",
+            resolved=True,
+            end_time=timezone.now() - timedelta(hours=1),
+        )
+        information = self.create_incident(
+            parent,
+            text="Planned works",
+            information=True,
+        )
+
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            response = self.client.get("/beta/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "beta.html")
+        self.assertEqual(list(response.context["issues"]), [active])
+        self.assertIn(resolved, list(response.context["resolved"]))
+        self.assertEqual(list(response.context["information"]), [information])
+        self.assertNotContains(response, "Current Status")
+        self.assertContains(response, "Current Issues")
+        self.assertContains(response, "Resolved Issues")
+        self.assertContains(response, "Information")
+        self.assertContains(response, "beta-inline-status-current")
+        self.assertContains(response, "icon-magic")
+        self.assertContains(response, "beta-inline-meter")
+        self.assertContains(response, "AI prediction:")
+
     def test_detail_avoids_n_plus_one_queries_for_reports(self):
         now = timezone.now()
         stations = [

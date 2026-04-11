@@ -109,3 +109,99 @@ h3 {
 	height: 23px;
 	vertical-align: text-bottom;
 }
+
+.skip-link {
+	left: 1em;
+	position: absolute;
+	top: -3em;
+	background: #fff;
+	border: 2px solid #333;
+	color: #333;
+	padding: 0.5em 0.75em;
+	z-index: 1000;
+}
+
+.skip-link:focus {
+	top: 1em;
+}
+
+.beta-inline-status {
+	background-color: #F2F2F2;
+	border-radius: 999px;
+	color: #333;
+	display: inline-flex;
+	align-items: center;
+	gap: 0.55em;
+	font-family: 'Montserrat';
+	font-size: 12px;
+	font-weight: 700;
+	margin-left: 0.5em;
+	padding: 0.2em 0.65em;
+	vertical-align: middle;
+}
+
+.beta-inline-status-main {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.35em;
+}
+
+.beta-inline-status-icon {
+	font-size: 11px;
+}
+
+.beta-inline-status-meter {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.35em;
+}
+
+.beta-inline-meter {
+	background-color: rgba(0, 0, 0, 0.12);
+	border-radius: 999px;
+	display: inline-block;
+	height: 0.45em;
+	overflow: hidden;
+	width: 3.5em;
+}
+
+.beta-inline-meter-fill {
+	background-color: currentColor;
+	display: block;
+	height: 100%;
+}
+
+.beta-inline-meter-value {
+	font-size: 11px;
+	font-weight: 400;
+	opacity: 0.8;
+}
+
+.beta-inline-status-current {
+	background-color: #E8F1FB;
+	color: #0450A1;
+}
+
+.beta-inline-status-good {
+	background-color: #E6F7E6;
+	color: #2D6A2D;
+}
+
+.beta-inline-status-near {
+	background-color: #FFF5DB;
+	color: #8A5A00;
+}
+
+.beta-inline-status-miss {
+	background-color: #F3F3F3;
+	color: #555;
+}
+
+@media (max-width: 767px) {
+	.beta-inline-status {
+		display: inline-flex;
+		flex-wrap: wrap;
+		margin-left: 0;
+		margin-top: 0.35em;
+	}
+}
