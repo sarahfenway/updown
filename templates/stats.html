@@ -54,6 +54,7 @@
                 <p>Right block or very close: {{ prediction_correct_count }} / {{ prediction_count }} ({{ prediction_accuracy_pct }}%)</p>
                 <p><i>A prediction is "correct" if the actual fix happened in the predicted time block, or within {{ prediction_boundary_grace_minutes }} minutes of that block starting or ending.</i></p>
                 <p><i>User-facing predictions are only shown when a confidence bucket has at least {{ prediction_display_min_samples }} recent examples and a conservative estimated accuracy above {{ prediction_display_min_accuracy_pct }}%. We use the last {{ prediction_display_primary_window_days }} days when possible, and fall back to the last {{ prediction_display_fallback_window_days }} days if a bucket is too sparse.</i></p>
+                <p><i>A narrow exception applies for {{ prediction_station_override_bucket_label }} predictions: they can still be shown when that station has at least {{ prediction_station_override_min_samples }} resolved predictions in the last {{ prediction_station_override_window_days }} days and at least {{ prediction_station_override_min_accuracy_pct }}% close accuracy.</i></p>
 
                 {% if confidence_chart %}
                 <h3>Confidence vs Accuracy</h3>

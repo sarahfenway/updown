@@ -37,6 +37,7 @@ from incidents.views import (
     _prediction_bucket_metrics,
     _prediction_confidence_label,
     _prediction_display_policy,
+    _prediction_station_overrides,
     _prepare_incidents,
 )
 from stations.models import Station
@@ -844,6 +845,68 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertTrue(incidents[1].show_prediction)
         self.assertEqual(incidents[1].prediction_label, "likely")
         self.assertEqual(incidents[1].prediction_accuracy_pct, 83)
+
+    def test_prepare_incidents_allows_40_bucket_for_station_with_strong_history(self):
+        weak_station = self.create_parent_station("Camden Road", overground=True)
+        strong_station = self.create_parent_station("Roding Valley")
+        now = timezone.now()
+
+        for i in range(15):
+            start_time = now - timedelta(days=30 + i, hours=2)
+            self.create_incident(
+                weak_station,
+                text=f"Weak bucket miss {i}",
+                resolved=True,
+                start_time=start_time,
+                end_time=start_time + timedelta(days=1, hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.45,
+            )
+
+        for i in range(20):
+            start_time = now - timedelta(days=60 + i, hours=2)
+            self.create_incident(
+                strong_station,
+                text=f"Strong history good {i}",
+                resolved=True,
+                start_time=start_time,
+                end_time=start_time + timedelta(hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+
+        current = self.create_incident(
+            strong_station,
+            text="Current moderate confidence outage",
+            resolved=False,
+            start_time=now - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.45,
+        )
+
+        policy = _prediction_display_policy(now)
+        overrides = _prediction_station_overrides(
+            Incident.objects.filter(id=current.id).select_related(
+                "station", "station__parent_station"
+            ),
+            policy,
+            now,
+        )
+
+        incidents = _prepare_incidents(
+            Incident.objects.filter(id=current.id).select_related(
+                "station", "station__parent_station"
+            ),
+            prediction_policy=policy,
+            station_prediction_overrides=overrides,
+            now=now,
+        )
+
+        self.assertFalse(policy[40]["show_prediction"])
+        self.assertTrue(incidents[0].show_prediction)
+        self.assertTrue(incidents[0].used_station_prediction_override)
+        self.assertEqual(incidents[0].prediction_label, "maybe")
+        self.assertEqual(incidents[0].prediction_accuracy_pct, 100)
 
     def test_prediction_display_policy_falls_back_when_recent_bucket_is_sparse(self):
         parent = self.create_parent_station("Waterloo")
