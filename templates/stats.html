@@ -89,6 +89,36 @@
                     {% endfor %}
                 </svg>
                 {% endif %}
+
+                {% if recent_prediction_rows %}
+                <h3>Recent Prediction Checks</h3>
+                <p><i>The {{ prediction_review_limit }} most recent resolved incidents with predictions.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Recent resolved incidents showing what we predicted, what actually happened, how certain we were, and whether we were right.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Station</th>
+                                <th scope="col">We thought</th>
+                                <th scope="col">Actually fixed</th>
+                                <th scope="col">Certainty</th>
+                                <th scope="col">Result</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in recent_prediction_rows %}
+                            <tr>
+                                <td>{{ row.station_name }}</td>
+                                <td>{{ row.predicted_block }}</td>
+                                <td>{{ row.actual_block }} <span class="text-muted">({{ row.actual_end_time|date:"H:i, d M" }})</span></td>
+                                <td>{{ row.confidence_pct }}%</td>
+                                <td>{{ row.outcome_text }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
             {% else %}
                 <p>No prediction data available yet.</p>
             {% endif %}

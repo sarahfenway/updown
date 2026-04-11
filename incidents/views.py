@@ -36,6 +36,7 @@ PREDICTION_POLICY_FALLBACK_WINDOW_DAYS = (90, 180)
 PREDICTION_BUCKET_MIN_SAMPLES = 15
 PREDICTION_BUCKET_MIN_LOWER_BOUND = 0.55
 BETA_LONG_RANGE_DAYS = 7
+PREDICTION_REVIEW_LIMIT = 50
 
 
 def _format_duration(duration):
@@ -139,6 +140,19 @@ def _beta_resolved_status_title(issue):
     )
 
 
+def _format_absolute_block_slot(slot):
+    date, block = slot
+    return f"{date.day} {date.strftime('%b')} {block}"
+
+
+def _prediction_review_outcome_text(outcome):
+    if outcome == "exact":
+        return "Right"
+    if outcome == "near":
+        return "Nearly right"
+    return "Wrong"
+
+
 def _wilson_lower_bound(successes, total, z=1.96):
     if total == 0:
         return 0.0
@@ -214,22 +228,8 @@ def _prediction_bucket_metrics(since):
     }
 
 
-def _prediction_window_metrics(now=None, windows=None):
-    if now is None:
-        now = timezone.now()
-    if windows is None:
-        windows = (PREDICTION_POLICY_WINDOW_DAYS,)
-
+def _prediction_window_metrics_from_incidents(incidents, now, windows):
     windows = tuple(sorted(set(windows)))
-    oldest_since = now - timedelta(days=windows[-1])
-    incidents = Incident.objects.filter(
-        resolved=True,
-        end_time__gt=oldest_since,
-        estimated_duration__isnull=False,
-        start_time__isnull=False,
-        end_time__isnull=False,
-    ).only("start_time", "end_time", "estimated_duration", "prediction_confidence")
-
     raw_metrics = {
         days: {"prediction_count": 0, "prediction_correct_count": 0, "buckets": {}}
         for days in windows
@@ -303,6 +303,24 @@ def _prediction_window_metrics(now=None, windows=None):
         }
 
     return finalised
+
+
+def _prediction_window_metrics(now=None, windows=None):
+    if now is None:
+        now = timezone.now()
+    if windows is None:
+        windows = (PREDICTION_POLICY_WINDOW_DAYS,)
+
+    windows = tuple(sorted(set(windows)))
+    oldest_since = now - timedelta(days=windows[-1])
+    incidents = Incident.objects.filter(
+        resolved=True,
+        end_time__gt=oldest_since,
+        estimated_duration__isnull=False,
+        start_time__isnull=False,
+        end_time__isnull=False,
+    ).only("start_time", "end_time", "estimated_duration", "prediction_confidence")
+    return _prediction_window_metrics_from_incidents(incidents, now, windows)
 
 
 def _prediction_display_policy_from_window_metrics(metrics_by_window):
@@ -806,15 +824,60 @@ def stats(request):
 def _prediction_stats(since):
     now = timezone.now()
     windows = (PREDICTION_POLICY_WINDOW_DAYS,) + PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
-    window_metrics = _prediction_window_metrics(now, windows)
+    oldest_since = now - timedelta(days=max(windows))
+    incidents = list(
+        Incident.objects.filter(
+            resolved=True,
+            end_time__gt=oldest_since,
+            estimated_duration__isnull=False,
+            start_time__isnull=False,
+            end_time__isnull=False,
+        )
+        .select_related("station", "station__parent_station")
+        .only(
+            "id",
+            "station__name",
+            "station__parent_station__name",
+            "start_time",
+            "end_time",
+            "estimated_duration",
+            "prediction_confidence",
+        )
+        .order_by("-end_time", "-id")
+    )
+    window_metrics = _prediction_window_metrics_from_incidents(incidents, now, windows)
     metrics = window_metrics[PREDICTION_POLICY_WINDOW_DAYS]
     display_policy = _prediction_display_policy_from_window_metrics(window_metrics)
     count = metrics["prediction_count"]
     correct = metrics["prediction_correct_count"]
     buckets = metrics["buckets"]
+    recent_prediction_rows = []
+
+    for incident in incidents:
+        if incident.end_time <= since or len(recent_prediction_rows) >= PREDICTION_REVIEW_LIMIT:
+            continue
+
+        predicted_end = incident.start_time + incident.estimated_duration
+        outcome = prediction_outcome(predicted_end, incident.end_time)
+        station = incident.station.parent_station or incident.station
+        recent_prediction_rows.append(
+            {
+                "station_name": station.name,
+                "predicted_block": _format_absolute_block_slot(
+                    time_block_slot(predicted_end)
+                ),
+                "actual_block": _format_absolute_block_slot(
+                    time_block_slot(incident.end_time)
+                ),
+                "actual_end_time": incident.end_time,
+                "confidence_pct": round((incident.prediction_confidence or 0) * 100),
+                "outcome": outcome,
+                "outcome_text": _prediction_review_outcome_text(outcome),
+            }
+        )
 
     if count == 0:
-        return {"prediction_count": 0}
+        return {"prediction_count": 0, "recent_prediction_rows": []}
 
     # Build chart data: % correct per confidence bucket, 0–100 on Y axis.
     chart_height = 160
@@ -868,6 +931,8 @@ def _prediction_stats(since):
         "prediction_display_fallback_window_days": ", ".join(
             str(days) for days in PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
         ),
+        "recent_prediction_rows": recent_prediction_rows,
+        "prediction_review_limit": PREDICTION_REVIEW_LIMIT,
     }
 
 

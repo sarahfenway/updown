@@ -1217,6 +1217,31 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(response.context["planned_maintenance_delays_percentage"], 0)
         self.assertEqual(response.context["last_updated"], "09:15 26 Mar")
 
+    def test_stats_includes_recent_prediction_checks_table(self):
+        parent = self.create_parent_station("Green Park")
+        start_time = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        self.create_incident(
+            parent,
+            text="faulty lift",
+            start_time=start_time,
+            end_time=start_time + timedelta(hours=1),
+            resolved=True,
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.65,
+        )
+
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            response = self.client.get("/stats/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Recent Prediction Checks")
+        self.assertContains(response, "Green Park")
+        self.assertContains(response, "65%")
+        rows = response.context["recent_prediction_rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["station_name"], "Green Park")
+        self.assertEqual(rows[0]["outcome_text"], "Right")
+
     def test_stats_uses_small_constant_number_of_queries(self):
         parent = self.create_parent_station("Green Park")
         now = timezone.now()
