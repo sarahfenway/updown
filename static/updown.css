@@ -171,12 +171,6 @@ h3 {
 	height: 100%;
 }
 
-.beta-inline-meter-value {
-	font-size: 11px;
-	font-weight: 400;
-	opacity: 0.8;
-}
-
 .beta-inline-status-current {
 	background-color: #E8F1FB;
 	color: #0450A1;

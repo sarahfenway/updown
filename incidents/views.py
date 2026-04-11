@@ -34,6 +34,7 @@ from stations.models import Station
 PREDICTION_POLICY_WINDOW_DAYS = 30
 PREDICTION_BUCKET_MIN_SAMPLES = 15
 PREDICTION_BUCKET_MIN_LOWER_BOUND = 0.55
+BETA_LONG_RANGE_DAYS = 7
 
 
 def _format_duration(duration):
@@ -86,8 +87,14 @@ def _prediction_confidence_label(accuracy):
     return "very likely"
 
 
-def _beta_current_status_text(label, expected_block):
-    if not label or not expected_block:
+def _beta_current_status_text(label, expected_end_time, expected_block, now):
+    if expected_end_time is None or expected_block is None:
+        return None
+    if expected_end_time <= now:
+        return None
+    if expected_end_time > now + timedelta(days=BETA_LONG_RANGE_DAYS):
+        return "More than a week"
+    if not label:
         return None
     return f"{label.capitalize()} {expected_block}"
 
@@ -99,7 +106,36 @@ def _beta_resolved_status_text(issue):
         return "Right"
     if issue.prediction_outcome == "near":
         return "Nearly right"
-    return f"Predicted {issue.expected_block}"
+    return "Wrong"
+
+
+def _beta_meter_help_text():
+    return "The meter shows how certain we feel based on recent similar predictions."
+
+
+def _beta_current_status_title(status_text):
+    if not status_text:
+        return None
+    return f"AI prediction: {status_text}. {_beta_meter_help_text()}"
+
+
+def _beta_resolved_status_title(issue):
+    if not issue.beta_resolved_status:
+        return None
+    if issue.prediction_outcome == "exact":
+        return (
+            f"AI prediction: right. We expected {issue.expected_block}, and it was fixed then. "
+            f"{_beta_meter_help_text()}"
+        )
+    if issue.prediction_outcome == "near":
+        return (
+            f"AI prediction: nearly right. We expected {issue.expected_block}, but it was fixed "
+            f"{issue.actual_block}, just outside that window. {_beta_meter_help_text()}"
+        )
+    return (
+        f"AI prediction: wrong. We expected {issue.expected_block}, but it was fixed "
+        f"{issue.actual_block}. {_beta_meter_help_text()}"
+    )
 
 
 def _wilson_lower_bound(successes, total, z=1.96):
@@ -217,20 +253,26 @@ def _prepare_incidents(queryset, prediction_policy=None):
         incident.prediction_label = bucket_policy.get("label")
         incident.prediction_accuracy_pct = bucket_policy.get("accuracy_pct")
         incident.show_prediction = bool(
-            incident.expected_block is not None and bucket_policy.get("show_prediction")
+            incident.expected_block is not None
+            and bucket_policy.get("show_prediction")
+            and (
+                incident.resolved
+                or (
+                    incident.expected_end_time is not None
+                    and incident.expected_end_time > now
+                )
+            )
         )
         incident.beta_current_status = _beta_current_status_text(
             incident.prediction_label,
+            incident.expected_end_time,
             incident.expected_block,
+            now,
         )
-        incident.beta_accuracy_text = (
-            (
-                "Recently similar AI predictions were right "
-                f"{incident.prediction_accuracy_pct}% of the time"
-            )
-            if incident.prediction_accuracy_pct is not None
-            else None
+        incident.beta_current_status_title = _beta_current_status_title(
+            incident.beta_current_status
         )
+        incident.beta_meter_help_text = _beta_meter_help_text()
 
         if (
             incident.resolved
@@ -247,12 +289,14 @@ def _prepare_incidents(queryset, prediction_policy=None):
             incident.prediction_was_nearly_right = incident.prediction_outcome == "near"
             incident.actual_block = format_block_slot(actual_slot, now)
             incident.beta_resolved_status = _beta_resolved_status_text(incident)
+            incident.beta_resolved_status_title = _beta_resolved_status_title(incident)
         else:
             incident.prediction_outcome = None
             incident.prediction_was_correct = None
             incident.prediction_was_nearly_right = None
             incident.actual_block = None
             incident.beta_resolved_status = None
+            incident.beta_resolved_status_title = None
 
     return incidents
 

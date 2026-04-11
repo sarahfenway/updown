@@ -751,6 +751,110 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(incidents[1].prediction_label, "likely")
         self.assertEqual(incidents[1].prediction_accuracy_pct, 83)
 
+    def test_prepare_incidents_hides_overdue_current_prediction(self):
+        parent = self.create_parent_station("Bank")
+        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        for i in range(15):
+            self.create_incident(
+                parent,
+                text=f"Resolved good {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i),
+                end_time=base + timedelta(days=i, hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+
+        overdue = self.create_incident(
+            parent,
+            text="Overdue outage",
+            resolved=False,
+            start_time=timezone.now() - timedelta(days=2),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.65,
+        )
+        policy = _prediction_bucket_metrics(
+            timezone.now() - timedelta(days=365)
+        )["buckets"]
+
+        incidents = _prepare_incidents(
+            Incident.objects.filter(id=overdue.id),
+            prediction_policy=policy,
+        )
+
+        self.assertFalse(incidents[0].show_prediction)
+        self.assertIsNone(incidents[0].beta_current_status)
+
+    def test_prepare_incidents_uses_more_than_a_week_for_long_range_prediction(self):
+        parent = self.create_parent_station("Bank")
+        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        for i in range(15):
+            self.create_incident(
+                parent,
+                text=f"Resolved good {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i),
+                end_time=base + timedelta(days=i, hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+
+        long_range = self.create_incident(
+            parent,
+            text="Long range outage",
+            resolved=False,
+            start_time=timezone.now(),
+            estimated_duration=timedelta(days=8),
+            prediction_confidence=0.65,
+        )
+        policy = _prediction_bucket_metrics(
+            timezone.now() - timedelta(days=365)
+        )["buckets"]
+
+        incidents = _prepare_incidents(
+            Incident.objects.filter(id=long_range.id),
+            prediction_policy=policy,
+        )
+
+        self.assertTrue(incidents[0].show_prediction)
+        self.assertEqual(incidents[0].beta_current_status, "More than a week")
+
+    def test_prepare_incidents_marks_resolved_miss_as_wrong(self):
+        parent = self.create_parent_station("Bank")
+        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        for i in range(15):
+            self.create_incident(
+                parent,
+                text=f"Resolved good {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i),
+                end_time=base + timedelta(days=i, hours=1),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.65,
+            )
+
+        missed = self.create_incident(
+            parent,
+            text="Missed outage",
+            resolved=True,
+            start_time=timezone.now() - timedelta(days=2),
+            end_time=timezone.now() - timedelta(days=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.65,
+        )
+        policy = _prediction_bucket_metrics(
+            timezone.now() - timedelta(days=365)
+        )["buckets"]
+
+        incidents = _prepare_incidents(
+            Incident.objects.filter(id=missed.id),
+            prediction_policy=policy,
+        )
+
+        self.assertTrue(incidents[0].show_prediction)
+        self.assertEqual(incidents[0].prediction_outcome, "miss")
+        self.assertEqual(incidents[0].beta_resolved_status, "Wrong")
+
     def test_detail_renders_home_lists(self):
         parent = self.create_parent_station("Bank")
         active = self.create_incident(parent, text="Active outage", resolved=False)
@@ -825,7 +929,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertContains(response, "beta-inline-status-current")
         self.assertContains(response, "icon-magic")
         self.assertContains(response, "beta-inline-meter")
-        self.assertContains(response, "AI prediction:")
+        self.assertContains(response, "The meter shows how certain we feel")
 
     def test_detail_avoids_n_plus_one_queries_for_reports(self):
         now = timezone.now()

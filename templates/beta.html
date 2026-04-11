@@ -43,22 +43,18 @@
                                         {% if issue.start_time %}
                                             <br>
                                             {% if issue.show_prediction %}
-                                                <span title="BETA: {{ issue.prediction_label|capfirst }} to be fixed {{ issue.expected_block }}{% if issue.prediction_accuracy_pct %} (recently similar predictions were right {{ issue.prediction_accuracy_pct }}% of the time){% endif %}">
-                                                    {{ issue.start_time }}
-                                                </span>
-                                                <span class="beta-inline-status beta-inline-status-current">
+                                                {{ issue.start_time }}
+                                                <span class="beta-inline-status beta-inline-status-current" title="{{ issue.beta_current_status_title }}">
                                                     <span class="beta-inline-status-main">
                                                         <i class="icon-magic beta-inline-status-icon" aria-hidden="true"></i>
-                                                        <span class="sr-only">AI prediction: </span>
                                                         <span>{{ issue.beta_current_status }}</span>
+                                                        <span class="sr-only">. AI prediction. {{ issue.beta_meter_help_text }}</span>
                                                     </span>
                                                     {% if issue.prediction_accuracy_pct is not None %}
                                                         <span class="beta-inline-status-meter">
-                                                            <span class="sr-only">{{ issue.beta_accuracy_text }}</span>
                                                             <span class="beta-inline-meter" aria-hidden="true">
                                                                 <span class="beta-inline-meter-fill" style="width: {{ issue.prediction_accuracy_pct }}%;"></span>
                                                             </span>
-                                                            <span class="beta-inline-meter-value" aria-hidden="true">{{ issue.prediction_accuracy_pct }}%</span>
                                                         </span>
                                                     {% endif %}
                                                 </span>
@@ -101,22 +97,18 @@
                                 <i>
                                         {% if issue.end_time %}
                                             {% if issue.show_prediction and issue.prediction_was_correct is not None %}
-                                                <span title="BETA: {% if issue.prediction_outcome == 'exact' %}We correctly thought it was {{ issue.prediction_label }} to be fixed {{ issue.expected_block }}{% elif issue.prediction_outcome == 'near' %}We were nearly right: fixed {{ issue.actual_block }}, just outside our predicted {{ issue.expected_block }} window{% else %}Fixed {{ issue.actual_block }}, we had thought it was {{ issue.prediction_label }} to be fixed {{ issue.expected_block }}{% endif %}{% if issue.prediction_accuracy_pct %} (recently similar predictions were right {{ issue.prediction_accuracy_pct }}% of the time){% endif %}">
                                                 {{ issue.end_time }}
-                                            </span>
-                                            <span class="beta-inline-status {% if issue.prediction_outcome == 'exact' %}beta-inline-status-good{% elif issue.prediction_outcome == 'near' %}beta-inline-status-near{% else %}beta-inline-status-miss{% endif %}">
+                                            <span class="beta-inline-status {% if issue.prediction_outcome == 'exact' %}beta-inline-status-good{% elif issue.prediction_outcome == 'near' %}beta-inline-status-near{% else %}beta-inline-status-miss{% endif %}" title="{{ issue.beta_resolved_status_title }}">
                                                 <span class="beta-inline-status-main">
                                                     <i class="icon-magic beta-inline-status-icon" aria-hidden="true"></i>
-                                                    <span class="sr-only">AI prediction result: </span>
                                                     <span>{{ issue.beta_resolved_status }}</span>
+                                                    <span class="sr-only">. AI prediction result. {{ issue.beta_meter_help_text }}</span>
                                                 </span>
                                                 {% if issue.prediction_accuracy_pct is not None %}
                                                     <span class="beta-inline-status-meter">
-                                                        <span class="sr-only">{{ issue.beta_accuracy_text }}</span>
                                                         <span class="beta-inline-meter" aria-hidden="true">
                                                             <span class="beta-inline-meter-fill" style="width: {{ issue.prediction_accuracy_pct }}%;"></span>
                                                         </span>
-                                                        <span class="beta-inline-meter-value" aria-hidden="true">{{ issue.prediction_accuracy_pct }}%</span>
                                                     </span>
                                                 {% endif %}
                                             </span>
