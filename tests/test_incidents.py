@@ -1441,6 +1441,107 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         )
         self.assertEqual(response.context["current_prediction_hidden_missing_count"], 1)
 
+    def test_stats_includes_hidden_low_accuracy_diagnostics(self):
+        tube_station = self.create_parent_station("Green Park", tube=True)
+        dlr_station = self.create_parent_station(
+            "West India Quay",
+            tube=False,
+            dlr=True,
+            national_rail=False,
+            crossrail=False,
+            overground=False,
+        )
+        base = timezone.now() - timedelta(days=20)
+
+        for i in range(15):
+            self.create_incident(
+                tube_station,
+                text=f"Resolved weak tube {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i),
+                end_time=base + timedelta(days=i + 1, hours=4),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.25,
+            )
+            self.create_incident(
+                dlr_station,
+                text=f"Resolved weak dlr {i}",
+                resolved=True,
+                start_time=base + timedelta(days=i, hours=1),
+                end_time=base + timedelta(days=i + 1, hours=5),
+                estimated_duration=timedelta(hours=1),
+                prediction_confidence=0.35,
+            )
+
+        self.create_incident(
+            tube_station,
+            text="faulty lift",
+            resolved=False,
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.25,
+        )
+        self.create_incident(
+            dlr_station,
+            text="planned maintenance",
+            resolved=False,
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.35,
+        )
+        self.create_incident(
+            dlr_station,
+            text="unavailability of station staff",
+            resolved=False,
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.35,
+        )
+
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            response = self.client.get("/stats/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Hidden Low-Accuracy Diagnostics")
+        self.assertContains(response, "By confidence bucket")
+        self.assertContains(response, "By category")
+        self.assertContains(response, "By network")
+        self.assertContains(response, "By station")
+
+        bucket_rows = {
+            row["label"]: row["count"]
+            for row in response.context["current_hidden_low_accuracy_bucket_rows"]
+        }
+        self.assertEqual(bucket_rows, {"20-30%": 1, "30-40%": 2})
+
+        category_rows = {
+            row["label"]: row["count"]
+            for row in response.context["current_hidden_low_accuracy_category_rows"]
+        }
+        self.assertEqual(
+            category_rows,
+            {"Faulty lift": 1, "Planned maintenance": 1, "Staff issue": 1},
+        )
+
+        network_rows = {
+            row["label"]: row["count"]
+            for row in response.context["current_hidden_low_accuracy_network_rows"]
+        }
+        self.assertEqual(network_rows, {"Tube": 1, "DLR": 2})
+
+        station_rows = {
+            row["station_name"]: row
+            for row in response.context["current_hidden_low_accuracy_station_rows"]
+        }
+        self.assertEqual(station_rows["Green Park"]["current_hidden_count"], 1)
+        self.assertEqual(station_rows["Green Park"]["recent_prediction_count"], 15)
+        self.assertEqual(station_rows["Green Park"]["recent_accuracy_pct"], 0)
+        self.assertTrue(station_rows["Green Park"]["has_enough_history"])
+        self.assertEqual(station_rows["West India Quay"]["current_hidden_count"], 2)
+        self.assertEqual(station_rows["West India Quay"]["recent_prediction_count"], 15)
+        self.assertEqual(station_rows["West India Quay"]["recent_accuracy_pct"], 0)
+        self.assertTrue(station_rows["West India Quay"]["has_enough_history"])
+
     def test_stats_uses_small_constant_number_of_queries(self):
         parent = self.create_parent_station("Green Park")
         now = timezone.now()

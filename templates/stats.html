@@ -130,6 +130,116 @@
                     </table>
                 </div>
 
+                {% if current_hidden_low_accuracy_bucket_rows or current_hidden_low_accuracy_station_rows %}
+                <h3>Hidden Low-Accuracy Diagnostics</h3>
+                <p><i>These tables only look at current unresolved issues hidden because similar predictions have not been accurate enough.</i></p>
+
+                {% if current_hidden_low_accuracy_bucket_rows %}
+                <h4>By confidence bucket</h4>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Current unresolved issues hidden because similar predictions have not been accurate enough, grouped by confidence bucket.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Confidence bucket</th>
+                                <th scope="col">Current hidden issues</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in current_hidden_low_accuracy_bucket_rows %}
+                            <tr>
+                                <td>{{ row.label }}</td>
+                                <td>{{ row.count }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+
+                {% if current_hidden_low_accuracy_category_rows %}
+                <h4>By category</h4>
+                <p><i>Categories are inferred from the incident text.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Current unresolved issues hidden because similar predictions have not been accurate enough, grouped by inferred category.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Category</th>
+                                <th scope="col">Current hidden issues</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in current_hidden_low_accuracy_category_rows %}
+                            <tr>
+                                <td>{{ row.label }}</td>
+                                <td>{{ row.count }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+
+                {% if current_hidden_low_accuracy_network_rows %}
+                <h4>By network</h4>
+                <p><i>A station can appear in more than one network, so these counts can add up to more than the number of current hidden issues.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Current unresolved issues hidden because similar predictions have not been accurate enough, grouped by station network.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Network</th>
+                                <th scope="col">Current hidden issues</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in current_hidden_low_accuracy_network_rows %}
+                            <tr>
+                                <td>{{ row.label }}</td>
+                                <td>{{ row.count }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+
+                {% if current_hidden_low_accuracy_station_rows %}
+                <h4>By station</h4>
+                <p><i>Recent station accuracy is only shown when that station has at least {{ prediction_station_diagnostic_min_samples }} resolved predictions in the last {{ prediction_station_diagnostic_window_days }} days.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Stations with current unresolved issues hidden because similar predictions have not been accurate enough, with recent prediction history where available.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Station</th>
+                                <th scope="col">Current hidden issues</th>
+                                <th scope="col">Recent resolved predictions</th>
+                                <th scope="col">Recent close accuracy</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in current_hidden_low_accuracy_station_rows %}
+                            <tr>
+                                <td>{{ row.station_name }}</td>
+                                <td>{{ row.current_hidden_count }}</td>
+                                <td>{{ row.recent_prediction_count }}</td>
+                                <td>
+                                    {% if row.has_enough_history %}
+                                        {{ row.recent_accuracy_pct }}%
+                                    {% else %}
+                                        Not enough history
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+                {% endif %}
+
                 {% if recent_prediction_rows %}
                 <h3>Recent Prediction Checks</h3>
                 <p><i>The {{ prediction_review_limit }} most recent resolved incidents with predictions.</i></p>

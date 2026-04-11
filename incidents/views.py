@@ -35,8 +35,16 @@ PREDICTION_POLICY_WINDOW_DAYS = 30
 PREDICTION_POLICY_FALLBACK_WINDOW_DAYS = (90, 180)
 PREDICTION_BUCKET_MIN_SAMPLES = 15
 PREDICTION_BUCKET_MIN_LOWER_BOUND = 0.55
+PREDICTION_STATION_DIAGNOSTIC_MIN_SAMPLES = 3
 BETA_LONG_RANGE_DAYS = 7
 PREDICTION_REVIEW_LIMIT = 50
+PREDICTION_NETWORK_LABELS = (
+    ("tube", "Tube"),
+    ("dlr", "DLR"),
+    ("national_rail", "National rail"),
+    ("crossrail", "Crossrail"),
+    ("overground", "Overground"),
+)
 
 
 def _format_duration(duration):
@@ -77,6 +85,12 @@ def _prediction_confidence_bucket(confidence):
     if confidence is None:
         return None
     return min(9, int(confidence * 10)) * 10
+
+
+def _prediction_confidence_bucket_label(bucket):
+    if bucket is None:
+        return "Unknown"
+    return f"{bucket}-{bucket + 10}%"
 
 
 def _prediction_confidence_label(accuracy):
@@ -163,6 +177,140 @@ def _prediction_review_outcome_text(outcome):
     if outcome == "near":
         return "Nearly right"
     return "Wrong"
+
+
+def _effective_station(station):
+    return station.parent_station or station
+
+
+def _prediction_issue_category(text):
+    text_lower = (text or "").lower()
+    if "faulty lift" in text_lower:
+        return "Faulty lift"
+    if "planned maintenance" in text_lower:
+        return "Planned maintenance"
+    if "staff" in text_lower:
+        return "Staff issue"
+    return "Other"
+
+
+def _prediction_issue_networks(station):
+    station = _effective_station(station)
+    labels = [
+        label for field, label in PREDICTION_NETWORK_LABELS if getattr(station, field, False)
+    ]
+    return labels or ["Unknown"]
+
+
+def _count_rows_from_mapping(mapping, labels=None):
+    if labels is None:
+        labels = sorted(mapping)
+    return [
+        {"label": label, "count": mapping[label]}
+        for label in labels
+        if mapping.get(label, 0) > 0
+    ]
+
+
+def _hidden_low_accuracy_diagnostics(current_issues, resolved_incidents):
+    low_accuracy_issues = [
+        issue
+        for issue in current_issues
+        if issue.prediction_hidden_reason == "bucket_accuracy_too_low"
+    ]
+
+    bucket_counts = {}
+    category_counts = {
+        "Faulty lift": 0,
+        "Planned maintenance": 0,
+        "Staff issue": 0,
+        "Other": 0,
+    }
+    network_counts = {label: 0 for _, label in PREDICTION_NETWORK_LABELS}
+    station_history = {}
+    station_current_counts = {}
+
+    for incident in resolved_incidents:
+        station = _effective_station(incident.station)
+        history = station_history.setdefault(
+            station.id,
+            {
+                "station_name": station.name,
+                "prediction_count": 0,
+                "correct_count": 0,
+            },
+        )
+        history["prediction_count"] += 1
+        predicted_end = incident.start_time + incident.estimated_duration
+        if prediction_is_close_enough(predicted_end, incident.end_time):
+            history["correct_count"] += 1
+
+    for issue in low_accuracy_issues:
+        bucket_label = _prediction_confidence_bucket_label(
+            _prediction_confidence_bucket(issue.prediction_confidence)
+        )
+        bucket_counts[bucket_label] = bucket_counts.get(bucket_label, 0) + 1
+        category_counts[_prediction_issue_category(issue.text)] += 1
+
+        station = _effective_station(issue.station)
+        station_entry = station_current_counts.setdefault(
+            station.id,
+            {"station_name": station.name, "current_hidden_count": 0},
+        )
+        station_entry["current_hidden_count"] += 1
+
+        for network_label in _prediction_issue_networks(station):
+            network_counts[network_label] = network_counts.get(network_label, 0) + 1
+
+    station_rows = []
+    for station_id, station_entry in station_current_counts.items():
+        history = station_history.get(
+            station_id, {"prediction_count": 0, "correct_count": 0}
+        )
+        prediction_count = history["prediction_count"]
+        has_enough_history = (
+            prediction_count >= PREDICTION_STATION_DIAGNOSTIC_MIN_SAMPLES
+        )
+        station_rows.append(
+            {
+                "station_name": station_entry["station_name"],
+                "current_hidden_count": station_entry["current_hidden_count"],
+                "recent_prediction_count": prediction_count,
+                "recent_accuracy_pct": (
+                    round(history["correct_count"] / prediction_count * 100)
+                    if has_enough_history and prediction_count
+                    else None
+                ),
+                "has_enough_history": has_enough_history,
+            }
+        )
+
+    station_rows.sort(
+        key=lambda row: (
+            -row["current_hidden_count"],
+            -(row["recent_prediction_count"] or 0),
+            row["station_name"],
+        )
+    )
+
+    return {
+        "current_hidden_low_accuracy_bucket_rows": _count_rows_from_mapping(
+            bucket_counts,
+            labels=[
+                _prediction_confidence_bucket_label(bucket)
+                for bucket in range(0, 100, 10)
+            ],
+        ),
+        "current_hidden_low_accuracy_category_rows": _count_rows_from_mapping(
+            category_counts,
+            labels=["Faulty lift", "Planned maintenance", "Staff issue", "Other"],
+        ),
+        "current_hidden_low_accuracy_network_rows": _count_rows_from_mapping(
+            network_counts,
+            labels=[label for _, label in PREDICTION_NETWORK_LABELS] + ["Unknown"],
+        ),
+        "current_hidden_low_accuracy_station_rows": station_rows,
+    }
 
 
 def _wilson_lower_bound(successes, total, z=1.96):
@@ -905,6 +1053,7 @@ def _prediction_stats(since):
         for issue in current_issues
         if issue.prediction_hidden_reason == "missing_prediction"
     )
+    low_accuracy_diagnostics = _hidden_low_accuracy_diagnostics(current_issues, incidents)
 
     for incident in incidents:
         if incident.end_time <= since or len(recent_prediction_rows) >= PREDICTION_REVIEW_LIMIT:
@@ -984,6 +1133,10 @@ def _prediction_stats(since):
         "prediction_display_fallback_window_days": ", ".join(
             str(days) for days in PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
         ),
+        "prediction_station_diagnostic_min_samples": (
+            PREDICTION_STATION_DIAGNOSTIC_MIN_SAMPLES
+        ),
+        "prediction_station_diagnostic_window_days": max(windows),
         "current_issue_count": len(current_issues),
         "current_prediction_visible_count": current_prediction_visible_count,
         "current_prediction_hidden_sparse_count": (
@@ -998,6 +1151,7 @@ def _prediction_stats(since):
         "current_prediction_hidden_missing_count": current_prediction_hidden_missing_count,
         "recent_prediction_rows": recent_prediction_rows,
         "prediction_review_limit": PREDICTION_REVIEW_LIMIT,
+        **low_accuracy_diagnostics,
     }
 
 
