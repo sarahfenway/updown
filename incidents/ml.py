@@ -40,6 +40,9 @@ PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 MAX_OFFSET_CLASS = 20
 NETWORK_FIELDS = ("tube", "dlr", "national_rail", "crossrail", "overground")
 BASELINE_CATEGORY_OTHER = "other"
+STATION_HISTORY_DECAY = 0.95
+STATION_VELOCITY_WINDOW = 5
+CATEGORY_MAP = {"faulty_lift": 0, "planned_maintenance": 1, "staff_issue": 2, "other": 3}
 HISTORICAL_BASELINE_DEFAULTS = {
     "global_weight": 1.0,
     "category_weight": 1.0,
@@ -397,29 +400,20 @@ def _predict_duration(incident):
     metadata = data.get("metadata") or {}
     feature_version = metadata.get("feature_version", 1)
     use_v2_features = feature_version >= 2
+    use_v4_features = feature_version >= 4
 
     from django.db.models import Q
     from django.utils import timezone as tz_module
 
     from incidents.models import Incident
 
-    # Roll the station up to its parent — a station like "Bank" has
-    # separate child records per line but is one place from the user's
-    # point of view, and that's where the station-manager-level signal lives.
     station = incident.station.parent_station or incident.station
     feature_text = normalise_incident_text(incident.text) if use_v2_features else (incident.text or "")
     text = feature_text.lower()
     start_time_local = _to_local(incident.start_time) if use_v2_features else incident.start_time
 
-    # Historical filter: the effective station itself, or any of its
-    # children. Covers both possibilities regardless of which record the
-    # incident was originally filed against.
     station_filter = Q(station=station) | Q(station__parent_station=station)
 
-    # Per-station historical stats from resolved incidents. We pull the raw
-    # start/end times so we can compute both mean duration and mean block
-    # offset in a single query — the training pipeline uses the same two
-    # features, so they have to match.
     past_qs = Incident.objects.filter(
         station_filter,
         resolved=True,
@@ -427,18 +421,37 @@ def _predict_duration(incident):
     )
     if use_v2_features:
         past_qs = past_qs.filter(end_time__lte=incident.start_time)
-    past = list(past_qs.values_list("start_time", "end_time"))
+    past = list(past_qs.order_by("end_time").values_list("start_time", "end_time"))
     count = len(past)
     if count:
-        mean_dur = sum((e - s).total_seconds() for s, e in past) / count / 60
+        import math
+        import numpy as np
+
+        durations_min = [(e - s).total_seconds() / 60 for s, e in past]
         offsets = [
             max(0, min(MAX_OFFSET_CLASS, block_index(e) - block_index(s)))
             for s, e in past
         ]
-        mean_offset = sum(offsets) / count
+
+        if use_v4_features:
+            weights = np.array([STATION_HISTORY_DECAY ** (count - 1 - i) for i in range(count)])
+            w_sum = weights.sum()
+            mean_dur = float(np.dot(weights, durations_min) / w_sum)
+            mean_offset = float(np.dot(weights, offsets) / w_sum)
+            recent = durations_min[-STATION_VELOCITY_WINDOW:]
+            alpha = 2.0 / (len(recent) + 1)
+            ema = recent[0]
+            for v in recent[1:]:
+                ema = alpha * v + (1 - alpha) * ema
+            station_velocity = ema
+        else:
+            mean_dur = sum(durations_min) / count
+            mean_offset = sum(offsets) / count
+            station_velocity = 0.0
     else:
         mean_dur = 0
         mean_offset = 0
+        station_velocity = 0.0
 
     if hasattr(incident, "prefetched_reports"):
         num_reports = len(incident.prefetched_reports)
@@ -480,6 +493,16 @@ def _predict_duration(incident):
     start_idx = block_index(incident.start_time)
     start_block_num = start_idx % BLOCKS_PER_DAY
 
+    import math
+
+    has_history = int(days_since_last >= 0)
+    log_days_since_last = math.log1p(days_since_last) if days_since_last >= 0 else 0.0
+
+    category = _prediction_category_from_text(text)
+    category_numeric = CATEGORY_MAP.get(category, 3)
+    category_x_start_block = category_numeric * BLOCKS_PER_DAY + start_block_num
+    category_x_is_weekend = category_numeric * 2 + int(start_time_local.weekday() >= 5)
+
     features = {
         "station_id": station.id,
         "information": int(incident.information),
@@ -499,10 +522,15 @@ def _predict_duration(incident):
         "access_via_lift": int(bool(station.access_via_lift)),
         "num_reports": num_reports,
         "days_since_last_incident": round(days_since_last, 2),
+        "has_history": has_history,
+        "log_days_since_last": round(log_days_since_last, 4),
         "concurrent_incidents": concurrent,
+        "category_x_start_block": category_x_start_block,
+        "category_x_is_weekend": category_x_is_weekend,
         "station_mean_duration": mean_dur,
         "station_incident_count": count,
         "station_mean_offset": mean_offset,
+        "station_velocity": station_velocity,
     }
 
     try:

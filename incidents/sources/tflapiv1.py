@@ -17,9 +17,10 @@ def check():
         % (settings.TFL_API_ID, settings.TFL_API_KEY)
     )
 
-    cleared_disruption = list(
-        Report.objects.filter(resolved=False, source=Report.SOURCE_TFLAPI_V1)
-    )
+    cleared_disruption = {
+        report.pk: report
+        for report in Report.objects.filter(resolved=False, source=Report.SOURCE_TFLAPI_V1)
+    }
 
     try:
         r = requests.get(StatusPageURI)
@@ -77,14 +78,14 @@ def check():
                                         report.information = False
                             report.save()
                         else:
-                            if report in cleared_disruption:
-                                cleared_disruption.remove(report)
+                            cleared_disruption.pop(report.pk, None)
                     except ValueError:
                         pass
 
-            for report in cleared_disruption:
+            now = timezone.now()
+            for report in cleared_disruption.values():
                 report.resolved = True
-                report.end_time = timezone.now()
+                report.end_time = now
                 report.save()
 
     except requests.exceptions.ConnectionError:

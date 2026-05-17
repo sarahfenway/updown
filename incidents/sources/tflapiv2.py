@@ -1,5 +1,3 @@
-from datetime import datetime
-
 import requests
 from django.conf import settings
 from django.utils import timezone
@@ -12,9 +10,10 @@ from stations.utils import find_station_from_naptan
 def check():
     StatusPageURI = f"https://api.tfl.gov.uk/Disruptions/Lifts/?app_id={settings.TFL_API_ID}&app_key={settings.TFL_API_KEY}"
 
-    cleared_disruption = list(
-        Report.objects.filter(resolved=False, source=Report.SOURCE_TFLAPI_V2)
-    )
+    cleared_disruption = {
+        report.pk: report
+        for report in Report.objects.filter(resolved=False, source=Report.SOURCE_TFLAPI_V2)
+    }
 
     try:
         r = requests.get(StatusPageURI)
@@ -44,15 +43,15 @@ def check():
                     )
 
                     if not created:
-                        if report in cleared_disruption:
-                            cleared_disruption.remove(report)
+                        cleared_disruption.pop(report.pk, None)
 
                 except ValueError:
                     pass
 
-            for report in cleared_disruption:
+            now = timezone.now()
+            for report in cleared_disruption.values():
                 report.resolved = True
-                report.end_time = timezone.now()
+                report.end_time = now
                 report.save()
 
     except requests.exceptions.ConnectionError:

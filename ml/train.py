@@ -122,7 +122,11 @@ FEATURE_COLUMNS = [
     "access_via_lift",
     "num_reports",
     "days_since_last_incident",
+    "has_history",
+    "log_days_since_last",
     "concurrent_incidents",
+    "category_x_start_block",
+    "category_x_is_weekend",
 ]
 
 TARGET_COLUMN = "block_offset"
@@ -180,39 +184,54 @@ def normalise_incident_text(text):
     return " ".join(text.split())
 
 
+STATION_HISTORY_DECAY = 0.95
+STATION_VELOCITY_WINDOW = 5
+
+
 def add_causal_station_history(df):
-    """Add station history features using only incidents already resolved."""
+    """Add station history features using only incidents already resolved.
+
+    Uses exponential decay weighting so recent incidents matter more than
+    ancient ones, and also computes a 'velocity' feature — the EMA of the
+    last N resolution durations.
+    """
     df = df.sort_values(["start_time", "end_time", "station_id"]).reset_index(drop=True)
 
-    station_count = {}
-    station_duration_sum = {}
-    station_offset_sum = {}
+    station_durations = {}
+    station_offsets = {}
     pending = []
 
     mean_durations = []
     incident_counts = []
     mean_offsets = []
+    velocities = []
 
     for seq, row in enumerate(df.itertuples(index=False), start=1):
         while pending and pending[0][0] <= row.start_time:
             _, _, station_id, duration_minutes, block_offset = heapq.heappop(pending)
-            station_count[station_id] = station_count.get(station_id, 0) + 1
-            station_duration_sum[station_id] = (
-                station_duration_sum.get(station_id, 0.0) + duration_minutes
-            )
-            station_offset_sum[station_id] = (
-                station_offset_sum.get(station_id, 0.0) + block_offset
-            )
+            station_durations.setdefault(station_id, []).append(duration_minutes)
+            station_offsets.setdefault(station_id, []).append(block_offset)
 
-        count = station_count.get(row.station_id, 0)
+        durations = station_durations.get(row.station_id, [])
+        offsets = station_offsets.get(row.station_id, [])
+        count = len(durations)
         incident_counts.append(count)
 
         if count:
-            mean_durations.append(station_duration_sum[row.station_id] / count)
-            mean_offsets.append(station_offset_sum[row.station_id] / count)
+            weights = np.array([STATION_HISTORY_DECAY ** (count - 1 - i) for i in range(count)])
+            w_sum = weights.sum()
+            mean_durations.append(np.dot(weights, durations) / w_sum)
+            mean_offsets.append(np.dot(weights, offsets) / w_sum)
+            recent = durations[-STATION_VELOCITY_WINDOW:]
+            alpha = 2.0 / (len(recent) + 1)
+            ema = recent[0]
+            for v in recent[1:]:
+                ema = alpha * v + (1 - alpha) * ema
+            velocities.append(ema)
         else:
             mean_durations.append(0.0)
             mean_offsets.append(0.0)
+            velocities.append(0.0)
 
         heapq.heappush(
             pending,
@@ -228,6 +247,7 @@ def add_causal_station_history(df):
     df["station_mean_duration"] = mean_durations
     df["station_incident_count"] = incident_counts
     df["station_mean_offset"] = mean_offsets
+    df["station_velocity"] = velocities
     return df
 
 
@@ -293,8 +313,30 @@ def prepare_features(df):
     # training features match what we can know at prediction time.
     df = add_causal_station_history(df)
 
-    # TF-IDF on incident text
-    vectorizer = TfidfVectorizer(max_features=50, stop_words="english")
+    # Log-transform days_since_last_incident + binary has_history flag
+    df["has_history"] = (df["days_since_last_incident"] >= 0).astype(int)
+    df["log_days_since_last"] = df["days_since_last_incident"].apply(
+        lambda x: np.log1p(x) if x >= 0 else 0.0
+    )
+
+    # Interaction features: category × time signals
+    category_codes = df.apply(
+        lambda r: _incident_category_from_flags(
+            bool(r["has_faulty_lift"]),
+            bool(r["has_planned_maintenance"]),
+            bool(r["has_staff_issue"]),
+        ),
+        axis=1,
+    )
+    category_map = {"faulty_lift": 0, "planned_maintenance": 1, "staff_issue": 2, "other": 3}
+    category_numeric = category_codes.map(category_map).astype(int)
+    df["category_x_start_block"] = category_numeric * BLOCKS_PER_DAY + df["start_block"]
+    df["category_x_is_weekend"] = category_numeric * 2 + df["is_weekend"]
+
+    # TF-IDF on incident text — bigrams + more features for richer signal
+    vectorizer = TfidfVectorizer(
+        max_features=100, stop_words="english", ngram_range=(1, 2)
+    )
     tfidf_matrix = vectorizer.fit_transform(df["text"].fillna(""))
     tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
     tfidf_df = pd.DataFrame(
@@ -304,7 +346,12 @@ def prepare_features(df):
 
     feature_cols = (
         FEATURE_COLUMNS
-        + ["station_mean_duration", "station_incident_count", "station_mean_offset"]
+        + [
+            "station_mean_duration",
+            "station_incident_count",
+            "station_mean_offset",
+            "station_velocity",
+        ]
         + tfidf_cols
     )
 
@@ -510,24 +557,24 @@ def train_model(df, feature_cols):
     n = len(df)
     sample_weights = np.linspace(1.0, 1.5, n)
 
-    # Treat station_id as a proper categorical so the tree model can learn
-    # per-station behaviour directly, instead of treating it as an ordinal
-    # number that happens to sit next to other station IDs.
-    categorical_mask = [col == "station_id" for col in feature_cols]
+    # Treat station_id and interaction features as categorical so the tree
+    # model can learn per-group behaviour directly.
+    categorical_cols = {"station_id", "category_x_start_block", "category_x_is_weekend"}
+    categorical_mask = [col in categorical_cols for col in feature_cols]
 
     def _fresh_model():
         return HistGradientBoostingClassifier(
-            max_iter=300,
+            max_iter=500,
             max_depth=6,
             learning_rate=0.08,
-            min_samples_leaf=20,
-            l2_regularization=0.5,
+            min_samples_leaf=10,
+            l2_regularization=0.3,
             categorical_features=categorical_mask,
             random_state=42,
         )
 
     # Time-series cross-validation on block accuracy.
-    tscv = TimeSeriesSplit(n_splits=3)
+    tscv = TimeSeriesSplit(n_splits=5)
     fold_scores = []
     for train_idx, test_idx in tscv.split(X):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -612,7 +659,7 @@ def upload_model(model, vectorizer, historical_baselines, upload_url, key):
         "vectorizer": vectorizer,
         "historical_baselines": historical_baselines,
         "metadata": {
-            "feature_version": 3,
+            "feature_version": 4,
         },
     }, model_path)
     print(f"\nModel saved locally to {model_path}")

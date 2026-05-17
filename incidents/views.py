@@ -421,67 +421,10 @@ def _wilson_lower_bound(successes, total, z=1.96):
 
 
 def _prediction_bucket_metrics(since):
-    incidents = Incident.objects.filter(
-        resolved=True,
-        end_time__gt=since,
-        estimated_duration__isnull=False,
-        start_time__isnull=False,
-        end_time__isnull=False,
-    ).only("start_time", "end_time", "estimated_duration", "prediction_confidence")
-
-    count = 0
-    correct = 0
-    buckets = {}
-
-    for inc in incidents:
-        predicted_end = inc.start_time + inc.estimated_duration
-        is_correct = prediction_is_close_enough(predicted_end, inc.end_time)
-        count += 1
-        if is_correct:
-            correct += 1
-
-        bucket = _prediction_confidence_bucket(inc.prediction_confidence)
-        if bucket is None:
-            continue
-
-        entry = buckets.setdefault(bucket, {"count": 0, "correct": 0})
-        entry["count"] += 1
-        if is_correct:
-            entry["correct"] += 1
-
-    for bucket in range(0, 100, 10):
-        entry = buckets.setdefault(bucket, {"count": 0, "correct": 0})
-        if entry["count"] > 0:
-            accuracy = entry["correct"] / entry["count"]
-            lower_bound = _wilson_lower_bound(entry["correct"], entry["count"])
-        else:
-            accuracy = None
-            lower_bound = 0.0
-
-        show_prediction = (
-            entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES
-            and lower_bound >= PREDICTION_BUCKET_MIN_LOWER_BOUND
-        )
-        entry.update(
-            {
-                "bucket": bucket,
-                "accuracy": accuracy,
-                "accuracy_pct": round(accuracy * 100) if accuracy is not None else None,
-                "lower_bound": lower_bound,
-                "lower_bound_pct": round(lower_bound * 100),
-                "show_prediction": show_prediction,
-                "label": (
-                    _prediction_confidence_label(accuracy) if show_prediction else None
-                ),
-            }
-        )
-
-    return {
-        "prediction_count": count,
-        "prediction_correct_count": correct,
-        "prediction_accuracy_pct": round(correct / count * 100) if count else 0,
-        "buckets": buckets,
-    }
+    now = timezone.now()
+    return _prediction_window_metrics(now, (max(1, (now - since).days),)).get(
+        max(1, (now - since).days), {"prediction_count": 0, "buckets": {}}
+    )
 
 
 def _prediction_window_metrics_from_incidents(incidents, now, windows):
@@ -848,109 +791,40 @@ def beta_detail(request):
 
 @never_cache
 def api_incidents(request):
-    # Fetch querysets
-    issues_qs = (
-        Incident.objects.filter(resolved=False, information=False)
-        .order_by("-start_time", "station__parent_station")
-        .annotate(
-            station_name=Coalesce(
-                "station__parent_station__name",
-                "station__name",
-                output_field=CharField(),
-            ),
-            station_naptan=Coalesce(
-                "station__parent_station__naptan_id",
-                "station__parent_station__hub_naptan_id",
-                "station__naptan_id",
-                "station__hub_naptan_id",
-                output_field=CharField(),
-            ),
-        )
+    API_FIELDS = (
+        "id", "text", "start_time", "end_time",
+        "resolved", "information", "station_name", "station_naptan",
     )
 
-    resolved_qs = (
-        Incident.objects.filter(
-            resolved=True, end_time__gte=timezone.now() - timedelta(hours=12)
-        )
-        .order_by("-start_time", "station__parent_station")
-        .annotate(
-            station_name=Coalesce(
-                "station__parent_station__name",
-                "station__name",
-                output_field=CharField(),
-            ),
-            station_naptan=Coalesce(
-                "station__parent_station__naptan_id",
-                "station__parent_station__hub_naptan_id",
-                "station__naptan_id",
-                "station__hub_naptan_id",
-                output_field=CharField(),
-            ),
-        )
-    )
-
-    information_qs = (
-        Incident.objects.filter(resolved=False, information=True)
-        .order_by("-start_time", "station__parent_station")
-        .annotate(
-            station_name=Coalesce(
-                "station__parent_station__name",
-                "station__name",
-                output_field=CharField(),
-            ),
-            station_naptan=Coalesce(
-                "station__parent_station__naptan_id",
-                "station__parent_station__hub_naptan_id",
-                "station__naptan_id",
-                "station__hub_naptan_id",
-                output_field=CharField(),
-            ),
-        )
-    )
-
-    # Convert them into something JSON-friendly.
-    # You can specify exactly which fields you want via .values().
-    issues_data = list(
-        issues_qs.values(
-            "id",
-            "text",
-            "start_time",
-            "end_time",
-            "resolved",
-            "information",
-            "station_name",
-            "station_naptan",
-        )
-    )
-    resolved_data = list(
-        resolved_qs.values(
-            "id",
-            "text",
-            "start_time",
-            "end_time",
-            "resolved",
-            "information",
-            "station_name",
-            "station_naptan",
-        )
-    )
-    information_data = list(
-        information_qs.values(
-            "id",
-            "text",
-            "start_time",
-            "end_time",
-            "resolved",
-            "information",
-            "station_name",
-            "station_naptan",
-        )
+    base_qs = Incident.objects.order_by(
+        "-start_time", "station__parent_station"
+    ).annotate(
+        station_name=Coalesce(
+            "station__parent_station__name",
+            "station__name",
+            output_field=CharField(),
+        ),
+        station_naptan=Coalesce(
+            "station__parent_station__naptan_id",
+            "station__parent_station__hub_naptan_id",
+            "station__naptan_id",
+            "station__hub_naptan_id",
+            output_field=CharField(),
+        ),
     )
 
     data = {
-        "issues": issues_data,
-        "resolved": resolved_data,
-        "information": information_data,
+        "issues": list(
+            base_qs.filter(resolved=False, information=False).values(*API_FIELDS)
+        ),
+        "resolved": list(
+            base_qs.filter(
+                resolved=True, end_time__gte=timezone.now() - timedelta(hours=12)
+            ).values(*API_FIELDS)
+        ),
+        "information": list(
+            base_qs.filter(resolved=False, information=True).values(*API_FIELDS)
+        ),
         "last_updated": datetime.now().isoformat(),
     }
 
@@ -1307,25 +1181,21 @@ def _prediction_stats(since):
 
 
 def alexa(request):
-    issues = Incident.objects.filter(resolved=False, information=False).order_by(
-        "station__parent_station"
+    station_names = sorted(
+        Incident.objects.filter(
+            resolved=False, information=False
+        ).values_list("station__parent_station__name", flat=True)
     )
 
-    if issues.count() == 0:
+    if not station_names:
         alexa_string = "There are currently no reported step free access issues on the \
             Transport for London network."
+    elif len(station_names) == 1:
+        alexa_string = "There are step free access issues at: " + station_names[0]
     else:
         alexa_string = "There are step free access issues at: "
-        alexa_string += ", ".join(
-            sorted(issues.values_list("station__parent_station__name", flat=True))[0:-1]
-        )
-
-        if issues.count() > 1:
-            alexa_string += " and "
-
-        alexa_string += sorted(
-            issues.values_list("station__parent_station__name", flat=True)
-        )[-1]
+        alexa_string += ", ".join(station_names[:-1])
+        alexa_string += " and " + station_names[-1]
 
     alexa_string = alexa_string.replace("&", "and")
 

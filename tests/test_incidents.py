@@ -1518,7 +1518,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
                 text=f"Resolved weak {i}",
                 resolved=True,
                 start_time=base + timedelta(days=i, hours=3),
-                end_time=base + timedelta(days=i, hours=7),
+                end_time=base + timedelta(days=i, hours=12),
                 estimated_duration=timedelta(hours=1),
                 prediction_confidence=0.25,
             )
