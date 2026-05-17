@@ -125,27 +125,31 @@ class UtilityTests(SimpleTestCase):
         self.assertEqual(_prediction_confidence_label(0.85), "very likely")
 
     def test_prediction_outcome_is_one_sided_fixed_by_bound(self):
-        # Predicted "fixed by" the daytime block (10:00–15:00) on a GMT day.
+        # We promised it would be fixed *by* 14:00.
         predicted_end = datetime(2026, 1, 1, 14, 0, tzinfo=dt_timezone.utc)
 
-        # Resolved within the named block — the tightest possible hit.
-        self.assertEqual(
-            prediction_outcome(
-                predicted_end,
-                datetime(2026, 1, 1, 14, 30, tzinfo=dt_timezone.utc),
-            ),
-            "exact",
-        )
-        # Resolved earlier than the bound (we were conservative) — the
-        # "fixed by" promise still held, so this is near, not a miss.
+        # Resolved early — the "fixed by" promise was kept. Full success.
         self.assertEqual(
             prediction_outcome(
                 predicted_end,
                 datetime(2026, 1, 1, 9, 0, tzinfo=dt_timezone.utc),
             ),
+            "exact",
+        )
+        # Resolved exactly on the promised time — also a full success.
+        self.assertEqual(
+            prediction_outcome(predicted_end, predicted_end),
+            "exact",
+        )
+        # Overran, but only within the grace window — a soft miss.
+        self.assertEqual(
+            prediction_outcome(
+                predicted_end,
+                datetime(2026, 1, 1, 14, 20, tzinfo=dt_timezone.utc),
+            ),
             "near",
         )
-        # Resolved well after the bound — the promise broke.
+        # Overran well beyond grace — the promise broke.
         self.assertEqual(
             prediction_outcome(
                 predicted_end,

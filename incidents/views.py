@@ -150,8 +150,8 @@ def _beta_resolved_status_title(issue):
     if issue.prediction_outcome == "near":
         return (
             f"AI prediction: nearly right. We said it would be fixed by "
-            f"{issue.expected_block}; it was actually fixed {issue.actual_block}. "
-            f"{_beta_meter_help_text()}"
+            f"{issue.expected_block}; it ran slightly over and was fixed "
+            f"{issue.actual_block}. {_beta_meter_help_text()}"
         )
     return (
         f"AI prediction: wrong. We said it would be fixed by {issue.expected_block}, "

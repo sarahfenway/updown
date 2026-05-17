@@ -172,15 +172,20 @@ def prediction_is_close_enough(predicted_dt, actual_dt, grace=PREDICTION_BOUNDAR
 
 
 def prediction_outcome(predicted_dt, actual_dt, grace=PREDICTION_BOUNDARY_GRACE):
-    predicted_idx = block_index(predicted_dt)
-    actual_idx = block_index(actual_dt)
+    """Outcome of a one-sided "fixed by" prediction.
 
-    if predicted_idx == actual_idx:
-        # Resolved within the exact block we named — the tightest possible hit.
+    The promise was that it would be resolved by ``predicted_dt``. Being
+    resolved earlier is a full success — we never claimed it wouldn't be
+    sooner — so "exact" means resolved at or before the promised time,
+    whether early or bang on. "near" is a soft miss: it overran, but only
+    within the grace window. Anything later is a "miss".
+    """
+    actual = _to_local(actual_dt)
+    predicted = _to_local(predicted_dt)
+
+    if actual <= predicted:
         return "exact"
-    if _to_local(actual_dt) <= _to_local(predicted_dt) + grace:
-        # Resolved before our bound (we were a little conservative) or just
-        # the wrong side of it within grace — the "by" promise still held.
+    if actual <= predicted + grace:
         return "near"
     return "miss"
 
