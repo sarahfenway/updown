@@ -125,8 +125,6 @@ FEATURE_COLUMNS = [
     "has_history",
     "log_days_since_last",
     "concurrent_incidents",
-    "category_x_start_block",
-    "category_x_is_weekend",
 ]
 
 TARGET_COLUMN = "block_offset"
@@ -319,23 +317,9 @@ def prepare_features(df):
         lambda x: np.log1p(x) if x >= 0 else 0.0
     )
 
-    # Interaction features: category × time signals
-    category_codes = df.apply(
-        lambda r: _incident_category_from_flags(
-            bool(r["has_faulty_lift"]),
-            bool(r["has_planned_maintenance"]),
-            bool(r["has_staff_issue"]),
-        ),
-        axis=1,
-    )
-    category_map = {"faulty_lift": 0, "planned_maintenance": 1, "staff_issue": 2, "other": 3}
-    category_numeric = category_codes.map(category_map).astype(int)
-    df["category_x_start_block"] = category_numeric * BLOCKS_PER_DAY + df["start_block"]
-    df["category_x_is_weekend"] = category_numeric * 2 + df["is_weekend"]
-
     # TF-IDF on incident text — bigrams + more features for richer signal
     vectorizer = TfidfVectorizer(
-        max_features=100, stop_words="english", ngram_range=(1, 2)
+        max_features=75, stop_words="english", ngram_range=(1, 2)
     )
     tfidf_matrix = vectorizer.fit_transform(df["text"].fillna(""))
     tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
@@ -557,18 +541,15 @@ def train_model(df, feature_cols):
     n = len(df)
     sample_weights = np.linspace(1.0, 1.5, n)
 
-    # Treat station_id and interaction features as categorical so the tree
-    # model can learn per-group behaviour directly.
-    categorical_cols = {"station_id", "category_x_start_block", "category_x_is_weekend"}
-    categorical_mask = [col in categorical_cols for col in feature_cols]
+    categorical_mask = [col == "station_id" for col in feature_cols]
 
     def _fresh_model():
         return HistGradientBoostingClassifier(
-            max_iter=500,
+            max_iter=400,
             max_depth=6,
             learning_rate=0.08,
-            min_samples_leaf=10,
-            l2_regularization=0.3,
+            min_samples_leaf=20,
+            l2_regularization=0.5,
             categorical_features=categorical_mask,
             random_state=42,
         )

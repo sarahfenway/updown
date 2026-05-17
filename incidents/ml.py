@@ -42,7 +42,6 @@ NETWORK_FIELDS = ("tube", "dlr", "national_rail", "crossrail", "overground")
 BASELINE_CATEGORY_OTHER = "other"
 STATION_HISTORY_DECAY = 0.95
 STATION_VELOCITY_WINDOW = 5
-CATEGORY_MAP = {"faulty_lift": 0, "planned_maintenance": 1, "staff_issue": 2, "other": 3}
 HISTORICAL_BASELINE_DEFAULTS = {
     "global_weight": 1.0,
     "category_weight": 1.0,
@@ -498,11 +497,6 @@ def _predict_duration(incident):
     has_history = int(days_since_last >= 0)
     log_days_since_last = math.log1p(days_since_last) if days_since_last >= 0 else 0.0
 
-    category = _prediction_category_from_text(text)
-    category_numeric = CATEGORY_MAP.get(category, 3)
-    category_x_start_block = category_numeric * BLOCKS_PER_DAY + start_block_num
-    category_x_is_weekend = category_numeric * 2 + int(start_time_local.weekday() >= 5)
-
     features = {
         "station_id": station.id,
         "information": int(incident.information),
@@ -525,8 +519,6 @@ def _predict_duration(incident):
         "has_history": has_history,
         "log_days_since_last": round(log_days_since_last, 4),
         "concurrent_incidents": concurrent,
-        "category_x_start_block": category_x_start_block,
-        "category_x_is_weekend": category_x_is_weekend,
         "station_mean_duration": mean_dur,
         "station_incident_count": count,
         "station_mean_offset": mean_offset,
