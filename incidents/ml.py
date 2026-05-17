@@ -40,8 +40,7 @@ PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 MAX_OFFSET_CLASS = 20
 NETWORK_FIELDS = ("tube", "dlr", "national_rail", "crossrail", "overground")
 BASELINE_CATEGORY_OTHER = "other"
-STATION_HISTORY_DECAY = 0.95
-STATION_VELOCITY_WINDOW = 5
+STATION_RECENCY_WINDOW = 5
 HISTORICAL_BASELINE_DEFAULTS = {
     "global_weight": 1.0,
     "category_weight": 1.0,
@@ -420,37 +419,27 @@ def _predict_duration(incident):
     )
     if use_v2_features:
         past_qs = past_qs.filter(end_time__lte=incident.start_time)
-    past = list(past_qs.order_by("end_time").values_list("start_time", "end_time"))
+    past = list(past_qs.values_list("start_time", "end_time"))
     count = len(past)
     if count:
-        import math
-        import numpy as np
-
-        durations_min = [(e - s).total_seconds() / 60 for s, e in past]
+        mean_dur = sum((e - s).total_seconds() for s, e in past) / count / 60
         offsets = [
             max(0, min(MAX_OFFSET_CLASS, block_index(e) - block_index(s)))
             for s, e in past
         ]
-
+        mean_offset = sum(offsets) / count
         if use_v4_features:
-            weights = np.array([STATION_HISTORY_DECAY ** (count - 1 - i) for i in range(count)])
-            w_sum = weights.sum()
-            mean_dur = float(np.dot(weights, durations_min) / w_sum)
-            mean_offset = float(np.dot(weights, offsets) / w_sum)
-            recent = durations_min[-STATION_VELOCITY_WINDOW:]
-            alpha = 2.0 / (len(recent) + 1)
-            ema = recent[0]
-            for v in recent[1:]:
-                ema = alpha * v + (1 - alpha) * ema
-            station_velocity = ema
+            recent_durations = [
+                (e - s).total_seconds() / 60 for s, e in past[-STATION_RECENCY_WINDOW:]
+            ]
+            recent_mean = sum(recent_durations) / len(recent_durations)
+            station_recency_trend = recent_mean / mean_dur if mean_dur > 0 else 1.0
         else:
-            mean_dur = sum(durations_min) / count
-            mean_offset = sum(offsets) / count
-            station_velocity = 0.0
+            station_recency_trend = 1.0
     else:
         mean_dur = 0
         mean_offset = 0
-        station_velocity = 0.0
+        station_recency_trend = 1.0
 
     if hasattr(incident, "prefetched_reports"):
         num_reports = len(incident.prefetched_reports)
@@ -522,7 +511,7 @@ def _predict_duration(incident):
         "station_mean_duration": mean_dur,
         "station_incident_count": count,
         "station_mean_offset": mean_offset,
-        "station_velocity": station_velocity,
+        "station_recency_trend": station_recency_trend,
     }
 
     try:

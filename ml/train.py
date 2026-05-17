@@ -125,6 +125,7 @@ FEATURE_COLUMNS = [
     "has_history",
     "log_days_since_last",
     "concurrent_incidents",
+    "station_recency_trend",
 ]
 
 TARGET_COLUMN = "block_offset"
@@ -182,54 +183,55 @@ def normalise_incident_text(text):
     return " ".join(text.split())
 
 
-STATION_HISTORY_DECAY = 0.95
-STATION_VELOCITY_WINDOW = 5
+STATION_RECENCY_WINDOW = 5
 
 
 def add_causal_station_history(df):
-    """Add station history features using only incidents already resolved.
-
-    Uses exponential decay weighting so recent incidents matter more than
-    ancient ones, and also computes a 'velocity' feature — the EMA of the
-    last N resolution durations.
-    """
+    """Add station history features using only incidents already resolved."""
     df = df.sort_values(["start_time", "end_time", "station_id"]).reset_index(drop=True)
 
-    station_durations = {}
-    station_offsets = {}
+    station_count = {}
+    station_duration_sum = {}
+    station_offset_sum = {}
+    station_recent_durations = {}
     pending = []
 
     mean_durations = []
     incident_counts = []
     mean_offsets = []
-    velocities = []
+    recency_trends = []
 
     for seq, row in enumerate(df.itertuples(index=False), start=1):
         while pending and pending[0][0] <= row.start_time:
             _, _, station_id, duration_minutes, block_offset = heapq.heappop(pending)
-            station_durations.setdefault(station_id, []).append(duration_minutes)
-            station_offsets.setdefault(station_id, []).append(block_offset)
+            station_count[station_id] = station_count.get(station_id, 0) + 1
+            station_duration_sum[station_id] = (
+                station_duration_sum.get(station_id, 0.0) + duration_minutes
+            )
+            station_offset_sum[station_id] = (
+                station_offset_sum.get(station_id, 0.0) + block_offset
+            )
+            recent = station_recent_durations.setdefault(station_id, [])
+            recent.append(duration_minutes)
+            if len(recent) > STATION_RECENCY_WINDOW:
+                recent.pop(0)
 
-        durations = station_durations.get(row.station_id, [])
-        offsets = station_offsets.get(row.station_id, [])
-        count = len(durations)
+        count = station_count.get(row.station_id, 0)
         incident_counts.append(count)
 
         if count:
-            weights = np.array([STATION_HISTORY_DECAY ** (count - 1 - i) for i in range(count)])
-            w_sum = weights.sum()
-            mean_durations.append(np.dot(weights, durations) / w_sum)
-            mean_offsets.append(np.dot(weights, offsets) / w_sum)
-            recent = durations[-STATION_VELOCITY_WINDOW:]
-            alpha = 2.0 / (len(recent) + 1)
-            ema = recent[0]
-            for v in recent[1:]:
-                ema = alpha * v + (1 - alpha) * ema
-            velocities.append(ema)
+            mean_dur = station_duration_sum[row.station_id] / count
+            mean_durations.append(mean_dur)
+            mean_offsets.append(station_offset_sum[row.station_id] / count)
+            recent = station_recent_durations.get(row.station_id, [])
+            if recent and mean_dur > 0:
+                recency_trends.append(sum(recent) / len(recent) / mean_dur)
+            else:
+                recency_trends.append(1.0)
         else:
             mean_durations.append(0.0)
             mean_offsets.append(0.0)
-            velocities.append(0.0)
+            recency_trends.append(1.0)
 
         heapq.heappush(
             pending,
@@ -245,7 +247,7 @@ def add_causal_station_history(df):
     df["station_mean_duration"] = mean_durations
     df["station_incident_count"] = incident_counts
     df["station_mean_offset"] = mean_offsets
-    df["station_velocity"] = velocities
+    df["station_recency_trend"] = recency_trends
     return df
 
 
@@ -317,10 +319,8 @@ def prepare_features(df):
         lambda x: np.log1p(x) if x >= 0 else 0.0
     )
 
-    # TF-IDF on incident text — bigrams + more features for richer signal
-    vectorizer = TfidfVectorizer(
-        max_features=75, stop_words="english", ngram_range=(1, 2)
-    )
+    # TF-IDF on incident text
+    vectorizer = TfidfVectorizer(max_features=50, stop_words="english")
     tfidf_matrix = vectorizer.fit_transform(df["text"].fillna(""))
     tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
     tfidf_df = pd.DataFrame(
@@ -334,7 +334,7 @@ def prepare_features(df):
             "station_mean_duration",
             "station_incident_count",
             "station_mean_offset",
-            "station_velocity",
+            "station_recency_trend",
         ]
         + tfidf_cols
     )
