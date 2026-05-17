@@ -116,7 +116,7 @@ def _beta_current_status_text(label, expected_end_time, expected_block, now):
         return "More than a week"
     if not label:
         return None
-    return f"{label.capitalize()} {expected_block}"
+    return f"{label.capitalize()} by {expected_block}"
 
 
 def _beta_resolved_status_text(issue):
@@ -144,17 +144,18 @@ def _beta_resolved_status_title(issue):
         return None
     if issue.prediction_outcome == "exact":
         return (
-            f"AI prediction: right. We expected {issue.expected_block}, and it was fixed then. "
-            f"{_beta_meter_help_text()}"
+            f"AI prediction: right. We said it would be fixed by {issue.expected_block}, "
+            f"and it was. {_beta_meter_help_text()}"
         )
     if issue.prediction_outcome == "near":
         return (
-            f"AI prediction: nearly right. We expected {issue.expected_block}, but it was fixed "
-            f"{issue.actual_block}, just outside that window. {_beta_meter_help_text()}"
+            f"AI prediction: nearly right. We said it would be fixed by "
+            f"{issue.expected_block}; it was actually fixed {issue.actual_block}. "
+            f"{_beta_meter_help_text()}"
         )
     return (
-        f"AI prediction: wrong. We expected {issue.expected_block}, but it was fixed "
-        f"{issue.actual_block}. {_beta_meter_help_text()}"
+        f"AI prediction: wrong. We said it would be fixed by {issue.expected_block}, "
+        f"but it was not fixed until {issue.actual_block}. {_beta_meter_help_text()}"
     )
 
 

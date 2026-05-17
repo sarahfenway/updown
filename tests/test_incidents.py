@@ -124,9 +124,11 @@ class UtilityTests(SimpleTestCase):
         self.assertEqual(_prediction_confidence_label(0.84), "likely")
         self.assertEqual(_prediction_confidence_label(0.85), "very likely")
 
-    def test_prediction_outcome_treats_small_boundary_miss_as_near(self):
+    def test_prediction_outcome_is_one_sided_fixed_by_bound(self):
+        # Predicted "fixed by" the daytime block (10:00–15:00) on a GMT day.
         predicted_end = datetime(2026, 1, 1, 14, 0, tzinfo=dt_timezone.utc)
 
+        # Resolved within the named block — the tightest possible hit.
         self.assertEqual(
             prediction_outcome(
                 predicted_end,
@@ -134,17 +136,20 @@ class UtilityTests(SimpleTestCase):
             ),
             "exact",
         )
+        # Resolved earlier than the bound (we were conservative) — the
+        # "fixed by" promise still held, so this is near, not a miss.
+        self.assertEqual(
+            prediction_outcome(
+                predicted_end,
+                datetime(2026, 1, 1, 9, 0, tzinfo=dt_timezone.utc),
+            ),
+            "near",
+        )
+        # Resolved well after the bound — the promise broke.
         self.assertEqual(
             prediction_outcome(
                 predicted_end,
                 datetime(2026, 1, 1, 15, 1, tzinfo=dt_timezone.utc),
-            ),
-            "near",
-        )
-        self.assertEqual(
-            prediction_outcome(
-                predicted_end,
-                datetime(2026, 1, 1, 16, 0, tzinfo=dt_timezone.utc),
             ),
             "miss",
         )
@@ -677,7 +682,10 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
         ):
             duration, confidence = predict_duration(incident)
 
-        self.assertEqual(duration, timedelta(minutes=135))
+        # The model is certain (P=1.0 on offset 0), so the one-sided bound
+        # is the end of the start block (daytime, ends 15:00 BST), landing
+        # one second inside it. Start is 10:30 BST → 14:59:59 BST.
+        self.assertEqual(duration, timedelta(hours=4, minutes=29, seconds=59))
         self.assertEqual(confidence, 0.95)
         self.assertEqual(captured["features"]["hour_of_day"], 10)
         self.assertEqual(captured["features"]["month"], 7)
@@ -823,8 +831,13 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
         ):
             duration, confidence = predict_duration(incident)
 
-        self.assertEqual(duration, timedelta(minutes=135))
-        self.assertEqual(confidence, 0.58)
+        # Blended probs are [0.578, 0.422] over offsets [0, 1]. The 75%
+        # cumulative bound falls on offset 1, so the prediction is "fixed
+        # by" the end of the next (evening) block: 20:00 BST minus a second,
+        # from a 10:30 BST start. Confidence is the cumulative mass (~1.0,
+        # clamped to 0.95).
+        self.assertEqual(duration, timedelta(hours=9, minutes=29, seconds=59))
+        self.assertEqual(confidence, 0.95)
 
 
 @override_settings(ROOT_URLCONF="updown.urls")
@@ -865,34 +878,52 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         parent = self.create_parent_station("Waterloo")
         base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
 
-        for i in range(15):
+        # One-sided scoring: a prediction is correct when the incident was
+        # resolved at or before the predicted "fixed by" time. "Wrong"
+        # therefore means it resolved *later* than we promised.
+        #
+        # Bucket 60 (conf 0.65): 20 predictions, 16 correct → 80% accuracy,
+        # which clears the display gate and lands in the "likely" band.
+        for i in range(16):
             self.create_incident(
                 parent,
                 text=f"Resolved good {i}",
                 resolved=True,
                 start_time=base + timedelta(days=i),
                 end_time=base + timedelta(days=i, hours=1),
+                estimated_duration=timedelta(hours=2),
+                prediction_confidence=0.65,
+            )
+        for i in range(4):
+            self.create_incident(
+                parent,
+                text=f"Resolved good late {i}",
+                resolved=True,
+                start_time=base + timedelta(days=20 + i),
+                end_time=base + timedelta(days=20 + i, hours=12),
                 estimated_duration=timedelta(hours=1),
                 prediction_confidence=0.65,
             )
-        for i in range(3):
+        # Bucket 40 (conf 0.45): 15 predictions, 7 correct → ~47% accuracy,
+        # well below the gate, so it stays hidden.
+        for i in range(7):
             self.create_incident(
                 parent,
-                text=f"Resolved missed {i}",
-                resolved=True,
-                start_time=base + timedelta(days=20 + i),
-                end_time=base + timedelta(days=20 + i, hours=1),
-                estimated_duration=timedelta(hours=12),
-                prediction_confidence=0.65,
-            )
-        for i in range(15):
-            self.create_incident(
-                parent,
-                text=f"Resolved bad {i}",
+                text=f"Resolved low ok {i}",
                 resolved=True,
                 start_time=base + timedelta(days=40 + i),
                 end_time=base + timedelta(days=40 + i, hours=1),
-                estimated_duration=timedelta(hours=12),
+                estimated_duration=timedelta(hours=2),
+                prediction_confidence=0.45,
+            )
+        for i in range(8):
+            self.create_incident(
+                parent,
+                text=f"Resolved low late {i}",
+                resolved=True,
+                start_time=base + timedelta(days=60 + i),
+                end_time=base + timedelta(days=60 + i, hours=12),
+                estimated_duration=timedelta(hours=1),
                 prediction_confidence=0.45,
             )
 
@@ -921,7 +952,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertIsNone(incidents[0].prediction_label)
         self.assertTrue(incidents[1].show_prediction)
         self.assertEqual(incidents[1].prediction_label, "likely")
-        self.assertEqual(incidents[1].prediction_accuracy_pct, 83)
+        self.assertEqual(incidents[1].prediction_accuracy_pct, 80)
 
     def test_prepare_incidents_allows_40_bucket_for_station_with_strong_history(self):
         weak_station = self.create_parent_station("Camden Road", overground=True)
@@ -1024,13 +1055,15 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
         for i in range(15):
             start_time = now - timedelta(days=10 + i, hours=2)
+            # One-sided miss: we said "fixed by" an hour but it actually
+            # took twelve, so the promise broke.
             self.create_incident(
                 parent,
                 text=f"Recent miss {i}",
                 resolved=True,
                 start_time=start_time,
-                end_time=start_time + timedelta(hours=1),
-                estimated_duration=timedelta(hours=12),
+                end_time=start_time + timedelta(hours=12),
+                estimated_duration=timedelta(hours=1),
                 prediction_confidence=0.65,
             )
         for i in range(20):

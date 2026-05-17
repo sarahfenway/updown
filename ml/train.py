@@ -48,6 +48,9 @@ BLOCKS_PER_DAY = 4
 BLOCK_NAMES = ["morning", "daytime", "evening", "overnight"]
 MAX_OFFSET_CLASS = 20
 PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
+# Kept in sync with incidents/ml.py — predictions are a one-sided "fixed by"
+# bound at this cumulative probability.
+PREDICTION_COVERAGE_TARGET = 0.75
 
 
 def block_index(dt):
@@ -96,7 +99,18 @@ def block_distance_from_index(dt, index):
 
 
 def prediction_is_close_enough(predicted_block_idx, actual_dt, grace=PREDICTION_BOUNDARY_GRACE):
-    return block_distance_from_index(actual_dt, predicted_block_idx) <= grace
+    # One-sided "fixed by" check: the promise was that it would be resolved
+    # by the end of the predicted block. It held if the incident actually
+    # resolved at or before then (resolving earlier still counts), with a
+    # small grace for landing just over a boundary.
+    if getattr(actual_dt, "tzinfo", None) is not None:
+        if hasattr(actual_dt, "tz_localize"):
+            actual_dt = actual_dt.tz_localize(None)
+        else:
+            actual_dt = actual_dt.replace(tzinfo=None)
+
+    _, block_end_dt = block_start_end(predicted_block_idx)
+    return actual_dt <= block_end_dt + grace
 
 
 # ---------------------------------------------------------------------------
@@ -122,10 +136,7 @@ FEATURE_COLUMNS = [
     "access_via_lift",
     "num_reports",
     "days_since_last_incident",
-    "has_history",
-    "log_days_since_last",
     "concurrent_incidents",
-    "station_recency_trend",
 ]
 
 TARGET_COLUMN = "block_offset"
@@ -183,9 +194,6 @@ def normalise_incident_text(text):
     return " ".join(text.split())
 
 
-STATION_RECENCY_WINDOW = 5
-
-
 def add_causal_station_history(df):
     """Add station history features using only incidents already resolved."""
     df = df.sort_values(["start_time", "end_time", "station_id"]).reset_index(drop=True)
@@ -193,13 +201,11 @@ def add_causal_station_history(df):
     station_count = {}
     station_duration_sum = {}
     station_offset_sum = {}
-    station_recent_durations = {}
     pending = []
 
     mean_durations = []
     incident_counts = []
     mean_offsets = []
-    recency_trends = []
 
     for seq, row in enumerate(df.itertuples(index=False), start=1):
         while pending and pending[0][0] <= row.start_time:
@@ -211,27 +217,16 @@ def add_causal_station_history(df):
             station_offset_sum[station_id] = (
                 station_offset_sum.get(station_id, 0.0) + block_offset
             )
-            recent = station_recent_durations.setdefault(station_id, [])
-            recent.append(duration_minutes)
-            if len(recent) > STATION_RECENCY_WINDOW:
-                recent.pop(0)
 
         count = station_count.get(row.station_id, 0)
         incident_counts.append(count)
 
         if count:
-            mean_dur = station_duration_sum[row.station_id] / count
-            mean_durations.append(mean_dur)
+            mean_durations.append(station_duration_sum[row.station_id] / count)
             mean_offsets.append(station_offset_sum[row.station_id] / count)
-            recent = station_recent_durations.get(row.station_id, [])
-            if recent and mean_dur > 0:
-                recency_trends.append(sum(recent) / len(recent) / mean_dur)
-            else:
-                recency_trends.append(1.0)
         else:
             mean_durations.append(0.0)
             mean_offsets.append(0.0)
-            recency_trends.append(1.0)
 
         heapq.heappush(
             pending,
@@ -247,7 +242,6 @@ def add_causal_station_history(df):
     df["station_mean_duration"] = mean_durations
     df["station_incident_count"] = incident_counts
     df["station_mean_offset"] = mean_offsets
-    df["station_recency_trend"] = recency_trends
     return df
 
 
@@ -313,12 +307,6 @@ def prepare_features(df):
     # training features match what we can know at prediction time.
     df = add_causal_station_history(df)
 
-    # Log-transform days_since_last_incident + binary has_history flag
-    df["has_history"] = (df["days_since_last_incident"] >= 0).astype(int)
-    df["log_days_since_last"] = df["days_since_last_incident"].apply(
-        lambda x: np.log1p(x) if x >= 0 else 0.0
-    )
-
     # TF-IDF on incident text
     vectorizer = TfidfVectorizer(max_features=50, stop_words="english")
     tfidf_matrix = vectorizer.fit_transform(df["text"].fillna(""))
@@ -330,12 +318,7 @@ def prepare_features(df):
 
     feature_cols = (
         FEATURE_COLUMNS
-        + [
-            "station_mean_duration",
-            "station_incident_count",
-            "station_mean_offset",
-            "station_recency_trend",
-        ]
+        + ["station_mean_duration", "station_incident_count", "station_mean_offset"]
         + tfidf_cols
     )
 
@@ -541,11 +524,14 @@ def train_model(df, feature_cols):
     n = len(df)
     sample_weights = np.linspace(1.0, 1.5, n)
 
+    # Treat station_id as a proper categorical so the tree model can learn
+    # per-station behaviour directly, instead of treating it as an ordinal
+    # number that happens to sit next to other station IDs.
     categorical_mask = [col == "station_id" for col in feature_cols]
 
     def _fresh_model():
         return HistGradientBoostingClassifier(
-            max_iter=400,
+            max_iter=300,
             max_depth=6,
             learning_rate=0.08,
             min_samples_leaf=20,
@@ -555,7 +541,7 @@ def train_model(df, feature_cols):
         )
 
     # Time-series cross-validation on block accuracy.
-    tscv = TimeSeriesSplit(n_splits=5)
+    tscv = TimeSeriesSplit(n_splits=3)
     fold_scores = []
     for train_idx, test_idx in tscv.split(X):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -585,11 +571,21 @@ def train_model(df, feature_cols):
                 baseline_evidence,
                 baselines["config"],
             )
-            pred_pos = int(np.argmax(blended_probs))
-            preds.append(int(cv_model.classes_[pred_pos]))
+            # Decode the same way runtime does: the earliest offset whose
+            # cumulative probability reaches the coverage target, presented
+            # as a one-sided "fixed by" bound.
+            sorted_pos = np.argsort(cv_model.classes_)
+            sorted_offsets = np.asarray(cv_model.classes_)[sorted_pos]
+            cumulative = np.cumsum(np.asarray(blended_probs)[sorted_pos])
+            target_pos = int(np.searchsorted(cumulative, PREDICTION_COVERAGE_TARGET))
+            target_pos = min(target_pos, len(sorted_offsets) - 1)
+            preds.append(int(sorted_offsets[target_pos]))
         preds = np.asarray(preds, dtype=int)
 
-        exact = accuracy_score(y_test, preds)
+        # With a one-sided bound "exact" means the actual block was at or
+        # before the predicted one (the promise held). The argmax exact
+        # metric no longer reflects how predictions are presented.
+        exact = np.mean(y_test.values <= preds)
         predicted_block_idx = test_df["start_block_idx"].values + preds
         actual_end_times = test_df["end_time"].tolist()
         boundary_grace = np.mean(
@@ -598,26 +594,26 @@ def train_model(df, feature_cols):
                 for pred_idx, actual_dt in zip(predicted_block_idx, actual_end_times)
             ]
         )
-        # "Within ±1 block" is a softer success criterion — useful sanity check
-        within_one = np.mean(np.abs(preds - y_test.values) <= 1)
+        within_one = np.mean((y_test.values - preds) <= 1)
         fold_scores.append((exact, boundary_grace, within_one))
 
     print(
         f"\nCross-validation results ({tscv.n_splits} splits, model + historical baselines):"
     )
+    grace_m = int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)
     for i, (exact, boundary_grace, within_one) in enumerate(fold_scores):
         print(
-            f"  fold {i + 1}: exact block {exact * 100:.1f}%, "
-            f"within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m of block {boundary_grace * 100:.1f}%, "
-            f"within ±1 block {within_one * 100:.1f}%"
+            f"  fold {i + 1}: resolved by bound {exact * 100:.1f}%, "
+            f"by bound +{grace_m}m {boundary_grace * 100:.1f}%, "
+            f"within 1 block over {within_one * 100:.1f}%"
         )
     mean_exact = sum(s[0] for s in fold_scores) / len(fold_scores)
     mean_boundary = sum(s[1] for s in fold_scores) / len(fold_scores)
     mean_within = sum(s[2] for s in fold_scores) / len(fold_scores)
     print(
-        f"  mean:   exact block {mean_exact * 100:.1f}%, "
-        f"within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m of block {mean_boundary * 100:.1f}%, "
-        f"within ±1 block {mean_within * 100:.1f}%"
+        f"  mean:   resolved by bound {mean_exact * 100:.1f}%, "
+        f"by bound +{grace_m}m {mean_boundary * 100:.1f}%, "
+        f"within 1 block over {mean_within * 100:.1f}%"
     )
 
     # Train final model on all data
@@ -640,7 +636,7 @@ def upload_model(model, vectorizer, historical_baselines, upload_url, key):
         "vectorizer": vectorizer,
         "historical_baselines": historical_baselines,
         "metadata": {
-            "feature_version": 4,
+            "feature_version": 3,
         },
     }, model_path)
     print(f"\nModel saved locally to {model_path}")
@@ -704,12 +700,12 @@ def calibration_report(df):
     acc = sub["correct"].mean()
     close_enough = sub["close_enough"].mean()
     within_one = (sub["offset_error"] <= 1).mean()
-    print(f"  Exact block:       {acc * 100:.1f}%")
+    print(f"  Exact block hit:      {acc * 100:.1f}%")
     print(
-        f"  Within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m of block: "
+        f"  Resolved by bound (+{int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m): "
         f"{close_enough * 100:.1f}%"
     )
-    print(f"  Within ±1 block:   {within_one * 100:.1f}%")
+    print(f"  Within ±1 block:      {within_one * 100:.1f}%")
 
     categories = {
         "Faulty lift": sub["has_faulty_lift"].astype(bool),

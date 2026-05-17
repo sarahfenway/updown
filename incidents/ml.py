@@ -38,9 +38,17 @@ PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 # "long tail" class during training. Five days is plenty of detail; beyond
 # that we barely have the data to distinguish blocks anyway.
 MAX_OFFSET_CLASS = 20
+
+# Predictions are framed as a one-sided "fixed by <time>" bound rather than
+# "fixed at <block>". We pick the earliest block by which the model's
+# cumulative probability of resolution reaches this target. The model is
+# only ~57% accurate at the exact block but ~72% within ±1 block, so a
+# cumulative bound is honest about the real uncertainty while still being
+# actionable ("won't be fixed before this evening").
+PREDICTION_COVERAGE_TARGET = 0.75
+
 NETWORK_FIELDS = ("tube", "dlr", "national_rail", "crossrail", "overground")
 BASELINE_CATEGORY_OTHER = "other"
-STATION_RECENCY_WINDOW = 5
 HISTORICAL_BASELINE_DEFAULTS = {
     "global_weight": 1.0,
     "category_weight": 1.0,
@@ -152,8 +160,15 @@ def block_distance_from_index(dt, index):
 
 
 def prediction_is_close_enough(predicted_dt, actual_dt, grace=PREDICTION_BOUNDARY_GRACE):
-    predicted_idx = block_index(predicted_dt)
-    return block_distance_from_index(actual_dt, predicted_idx) <= grace
+    """One-sided "fixed by" check.
+
+    ``predicted_dt`` is the time we told the user it would be fixed *by*.
+    The promise held if the incident was actually resolved at or before
+    that time. Resolving earlier still counts — we never claimed it
+    wouldn't be sooner. A small grace absorbs cases that land just the
+    wrong side of a block boundary.
+    """
+    return _to_local(actual_dt) <= _to_local(predicted_dt) + grace
 
 
 def prediction_outcome(predicted_dt, actual_dt, grace=PREDICTION_BOUNDARY_GRACE):
@@ -161,8 +176,11 @@ def prediction_outcome(predicted_dt, actual_dt, grace=PREDICTION_BOUNDARY_GRACE)
     actual_idx = block_index(actual_dt)
 
     if predicted_idx == actual_idx:
+        # Resolved within the exact block we named — the tightest possible hit.
         return "exact"
-    if block_distance_from_index(actual_dt, predicted_idx) <= grace:
+    if _to_local(actual_dt) <= _to_local(predicted_dt) + grace:
+        # Resolved before our bound (we were a little conservative) or just
+        # the wrong side of it within grace — the "by" promise still held.
         return "near"
     return "miss"
 
@@ -381,9 +399,12 @@ def _predict_duration(incident):
     """Returns (timedelta, confidence) or (None, None).
 
     The model is a classifier over "block offset" — how many coarse time
-    blocks after the incident's start block we expect it to be fixed in.
-    We decode the predicted class back into a representative timedelta so
-    callers keep getting a duration.
+    blocks after the incident's start block it resolves in. We don't decode
+    the single most-likely block; instead we walk the cumulative
+    distribution and return the earliest block by which there's a
+    ``PREDICTION_COVERAGE_TARGET`` chance it's resolved. The duration
+    therefore represents a one-sided "fixed by" bound, and ``confidence``
+    is the cumulative probability mass under that bound.
     """
     data = _load_model()
     if data is None:
@@ -398,20 +419,29 @@ def _predict_duration(incident):
     metadata = data.get("metadata") or {}
     feature_version = metadata.get("feature_version", 1)
     use_v2_features = feature_version >= 2
-    use_v4_features = feature_version >= 4
 
     from django.db.models import Q
     from django.utils import timezone as tz_module
 
     from incidents.models import Incident
 
+    # Roll the station up to its parent — a station like "Bank" has
+    # separate child records per line but is one place from the user's
+    # point of view, and that's where the station-manager-level signal lives.
     station = incident.station.parent_station or incident.station
     feature_text = normalise_incident_text(incident.text) if use_v2_features else (incident.text or "")
     text = feature_text.lower()
     start_time_local = _to_local(incident.start_time) if use_v2_features else incident.start_time
 
+    # Historical filter: the effective station itself, or any of its
+    # children. Covers both possibilities regardless of which record the
+    # incident was originally filed against.
     station_filter = Q(station=station) | Q(station__parent_station=station)
 
+    # Per-station historical stats from resolved incidents. We pull the raw
+    # start/end times so we can compute both mean duration and mean block
+    # offset in a single query — the training pipeline uses the same two
+    # features, so they have to match.
     past_qs = Incident.objects.filter(
         station_filter,
         resolved=True,
@@ -428,18 +458,9 @@ def _predict_duration(incident):
             for s, e in past
         ]
         mean_offset = sum(offsets) / count
-        if use_v4_features:
-            recent_durations = [
-                (e - s).total_seconds() / 60 for s, e in past[-STATION_RECENCY_WINDOW:]
-            ]
-            recent_mean = sum(recent_durations) / len(recent_durations)
-            station_recency_trend = recent_mean / mean_dur if mean_dur > 0 else 1.0
-        else:
-            station_recency_trend = 1.0
     else:
         mean_dur = 0
         mean_offset = 0
-        station_recency_trend = 1.0
 
     if hasattr(incident, "prefetched_reports"):
         num_reports = len(incident.prefetched_reports)
@@ -481,11 +502,6 @@ def _predict_duration(incident):
     start_idx = block_index(incident.start_time)
     start_block_num = start_idx % BLOCKS_PER_DAY
 
-    import math
-
-    has_history = int(days_since_last >= 0)
-    log_days_since_last = math.log1p(days_since_last) if days_since_last >= 0 else 0.0
-
     features = {
         "station_id": station.id,
         "information": int(incident.information),
@@ -505,13 +521,10 @@ def _predict_duration(incident):
         "access_via_lift": int(bool(station.access_via_lift)),
         "num_reports": num_reports,
         "days_since_last_incident": round(days_since_last, 2),
-        "has_history": has_history,
-        "log_days_since_last": round(log_days_since_last, 4),
         "concurrent_incidents": concurrent,
         "station_mean_duration": mean_dur,
         "station_incident_count": count,
         "station_mean_offset": mean_offset,
-        "station_recency_trend": station_recency_trend,
     }
 
     try:
@@ -547,26 +560,33 @@ def _predict_duration(incident):
         baseline_evidence,
         historical_baselines.get("config") if historical_baselines else None,
     )
-    pred_pos = int(np.argmax(probs))
-    pred_offset = int(model.classes_[pred_pos])
-    confidence = float(probs[pred_pos])
+    # One-sided "fixed by" bound. classes_ is sorted ascending, so the
+    # cumulative sum of probs is P(resolved by the end of that block). We
+    # take the earliest block whose cumulative probability reaches the
+    # coverage target and tell the user it'll be fixed *by* then. When the
+    # model is confident this collapses to a single block; when it's unsure
+    # the bound widens automatically instead of pretending to precision.
+    order = np.argsort(model.classes_)
+    sorted_offsets = np.asarray(model.classes_)[order]
+    cumulative = np.cumsum(np.asarray(probs)[order])
+    target_pos = int(np.searchsorted(cumulative, PREDICTION_COVERAGE_TARGET))
+    if target_pos >= len(sorted_offsets):
+        target_pos = len(sorted_offsets) - 1
+    pred_offset = int(sorted_offsets[target_pos])
+    confidence = float(cumulative[target_pos])
     confidence = max(0.05, min(0.95, confidence))
 
-    # Decode offset → representative end datetime. block_start_end returns
-    # naive datetimes in local (London) time, so attach the project's
-    # configured timezone before doing any arithmetic with the incident's
-    # (UTC-stored) start_time.
+    # Decode offset → the end of that block. block_start_end returns naive
+    # datetimes in local (London) time, so attach the project's configured
+    # timezone before doing arithmetic with the (UTC-stored) start_time.
+    # We land one second inside the block so block_index() of the predicted
+    # end resolves to this block, not the next one (end boundaries are
+    # exclusive).
     end_idx = start_idx + pred_offset
-    block_start_naive, block_end_naive = block_start_end(end_idx)
+    _, block_end_naive = block_start_end(end_idx)
     local_tz = tz_module.get_default_timezone()
-    block_start_dt = block_start_naive.replace(tzinfo=local_tz)
     block_end_dt = block_end_naive.replace(tzinfo=local_tz)
-
-    if pred_offset == 0:
-        # Same block as the start — midpoint between now and block end.
-        end_time = incident.start_time + (block_end_dt - incident.start_time) / 2
-    else:
-        end_time = block_start_dt + (block_end_dt - block_start_dt) / 2
+    end_time = block_end_dt - timedelta(seconds=1)
 
     # Guarantee strictly positive duration of at least 5 minutes.
     min_end = incident.start_time + timedelta(minutes=5)
