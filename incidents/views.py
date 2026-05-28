@@ -9,7 +9,9 @@ from django.db.models import CharField, Count, Prefetch, Q
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Now
-from django.http import HttpResponse, HttpResponseNotFound
+import csv
+
+from django.http import HttpResponse, HttpResponseNotFound, StreamingHttpResponse
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
@@ -1179,6 +1181,49 @@ def _prediction_stats(since):
         "prediction_review_limit": PREDICTION_REVIEW_LIMIT,
         **low_accuracy_diagnostics,
     }
+
+
+def incidents_tsv(request):
+    class Echo:
+        def write(self, value):
+            return value
+
+    pseudo_buffer = Echo()
+    writer = csv.writer(pseudo_buffer, delimiter="\t")
+
+    def generate():
+        yield writer.writerow(["station_name", "station_code", "start_time", "end_time", "text"])
+        qs = (
+            Incident.objects.order_by("-start_time", "-id")
+            .annotate(
+                station_name=Coalesce(
+                    "station__parent_station__name",
+                    "station__name",
+                    output_field=CharField(),
+                ),
+                station_code=Coalesce(
+                    "station__parent_station__naptan_id",
+                    "station__parent_station__hub_naptan_id",
+                    "station__naptan_id",
+                    "station__hub_naptan_id",
+                    output_field=CharField(),
+                ),
+            )
+            .values_list("station_name", "station_code", "start_time", "end_time", "text")
+            .iterator(chunk_size=500)
+        )
+        for station_name, station_code, start_time, end_time, text in qs:
+            yield writer.writerow([
+                station_name or "",
+                station_code or "",
+                start_time.isoformat() if start_time else "",
+                end_time.isoformat() if end_time else "",
+                text or "",
+            ])
+
+    response = StreamingHttpResponse(generate(), content_type="text/tab-separated-values")
+    response["Content-Disposition"] = 'attachment; filename="incidents.tsv"'
+    return response
 
 
 def alexa(request):
