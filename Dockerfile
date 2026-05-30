@@ -67,6 +67,20 @@ RUN apt-get update \
 
 COPY --from=builder /opt/venv /opt/venv
 
+# Make the venv (python, django-admin, etc.) available in interactive SSH
+# sessions. `fly ssh console` logs in as root with a default shell whose
+# PATH is reset by the login machinery, so the Dockerfile ENV PATH above
+# doesn't reach it. We export it from both the login-shell hook
+# (/etc/profile.d) and the interactive non-login hook (/etc/bash.bashrc)
+# so `python ...` and `python -m django ...` just work however the shell
+# is started.
+RUN printf '%s\n' \
+      'export PATH="/opt/venv/bin:$PATH"' \
+      'export DJANGO_SETTINGS_MODULE=updown.settings' \
+      'export PYTHONPATH=/app' \
+      > /etc/profile.d/venv.sh \
+    && cat /etc/profile.d/venv.sh >> /etc/bash.bashrc
+
 WORKDIR /app
 COPY . .
 
