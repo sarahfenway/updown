@@ -19,9 +19,10 @@ from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
+from incidents import ml as incidents_ml
 from incidents.management.commands.update_incidents import consolidate_incidents
 from incidents.ml import predict_duration, prediction_outcome
-from incidents.models import Incident, Report
+from incidents.models import Incident, MLModel, Report
 from incidents.sources import tflapiv1, tflapiv2
 from incidents.utils import (
     find_dates,
@@ -30,6 +31,7 @@ from incidents.utils import (
     parse_date,
     remove_tfl_specifics,
     send_bluesky,
+    send_bluesky_messages,
     send_tweet,
     update_last_updated,
 )
@@ -244,6 +246,32 @@ class UtilityTests(SimpleTestCase):
         client.login.assert_called_once_with("user", "password")
         client.send_post.assert_called_once_with("formatted post")
 
+    @override_settings(
+        DEBUG=False,
+        BLUESKY_USER_NAME="user",
+        BLUESKY_PASSWORD="password",
+    )
+    def test_send_bluesky_messages_reuses_one_login(self):
+        client = MagicMock()
+        profile = MagicMock(display_name="Up Down London")
+        client.login.return_value = profile
+
+        def fake_text_builder():
+            builder = MagicMock()
+            builder.text.side_effect = lambda message: f"formatted {message}"
+            return builder
+
+        with patch("incidents.utils.atproto.Client", return_value=client), patch(
+            "incidents.utils.atproto.client_utils.TextBuilder",
+            side_effect=fake_text_builder,
+        ), patch("builtins.print"):
+            send_bluesky_messages(["Bank update", "Lift fixed"])
+
+        client.login.assert_called_once_with("user", "password")
+        self.assertEqual(client.send_post.call_count, 2)
+        client.send_post.assert_any_call("formatted Bank update")
+        client.send_post.assert_any_call("formatted Lift fixed")
+
     def test_last_updated_round_trips_to_disk(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch(
             "incidents.utils.timezone.now",
@@ -307,6 +335,27 @@ class SourceTests(StationFactoryMixin, TestCase):
         report = Report.objects.get(source=Report.SOURCE_TFLAPI_V1)
         self.assertGreaterEqual(report.start_time, before)
         self.assertLessEqual(report.start_time, after)
+
+    def test_tflapiv1_uses_source_from_date_when_present(self):
+        station = self.create_child_station(self.create_parent_station("Waterloo"))
+        payload = [
+            {
+                "description": "Waterloo: There will be no step free access because the lift is unavailable",
+                "atcoCode": station.naptan_id,
+                "appearance": "RealTime",
+                "additionalInformation": "",
+                "fromDate": "2026-03-26T07:15:00Z",
+            }
+        ]
+
+        with patch.object(tflapiv1.requests, "get", return_value=FakeResponse(payload)):
+            tflapiv1.check()
+
+        report = Report.objects.get(source=Report.SOURCE_TFLAPI_V1)
+        self.assertEqual(
+            report.start_time,
+            datetime(2026, 3, 26, 7, 15, tzinfo=dt_timezone.utc),
+        )
 
     def test_tflapiv1_resolves_cleared_reports_and_skips_unknown_stations(self):
         station = self.create_child_station(
@@ -512,8 +561,8 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         with patch(
             "incidents.management.commands.update_incidents.send_tweet"
         ) as send_tweet_mock, patch(
-            "incidents.management.commands.update_incidents.send_bluesky"
-        ) as send_bluesky_mock:
+            "incidents.management.commands.update_incidents.send_bluesky_messages"
+        ) as send_bluesky_messages_mock:
             consolidate_incidents()
 
         incident.refresh_from_db()
@@ -522,7 +571,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         self.assertEqual(incident.start_time, first_report.start_time)
         self.assertEqual(incident.text, first_report.text)
         send_tweet_mock.assert_not_called()
-        send_bluesky_mock.assert_not_called()
+        send_bluesky_messages_mock.assert_not_called()
 
     def test_consolidate_resolves_expired_single_user_reports_silently(self):
         parent = self.create_parent_station("Oxford Circus")
@@ -536,8 +585,8 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         with patch(
             "incidents.management.commands.update_incidents.send_tweet"
         ) as send_tweet_mock, patch(
-            "incidents.management.commands.update_incidents.send_bluesky"
-        ) as send_bluesky_mock:
+            "incidents.management.commands.update_incidents.send_bluesky_messages"
+        ) as send_bluesky_messages_mock:
             consolidate_incidents()
 
         report.refresh_from_db()
@@ -545,7 +594,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         self.assertTrue(report.resolved)
         self.assertTrue(incident.resolved)
         send_tweet_mock.assert_not_called()
-        send_bluesky_mock.assert_not_called()
+        send_bluesky_messages_mock.assert_not_called()
 
     def test_consolidate_announces_restoration_for_non_user_incidents(self):
         parent = self.create_parent_station("Victoria")
@@ -598,8 +647,8 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         ), patch(
             "incidents.management.commands.update_incidents.send_tweet"
         ) as send_tweet_mock, patch(
-            "incidents.management.commands.update_incidents.send_bluesky"
-        ) as send_bluesky_mock:
+            "incidents.management.commands.update_incidents.send_bluesky_messages"
+        ) as send_bluesky_messages_mock:
             consolidate_incidents()
 
         incident.refresh_from_db()
@@ -607,10 +656,26 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         self.assertEqual(incident.estimated_duration, timedelta(hours=4))
         self.assertEqual(incident.prediction_confidence, 0.8)
         send_tweet_mock.assert_not_called()
-        send_bluesky_mock.assert_not_called()
+        send_bluesky_messages_mock.assert_not_called()
 
 
 class PredictionFeatureTests(StationFactoryMixin, TestCase):
+    def test_load_model_caches_failed_latest_row(self):
+        MLModel.objects.create(data=b"broken", size_bytes=6)
+        incidents_ml._clear_model_cache()
+
+        try:
+            with patch(
+                "incidents.ml._load_model_via_file_cache",
+                side_effect=AttributeError("boom"),
+            ) as load_mock:
+                self.assertIsNone(incidents_ml._load_model())
+                self.assertIsNone(incidents_ml._load_model())
+
+            load_mock.assert_called_once()
+        finally:
+            incidents_ml._clear_model_cache()
+
     def test_predict_duration_uses_local_time_and_prior_station_history(self):
         if np is None:
             self.skipTest("numpy not installed")
@@ -1448,7 +1513,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
         self.assertEqual(denied.status_code, 404)
         self.assertEqual(allowed.status_code, 204)
-        call_command_mock.assert_called_once_with("update_incidents")
+        call_command_mock.assert_called_once_with("update_incidents", timing=True)
 
     def test_stats_computes_counts_and_percentages(self):
         parent = self.create_parent_station("Green Park")

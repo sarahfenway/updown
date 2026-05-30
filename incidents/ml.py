@@ -261,6 +261,8 @@ def _load_model():
     try:
         data = _load_model_via_file_cache(joblib, latest_id)
     except Exception:
+        _cached_model = None
+        _cached_model_row_id = latest_id
         logger.exception("Failed to load MLModel row %s", latest_id)
         return None
 

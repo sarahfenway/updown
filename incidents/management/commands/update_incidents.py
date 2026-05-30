@@ -3,12 +3,13 @@ from difflib import SequenceMatcher
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from incidents.models import Report, Incident
 from incidents.sources.tflapiv1 import check as check_tflv1
 # from incidents.sources.tflapiv2 import check as check_tflv2
-from incidents.utils import send_tweet, update_last_updated, send_bluesky
+from incidents.utils import send_tweet, update_last_updated, send_bluesky_messages
 from incidents.ml import predict_duration
 
 
@@ -34,9 +35,14 @@ def consolidate_incidents():
 
     with transaction.atomic():
         # Take all the reports and consolidate them into incidents
-        for report in Report.objects.filter(resolved=False).select_related(
-            "station", "station__parent_station"
-        ):
+        unresolved_reports = sorted(
+            Report.objects.filter(resolved=False)
+            .order_by()
+            .select_related("station", "station__parent_station"),
+            key=lambda report: (report.start_time, report.pk),
+            reverse=True,
+        )
+        for report in unresolved_reports:
             # Check if there is an incident for this station
             incidents = Incident.objects.filter(
                 station=report.station.parent_station, resolved=False
@@ -107,20 +113,33 @@ def consolidate_incidents():
             source=Report.SOURCE_USER, resolved=False, end_time__lt=timezone.now()
         ).update(resolved=True)
 
-        for incident in Incident.objects.filter(resolved=False).select_related(
-            "station"
-        ).prefetch_related("reports"):
+        report_links = Incident.reports.through.objects.filter(
+            incident_id=OuterRef("pk")
+        )
+        unresolved_report_links = report_links.filter(report__resolved=False)
+
+        unresolved_incidents = sorted(
+            Incident.objects.filter(resolved=False)
+            .order_by()
+            .select_related("station")
+            .annotate(has_unresolved_reports=Exists(unresolved_report_links)),
+            key=lambda incident: (incident.start_time, incident.pk),
+            reverse=True,
+        )
+        for incident in unresolved_incidents:
             # Check if the incident has been resolved
-            unresolved_reports = [r for r in incident.reports.all() if not r.resolved]
-            if not unresolved_reports:
+            if not incident.has_unresolved_reports:
                 incident.resolved = True
                 incident.end_time = timezone.now()
                 incident.save()
 
-                all_reports = list(incident.reports.all())
+                reports_count = incident.reports.count()
+                first_report_source = (
+                    incident.reports.values_list("source", flat=True).first()
+                )
                 if (
-                    len(all_reports) > 1
-                    or all_reports[0].source != Report.SOURCE_USER
+                    reports_count > 1
+                    or first_report_source != Report.SOURCE_USER
                 ):
                     pending_posts.append(
                         f"Step free access has been restored at {incident.station.name}"
@@ -137,7 +156,7 @@ def _send_pending_posts(posts):
     """
     for message in posts:
         send_tweet(message)
-        send_bluesky(message)
+    send_bluesky_messages(posts)
 
 
 class Command(BaseCommand):
@@ -154,6 +173,8 @@ class Command(BaseCommand):
         timing = options.get("timing")
 
         def _phase(label, fn):
+            if timing:
+                self.stdout.write(f"  [{label}] starting")
             start = time.monotonic()
             result = fn()
             if timing:

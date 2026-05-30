@@ -155,6 +155,31 @@ def send_bluesky(tweet_text):
         print("Should have posted on blue sky: " + tweet_text)
 
 
+def send_bluesky_messages(messages):
+    """Send multiple Bluesky posts using one login session."""
+    messages = list(messages)
+    if not messages:
+        return
+
+    if settings.DEBUG is False:
+        try:
+            client = atproto.Client()
+            profile = client.login(
+                settings.BLUESKY_USER_NAME, settings.BLUESKY_PASSWORD
+            )
+            print("Welcome,", profile.display_name)
+
+            for message in messages:
+                text = atproto.client_utils.TextBuilder().text(message)
+                client.send_post(text)
+        # Except everything.
+        except:
+            pass
+    else:
+        for message in messages:
+            print("Should have posted on blue sky: " + message)
+
+
 def update_last_updated():
     with open("last_updated", "w") as f:
         f.write(timezone.now().astimezone().strftime("%H:%M %d %b"))

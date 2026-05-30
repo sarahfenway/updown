@@ -1284,7 +1284,7 @@ def alexa(request):
 class UpdateIncidentsView(View):
     def post(self, request, *args, **kwargs):
         if request.POST.get("key") == settings.FUNCTIONS_SECRET_KEY:
-            call_command("update_incidents")
+            call_command("update_incidents", timing=True)
             return HttpResponse(status=204)
         return HttpResponseNotFound()
 

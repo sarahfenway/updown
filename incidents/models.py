@@ -65,6 +65,11 @@ class Incident(models.Model):
                 fields=["station_id", "resolved"],
                 name="incident_station_resolved_idx",
             ),
+            models.Index(
+                fields=["id"],
+                name="incident_unresolved_idx",
+                condition=models.Q(resolved=False),
+            ),
         ]
         ordering = ["-start_time", "-id"]
 
@@ -120,6 +125,16 @@ class Report(models.Model):
                     "source",
                 ],
                 name="idx_covering",
+            ),
+            models.Index(
+                fields=["id"],
+                name="report_unresolved_idx",
+                condition=models.Q(resolved=False),
+            ),
+            models.Index(
+                fields=["source", "station_id", "information", "text"],
+                name="report_live_source_key_idx",
+                condition=models.Q(resolved=False),
             ),
         ]
         ordering = ["-start_time", "-id"]

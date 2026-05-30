@@ -167,6 +167,9 @@ class Command(BaseCommand):
                 with connections["default"].cursor() as cur:
                     cur.execute("PRAGMA foreign_keys=ON;")
 
+        if is_sqlite:
+            self._analyze_sqlite()
+
         self.stdout.write(self.style.SUCCESS("\nDone."))
 
     # ----------------------------------------------------------------------
@@ -250,3 +253,9 @@ class Command(BaseCommand):
     def _progress(self, label, copied, total):
         pct = (copied / total * 100) if total else 100.0
         self.stdout.write(f"  {label}: {copied:>8}/{total} ({pct:.1f}%)")
+
+    def _analyze_sqlite(self):
+        self.stdout.write("\nAnalyzing SQLite query planner statistics")
+        with connections["default"].cursor() as cur:
+            cur.execute("ANALYZE;")
+            cur.execute("PRAGMA optimize;")
