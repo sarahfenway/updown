@@ -23,3 +23,11 @@ PASSWORD_HASHERS = [
 ]
 
 STATICFILES_DIRS = [f"{BASE_DIR}/static"]
+
+# Dummy cache so per-test state never leaks via the prediction-policy
+# cache we use in production.
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.dummy.DummyCache",
+    }
+}

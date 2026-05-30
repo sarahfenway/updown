@@ -1,6 +1,8 @@
+import time
 from difflib import SequenceMatcher
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 from django.utils import timezone
 
 from incidents.models import Report, Incident
@@ -18,96 +20,152 @@ def refresh_prediction(incident):
 
 
 def consolidate_incidents():
-    # Take all the reports and consolidate them into incidents
-    for report in Report.objects.filter(resolved=False).select_related(
-        "station", "station__parent_station"
-    ):
-        # Check if there is an incident for this station
-        incidents = Incident.objects.filter(
-            station=report.station.parent_station, resolved=False
-        )
+    """Fold unresolved reports into incidents and detect resolutions.
 
-        incident = None
-        for item in incidents:
-            # if the same report station and similar text, then same incident
-            if SequenceMatcher(None, item.text, report.text).ratio() > 0.9:
-                incident = item
-                break
+    Returns a list of tweet/bluesky message strings to be sent *after*
+    the database work commits. We deliberately do not send them inline:
+    on SQLite the whole consolidation runs in one transaction (so the
+    dozens of small writes become a single commit instead of one
+    durable write each), and holding the single write-lock open across
+    a blocking HTTP call to Twitter/Bluesky is exactly what was stalling
+    the cron.
+    """
+    pending_posts = []
 
-        if incident is None:
-            # Create a new incident
-            incident = Incident(
-                information=report.information,
-                station=report.station.parent_station,
-                text=report.text,
-                start_time=report.start_time,
-                end_time=report.end_time,
-                resolved=report.resolved,
+    with transaction.atomic():
+        # Take all the reports and consolidate them into incidents
+        for report in Report.objects.filter(resolved=False).select_related(
+            "station", "station__parent_station"
+        ):
+            # Check if there is an incident for this station
+            incidents = Incident.objects.filter(
+                station=report.station.parent_station, resolved=False
             )
-            incident.save()
 
-            tweet = f"{incident.station.name}: {incident.text}"
+            incident = None
+            for item in incidents:
+                # if the same report station and similar text, then same incident
+                if SequenceMatcher(None, item.text, report.text).ratio() > 0.9:
+                    incident = item
+                    break
 
-            if report.source == Report.SOURCE_USER:
-                tweet += "\n\nThis is a user report"
+            # Only (re)compute the ML prediction when it can actually
+            # differ: a brand-new incident, or one whose text changed.
+            # The prediction is a function of the incident's text /
+            # station / timing features, so re-running it every 5 minutes
+            # for an unchanged incident was pure wasted work (a model
+            # load + several queries + a write, per report, per run).
+            should_predict = False
 
-            if len(tweet) > 280:
-                if incident.information:
-                    tweet = f"New information on step free access at {incident.station.name}"
-                else:
-                    tweet = (
-                        f"Step free access issues reported at {incident.station.name}"
+            if incident is None:
+                # Create a new incident
+                incident = Incident(
+                    information=report.information,
+                    station=report.station.parent_station,
+                    text=report.text,
+                    start_time=report.start_time,
+                    end_time=report.end_time,
+                    resolved=report.resolved,
+                )
+                incident.save()
+                should_predict = True
+
+                tweet = f"{incident.station.name}: {incident.text}"
+
+                if report.source == Report.SOURCE_USER:
+                    tweet += "\n\nThis is a user report"
+
+                if len(tweet) > 280:
+                    if incident.information:
+                        tweet = f"New information on step free access at {incident.station.name}"
+                    else:
+                        tweet = (
+                            f"Step free access issues reported at {incident.station.name}"
+                        )
+
+                pending_posts.append(tweet)
+            else:
+                # Update the existing incident
+                text_changed = incident.text != report.text
+                incident.information = report.information
+                incident.text = report.text
+                incident.start_time = (
+                    report.start_time
+                    if report.start_time < incident.start_time
+                    else incident.start_time
+                )
+                incident.save()
+                if text_changed:
+                    should_predict = True
+
+            # Add the report to the incident
+            incident.reports.add(report)
+            if should_predict:
+                refresh_prediction(incident)
+
+        Report.objects.filter(
+            source=Report.SOURCE_USER, resolved=False, end_time__lt=timezone.now()
+        ).update(resolved=True)
+
+        for incident in Incident.objects.filter(resolved=False).select_related(
+            "station"
+        ).prefetch_related("reports"):
+            # Check if the incident has been resolved
+            unresolved_reports = [r for r in incident.reports.all() if not r.resolved]
+            if not unresolved_reports:
+                incident.resolved = True
+                incident.end_time = timezone.now()
+                incident.save()
+
+                all_reports = list(incident.reports.all())
+                if (
+                    len(all_reports) > 1
+                    or all_reports[0].source != Report.SOURCE_USER
+                ):
+                    pending_posts.append(
+                        f"Step free access has been restored at {incident.station.name}"
                     )
 
-            send_tweet(tweet)
-            send_bluesky(tweet)
-        else:
-            # Update the existing incident
-            incident.information = report.information
-            incident.text = report.text
-            incident.start_time = (
-                report.start_time
-                if report.start_time < incident.start_time
-                else incident.start_time
-            )
-            incident.save()
+    return pending_posts
 
-        # Add the report to the incident
-        incident.reports.add(report)
-        refresh_prediction(incident)
 
-    Report.objects.filter(
-        source=Report.SOURCE_USER, resolved=False, end_time__lt=timezone.now()
-    ).update(resolved=True)
+def _send_pending_posts(posts):
+    """Fire the social posts once the DB transaction has committed.
 
-    for incident in Incident.objects.filter(resolved=False).select_related(
-        "station"
-    ).prefetch_related("reports"):
-        # Check if the incident has been resolved
-        unresolved_reports = [r for r in incident.reports.all() if not r.resolved]
-        if not unresolved_reports:
-            incident.resolved = True
-            incident.end_time = timezone.now()
-            incident.save()
-
-            all_reports = list(incident.reports.all())
-            if (
-                len(all_reports) > 1
-                or all_reports[0].source != Report.SOURCE_USER
-            ):
-                tweet = f"Step free access has been restored at {incident.station.name}"
-                send_tweet(tweet)
-                send_bluesky(tweet)
+    Kept outside ``consolidate_incidents``' transaction so a slow or
+    hung Twitter/Bluesky call can never hold the SQLite write lock.
+    """
+    for message in posts:
+        send_tweet(message)
+        send_bluesky(message)
 
 
 class Command(BaseCommand):
     help = "Updates the incidents list"
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--timing",
+            action="store_true",
+            help="Print how long each phase takes (TfL fetch, consolidate, posts).",
+        )
+
     def handle(self, *args, **options):
+        timing = options.get("timing")
+
+        def _phase(label, fn):
+            start = time.monotonic()
+            result = fn()
+            if timing:
+                elapsed = time.monotonic() - start
+                self.stdout.write(f"  [{label}] {elapsed:.2f}s")
+            return result
+
         try:
-            check_tflv1()
-#             check_tflv2()
-            consolidate_incidents()
+            _phase("tfl_fetch", check_tflv1)
+            # check_tflv2()
+            posts = _phase("consolidate", consolidate_incidents)
+            _phase("social_posts", lambda: _send_pending_posts(posts))
             update_last_updated()
         except Exception as e:
             raise CommandError(f"Error updating incidents list: {e}")

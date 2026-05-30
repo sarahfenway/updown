@@ -1,0 +1,48 @@
+# Fly.io app configuration.
+#
+# Picks: ``lhr`` region (London) keeps latency to TfL APIs and London users
+# low. Cross-region DB calls to DO Postgres add a few ms regardless until
+# we move the DB onto Fly (or to SQLite on a volume).
+#
+# Adjust ``app`` to the name you create with `fly apps create`.
+
+app = "updownlondon"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # Override if you ever need to debug a production-shaped image locally.
+  DEBUG = "false"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Single-machine config. SQLite locks the app to one writer anyway, so
+  # there's no benefit to HA at the app layer. ``min_machines_running``
+  # is a floor, not a cap — the actual machine count is managed by
+  # ``fly scale count 1`` and persisted in Fly's state, not here.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 25
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 2
+
+# Persistent disk for the SQLite database. Fly snapshots this daily, keeping
+# 5 days by default — that's our backup. Create the volume once with:
+#   fly volumes create data --region lhr --size 3
+[mounts]
+  source = "data"
+  destination = "/data"

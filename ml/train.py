@@ -46,7 +46,13 @@ BLOCK_EVENING = 2
 BLOCK_OVERNIGHT = 3
 BLOCKS_PER_DAY = 4
 BLOCK_NAMES = ["morning", "daytime", "evening", "overnight"]
-MAX_OFFSET_CLASS = 20
+# Offsets at or beyond this many blocks are lumped into one "long tail"
+# class. Kept deliberately small (8 → ~2 days): the model trains one tree
+# per class, so every extra class inflates the serialized model and its
+# load time, and offsets beyond ~8 blocks are each <2% of the data — too
+# sparse to predict precisely anyway. MUST stay in sync with
+# incidents/ml.py.
+MAX_OFFSET_CLASS = 8
 PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 # Kept in sync with incidents/ml.py — predictions are a one-sided "fixed by"
 # bound at this cumulative probability.
@@ -532,11 +538,19 @@ def train_model(df, feature_cols):
     def _fresh_model():
         return HistGradientBoostingClassifier(
             max_iter=300,
-            max_depth=6,
+            max_depth=5,
             learning_rate=0.08,
             min_samples_leaf=20,
             l2_regularization=0.5,
             categorical_features=categorical_mask,
+            # Early stopping trims iterations once a held-out slice stops
+            # improving — smaller model, and usually better generalisation.
+            # The model trains one tree per class per iteration, so fewer
+            # effective iterations × fewer classes (MAX_OFFSET_CLASS) is
+            # what keeps the serialized model small and fast to load.
+            early_stopping=True,
+            n_iter_no_change=10,
+            validation_fraction=0.1,
             random_state=42,
         )
 

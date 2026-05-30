@@ -22,7 +22,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv("DEBUG", False)
+DEBUG = os.getenv("DEBUG", "").lower() == "true"
 
 ALLOWED_HOSTS = [
     "127.0.0.1",
@@ -33,7 +33,24 @@ ALLOWED_HOSTS = [
     "www.updownlondon.info",
     "isstpthameslinkliftbroken.com",
     "www.isstpthameslinkliftbroken.com",
+    ".fly.dev",
 ]
+
+# Django 4 requires explicit trusted origins for HTTPS POST/PUT/PATCH/DELETE.
+# We trust the same set of domains we serve from, plus any *.fly.dev sub-domain
+# (Fly handles staging URLs as <app>.fly.dev).
+CSRF_TRUSTED_ORIGINS = [
+    "https://updownlondon.com",
+    "https://www.updownlondon.com",
+    "https://updownlondon.info",
+    "https://www.updownlondon.info",
+    "https://isstpthameslinkliftbroken.com",
+    "https://www.isstpthameslinkliftbroken.com",
+    "https://*.fly.dev",
+]
+
+# Fly's edge terminates TLS and forwards via this header.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 
 # Application definition
@@ -52,6 +69,10 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    # WhiteNoise serves collected static files directly from gunicorn — no
+    # separate static-site service needed on Fly. Must come right after
+    # SecurityMiddleware per the project's docs.
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -65,7 +86,7 @@ ROOT_URLCONF = "updown.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [f"{BASE_DIR}/templates", "/workspace/templates"],
+        "DIRS": [f"{BASE_DIR}/templates"],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -84,16 +105,50 @@ WSGI_APPLICATION = "updown.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/4.1/ref/settings/#databases
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql_psycopg2",
-        "NAME": os.getenv("DB_NAME"),
-        "USER": os.getenv("DB_USER"),
-        "PASSWORD": os.getenv("DB_PASSWORD"),
-        "HOST": os.getenv("DB_HOST"),
-        "PORT": os.getenv("DB_PORT"),
+# DB backend is chosen via DB_ENGINE: "sqlite" for the on-Fly SQLite file,
+# anything else (or unset) for Postgres. Lets us flip back-and-forth without
+# code changes during the migration window.
+if os.getenv("DB_ENGINE", "postgres").lower() == "sqlite":
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": os.getenv("SQLITE_PATH", os.path.join(BASE_DIR, "db.sqlite3")),
+            # Pragmas tuned for production: WAL gives concurrent reads
+            # alongside a single writer; NORMAL is the safe default under
+            # WAL; mmap speeds up reads; the temp store keeps small sorts
+            # off disk. ``foreign_keys`` mirrors Django's default but is
+            # cheap insurance against silently broken FKs.
+            "OPTIONS": {
+                "init_command": (
+                    "PRAGMA journal_mode=WAL;"
+                    "PRAGMA synchronous=NORMAL;"
+                    "PRAGMA temp_store=MEMORY;"
+                    "PRAGMA mmap_size=134217728;"
+                    "PRAGMA foreign_keys=ON;"
+                ),
+                # Wait up to 20s if another connection holds the write
+                # lock. The default 5s is easy to hit during ML batches.
+                "timeout": 20,
+            },
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql_psycopg2",
+            "NAME": os.getenv("DB_NAME"),
+            "USER": os.getenv("DB_USER"),
+            "PASSWORD": os.getenv("DB_PASSWORD"),
+            "HOST": os.getenv("DB_HOST"),
+            "PORT": os.getenv("DB_PORT"),
+            # DO Managed Postgres requires TLS, and the app is talking to
+            # it cross-cloud while we're still on Fly + DO PG.
+            "OPTIONS": {"sslmode": "require"},
+            # Reuse connections across requests; cuts the TLS handshake
+            # cost on every page load when the DB is in a different DC.
+            "CONN_MAX_AGE": 60,
+        }
+    }
 
 
 # Password validation
@@ -132,7 +187,10 @@ USE_TZ = True
 
 STATIC_URL = "/static/"
 STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
-STATICFILES_DIRS = [f"{BASE_DIR}/static", "/workspace/static"]
+STATICFILES_DIRS = [f"{BASE_DIR}/static"]
+# WhiteNoise: gzip + cache-bust (Manifest) so collected assets get a hash
+# in the filename and can be served with far-future cache headers.
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.1/ref/settings/#default-auto-field

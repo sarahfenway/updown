@@ -478,19 +478,16 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         child = self.create_child_station(parent)
         report = self.create_report(child, source=Report.SOURCE_USER)
 
-        with patch(
-            "incidents.management.commands.update_incidents.send_tweet"
-        ) as send_tweet_mock, patch(
-            "incidents.management.commands.update_incidents.send_bluesky"
-        ) as send_bluesky_mock:
-            consolidate_incidents()
+        # consolidate_incidents now returns the posts to send rather than
+        # sending them inline (sending happens after the DB transaction
+        # commits, in the command layer).
+        posts = consolidate_incidents()
 
         incident = Incident.objects.get()
         self.assertEqual(incident.station, parent)
         self.assertIn(report, incident.reports.all())
-        send_tweet_mock.assert_called_once()
-        send_bluesky_mock.assert_called_once()
-        self.assertIn("This is a user report", send_tweet_mock.call_args.args[0])
+        self.assertEqual(len(posts), 1)
+        self.assertIn("This is a user report", posts[0])
 
     def test_consolidate_merges_similar_reports_into_existing_incident(self):
         parent = self.create_parent_station("Waterloo")
@@ -560,22 +557,12 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         )
         incident = self.create_incident(parent, reports=[report])
 
-        with patch(
-            "incidents.management.commands.update_incidents.send_tweet"
-        ) as send_tweet_mock, patch(
-            "incidents.management.commands.update_incidents.send_bluesky"
-        ) as send_bluesky_mock:
-            consolidate_incidents()
+        posts = consolidate_incidents()
 
         incident.refresh_from_db()
         self.assertTrue(incident.resolved)
         self.assertIsNotNone(incident.end_time)
-        send_tweet_mock.assert_called_once_with(
-            "Step free access has been restored at Victoria"
-        )
-        send_bluesky_mock.assert_called_once_with(
-            "Step free access has been restored at Victoria"
-        )
+        self.assertEqual(posts, ["Step free access has been restored at Victoria"])
 
     def test_consolidate_refreshes_prediction_after_attaching_report(self):
         parent = self.create_parent_station("Green Park")
@@ -676,8 +663,8 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
                 dtype=object,
             )
 
-            def predict_proba(self, df):
-                captured["features"] = df.iloc[0].to_dict()
+            def predict_proba(self, x):
+                captured["features"] = dict(zip(self.feature_names_in_, x[0]))
                 return np.array([[1.0]])
 
         with patch(
@@ -749,8 +736,8 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
                 dtype=object,
             )
 
-            def predict_proba(self, df):
-                captured["features"] = df.iloc[0].to_dict()
+            def predict_proba(self, x):
+                captured["features"] = dict(zip(self.feature_names_in_, x[0]))
                 return np.array([[1.0]])
 
         with patch(

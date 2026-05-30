@@ -1,0 +1,15 @@
+# In-container cron schedule, run by supercronic. Each line is a standard
+# cron expression followed by a command. Output goes to stdout/stderr,
+# which Fly captures into ``fly logs``.
+#
+# Format: minute hour day-of-month month day-of-week command
+#
+# Defensive wrappers:
+#   * ``flock -n`` skips this tick if a previous one is still running,
+#     preventing process pile-up when a tick takes longer than its
+#     interval (e.g. TfL API slow).
+#   * ``timeout 240`` kills any tick that exceeds 4 minutes, so a hung
+#     HTTP call doesn't tie up a worker forever.
+# Both are standard Debian binaries already in the slim image.
+
+*/5 * * * * /usr/bin/flock -n /tmp/update_incidents.lock /usr/bin/timeout 240 /opt/venv/bin/python -m django update_incidents --settings=updown.settings

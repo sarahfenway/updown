@@ -13,7 +13,11 @@ class ReportInline(admin.TabularInline):
 class IncidentAdmin(admin.ModelAdmin):
     exclude = ["reports"]
     search_fields = ["station__name", "text"]
-    list_filter = ["resolved", "start_time", "station__parent_station__name"]
+    # ``station__parent_station__name`` builds the filter sidebar via a
+    # DISTINCT join, which on the report-heavy joined queryset costs
+    # more time than gunicorn's worker timeout. Removed; use the search
+    # box on station name instead.
+    list_filter = ["resolved", "start_time"]
     list_display = (
         "station",
         "start_time",
@@ -35,7 +39,9 @@ class IncidentAdmin(admin.ModelAdmin):
 @admin.register(Report)
 class ReportAdmin(admin.ModelAdmin):
     search_fields = ["station__name", "text"]
-    list_filter = ["resolved", "station__parent_station__name", "source"]
+    # Same reasoning as IncidentAdmin: the parent-station filter scans the
+    # whole 2M-row Reports table to populate its sidebar dropdown.
+    list_filter = ["resolved", "source"]
     list_display = (
         "station",
         "start_time",

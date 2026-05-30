@@ -12,3 +12,14 @@ packages/updown/update_incidents/.env
 last_updated
 .venv
 *.joblib
+
+# collectstatic output — regenerated in the Docker build, never committed
+staticfiles/
+
+# runtime model file-cache (lives on the Fly volume in prod)
+.ml_cache/
+
+# local SQLite databases
+db.sqlite3
+db.sqlite3-*
+test.sqlite3

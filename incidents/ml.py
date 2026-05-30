@@ -1,6 +1,6 @@
-import io
 import logging
 import os
+import warnings
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta
 
@@ -10,6 +10,16 @@ from incidents.text_features import normalise_incident_text
 
 
 logger = logging.getLogger(__name__)
+
+# We feed the model a plain numpy array at predict time so we can keep
+# pandas off the web dyno. sklearn warns whenever a model fitted with a
+# named DataFrame is given an unnamed numpy input — column order is
+# preserved against ``model.feature_names_in_``, so the warning is noise.
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names",
+    category=UserWarning,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,9 +45,11 @@ BLOCK_NAMES = ["morning", "daytime", "evening", "overnight"]
 PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 
 # Everything at or beyond this many blocks from the start is lumped into one
-# "long tail" class during training. Five days is plenty of detail; beyond
-# that we barely have the data to distinguish blocks anyway.
-MAX_OFFSET_CLASS = 20
+# "long tail" class during training. Kept small (8 → ~2 days): offsets
+# beyond this are individually too sparse (<2% each) to predict precisely,
+# and every extra class adds a full set of trees to the model — which is
+# what drives its size and load time. MUST stay in sync with ml/train.py.
+MAX_OFFSET_CLASS = 8
 
 # Predictions are framed as a one-sided "fixed by <time>" bound rather than
 # "fixed at <block>". We pick the earliest block by which the model's
@@ -235,19 +247,82 @@ def _load_model():
     if latest_id == _cached_model_row_id:
         return _cached_model
 
-    # New (or first) model — pull the bytes and deserialize.
-    row = MLModel.objects.only("data").get(pk=latest_id)
-    raw = bytes(row.data)
+    # The model is a ~100MB blob in the DB. Short-lived processes (the
+    # update_incidents cron fires a fresh process every few minutes) would
+    # otherwise pay a full DB read + in-memory joblib deserialize every
+    # single run, which dominated the cron's runtime.
+    #
+    # Instead we materialise the blob to a file on disk once per model
+    # version, then load it with ``mmap_mode="r"``. The big numpy tree
+    # arrays are then memory-mapped rather than copied: load is far
+    # cheaper, and because the OS page cache is shared across processes
+    # the web worker and the cron share the same physical pages instead
+    # of each holding a private 100MB copy.
     try:
-        data = joblib.load(io.BytesIO(raw))
+        data = _load_model_via_file_cache(joblib, latest_id)
     except Exception:
-        logger.exception("Failed to deserialize MLModel row %s", latest_id)
+        logger.exception("Failed to load MLModel row %s", latest_id)
         return None
+
     if not isinstance(data, dict):
         data = {"model": data}
     _cached_model = data
     _cached_model_row_id = latest_id
     return _cached_model
+
+
+def _model_cache_dir():
+    """Directory for the on-disk model cache.
+
+    Defaults to a ``.ml_cache`` dir next to the SQLite database (i.e. on
+    the persistent Fly volume) so the cached file survives restarts and
+    lives on the same disk we already pay for. Overridable via
+    ML_MODEL_CACHE_DIR.
+    """
+    explicit = os.getenv("ML_MODEL_CACHE_DIR")
+    if explicit:
+        return explicit
+
+    sqlite_path = os.getenv("SQLITE_PATH")
+    base = os.path.dirname(sqlite_path) if sqlite_path else settings.BASE_DIR
+    return os.path.join(base, ".ml_cache")
+
+
+def _load_model_via_file_cache(joblib, latest_id):
+    cache_dir = _model_cache_dir()
+    cache_path = os.path.join(cache_dir, f"model_{latest_id}.joblib")
+
+    if not os.path.exists(cache_path):
+        from incidents.models import MLModel
+
+        row = MLModel.objects.only("data").get(pk=latest_id)
+        os.makedirs(cache_dir, exist_ok=True)
+        # Write to a temp file then atomically rename, so a concurrent
+        # process never sees a half-written cache file.
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "wb") as fh:
+            fh.write(bytes(row.data))
+        os.replace(tmp_path, cache_path)
+
+        # Best-effort cleanup of older versions so the cache dir doesn't
+        # grow without bound across retrains.
+        try:
+            for name in os.listdir(cache_dir):
+                if name.startswith("model_") and name != os.path.basename(cache_path):
+                    os.remove(os.path.join(cache_dir, name))
+        except OSError:
+            pass
+
+    try:
+        return joblib.load(cache_path, mmap_mode="r")
+    except ValueError:
+        # Some joblib payloads (e.g. compressed dumps) can't be memory
+        # mapped. Fall back to a normal load so predictions still work —
+        # we just don't get the shared-page / fast-load benefit.
+        logger.warning(
+            "MLModel %s is not mmap-compatible; loading without mmap", latest_id
+        )
+        return joblib.load(cache_path)
 
 
 def _clear_model_cache():
@@ -534,25 +609,28 @@ def _predict_duration(incident):
 
     try:
         import numpy as np
-        import pandas as pd
     except ImportError:
         return None, None
 
-    df = pd.DataFrame([features])
-
+    # Build a single-row feature matrix in the exact column order the model
+    # was trained with. We deliberately avoid pandas here — it was being
+    # used as "an ordered dict that reindexes", which is ~80MB of RAM we
+    # don't need to ship to the web dyno. Column order is preserved
+    # against ``model.feature_names_in_`` so the underlying call is
+    # equivalent.
+    combined = dict(features)
     if vectorizer is not None:
-        tfidf_matrix = vectorizer.transform([feature_text])
-        tfidf_cols = [f"tfidf_{name}" for name in vectorizer.get_feature_names_out()]
-        tfidf_df = pd.DataFrame(
-            tfidf_matrix.toarray(), columns=tfidf_cols, index=df.index
-        )
-        df = pd.concat([df, tfidf_df], axis=1)
+        tfidf_row = vectorizer.transform([feature_text]).toarray()[0]
+        for name, value in zip(vectorizer.get_feature_names_out(), tfidf_row):
+            combined[f"tfidf_{name}"] = float(value)
 
-    expected_cols = list(getattr(model, "feature_names_in_", df.columns))
-    df = df.reindex(columns=expected_cols, fill_value=0)
+    expected_cols = list(getattr(model, "feature_names_in_", combined.keys()))
+    x = np.asarray(
+        [[combined.get(col, 0.0) for col in expected_cols]],
+        dtype=float,
+    )
 
-    # Classifier predicts a block offset; confidence is the class probability.
-    probs = model.predict_proba(df)[0]
+    probs = model.predict_proba(x)[0]
     baseline_probs, baseline_evidence = _historical_baseline_probs(
         historical_baselines,
         station,

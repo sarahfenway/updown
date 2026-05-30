@@ -16,7 +16,9 @@ def check():
     }
 
     try:
-        r = requests.get(StatusPageURI)
+        # Hard cap (connect, read) so a hung TfL endpoint can't block the
+        # update_incidents run indefinitely.
+        r = requests.get(StatusPageURI, timeout=(5, 20))
 
         if r.status_code == 200 and len(r.text) > 0:
             disruption = r.json()
@@ -54,5 +56,7 @@ def check():
                 report.end_time = now
                 report.save()
 
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.RequestException:
+        # Covers connection errors and timeouts alike — a flaky or slow
+        # TfL endpoint just means we skip this run, not crash or hang.
         pass

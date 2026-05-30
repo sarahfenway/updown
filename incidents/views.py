@@ -4,8 +4,9 @@ from datetime import timedelta
 from math import sqrt
 
 from django.conf import settings
+from django.core.cache import cache
 from django.core.management import call_command
-from django.db.models import CharField, Count, Prefetch, Q
+from django.db.models import CharField, Count, Max, Prefetch, Q
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Now
@@ -515,6 +516,33 @@ def _prediction_window_metrics(now=None, windows=None):
 
     windows = tuple(sorted(set(windows)))
     oldest_since = now - timedelta(days=windows[-1])
+
+    # Data-driven cache: a resolved incident with a prediction is
+    # immutable in our model (end_time / estimated_duration /
+    # prediction_confidence are written when it resolves and never
+    # rewritten), so ``MAX(end_time)`` over the filtered set is a
+    # complete watermark for "has anything new entered the policy data?".
+    # One indexed aggregate — sub-ms. We also include the current date
+    # in the key so the rolling window edge invalidates daily for free.
+    watermark = (
+        Incident.objects.filter(
+            resolved=True,
+            end_time__gt=oldest_since,
+            estimated_duration__isnull=False,
+        )
+        .aggregate(max_end=Max("end_time"))
+        .get("max_end")
+    )
+    watermark_key = watermark.isoformat() if watermark else "none"
+    cache_key = (
+        "pred_window_metrics:"
+        + ",".join(str(d) for d in windows)
+        + f":{now.strftime('%Y%m%d')}:{watermark_key}"
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     incidents = Incident.objects.filter(
         resolved=True,
         end_time__gt=oldest_since,
@@ -522,7 +550,11 @@ def _prediction_window_metrics(now=None, windows=None):
         start_time__isnull=False,
         end_time__isnull=False,
     ).only("start_time", "end_time", "estimated_duration", "prediction_confidence")
-    return _prediction_window_metrics_from_incidents(incidents, now, windows)
+    result = _prediction_window_metrics_from_incidents(incidents, now, windows)
+    # Long timeout (1 hour) is a safety net; the key already changes when
+    # data does, so a long TTL just means we don't churn LocMemCache.
+    cache.set(cache_key, result, timeout=3600)
+    return result
 
 
 def _prediction_display_policy_from_window_metrics(metrics_by_window):
