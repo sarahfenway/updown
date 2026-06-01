@@ -1,4 +1,6 @@
 import arrow
+import csv
+import gzip
 import json
 import os
 import tempfile
@@ -13,13 +15,16 @@ except ImportError:  # pragma: no cover - local test env may not have ML deps
     np = None
 
 from django.core.management import CommandError, call_command
-from django.db import connection
+from django.db import OperationalError, connection
 from django.db.models import Count
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from incidents import ml as incidents_ml
+from incidents.management.commands.archive_old_reports import (
+    Command as ArchiveOldReportsCommand,
+)
 from incidents.management.commands.update_incidents import consolidate_incidents
 from incidents.ml import predict_duration, prediction_outcome
 from incidents.models import Incident, MLModel, Report
@@ -535,6 +540,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         incident = Incident.objects.get()
         self.assertEqual(incident.station, parent)
         self.assertIn(report, incident.reports.all())
+        self.assertEqual(incident.report_count, 1)
         self.assertEqual(len(posts), 1)
         self.assertIn("This is a user report", posts[0])
 
@@ -568,6 +574,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         incident.refresh_from_db()
         self.assertEqual(Incident.objects.count(), 1)
         self.assertEqual(incident.reports.count(), 2)
+        self.assertEqual(incident.report_count, 2)
         self.assertEqual(incident.start_time, first_report.start_time)
         self.assertEqual(incident.text, first_report.text)
         send_tweet_mock.assert_not_called()
@@ -929,6 +936,138 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(second.estimated_duration, timedelta(minutes=30))
         self.assertEqual(second.prediction_confidence, 0.7)
         self.assertIn(f"Last processed incident id: {second.id}", stdout.getvalue())
+
+    def test_archive_old_reports_exports_and_deletes_after_backfill(self):
+        parent = self.create_parent_station("Bank")
+        old_report = self.create_report(
+            parent,
+            resolved=True,
+            start_time=datetime(2025, 1, 1, 9, 0, tzinfo=dt_timezone.utc),
+            end_time=datetime(2025, 1, 1, 10, 0, tzinfo=dt_timezone.utc),
+        )
+        old_incident = self.create_incident(
+            parent,
+            reports=[old_report],
+            resolved=True,
+            start_time=old_report.start_time,
+            end_time=old_report.end_time,
+        )
+        recent_report = self.create_report(
+            parent,
+            resolved=True,
+            start_time=datetime(2026, 1, 2, 9, 0, tzinfo=dt_timezone.utc),
+            end_time=datetime(2026, 1, 2, 10, 0, tzinfo=dt_timezone.utc),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            call_command(
+                "archive_old_reports",
+                "--before",
+                "2026-01-01T00:00:00Z",
+                "--output-dir",
+                temp_dir,
+                "--batch-size",
+                "1",
+                "--delete",
+            )
+
+            report_file = [
+                name for name in os.listdir(temp_dir) if name.startswith("reports_")
+            ][0]
+            link_file = [
+                name
+                for name in os.listdir(temp_dir)
+                if name.startswith("incident_report_links_")
+            ][0]
+
+            with gzip.open(os.path.join(temp_dir, report_file), "rt") as fh:
+                report_rows = list(csv.DictReader(fh))
+            with gzip.open(os.path.join(temp_dir, link_file), "rt") as fh:
+                link_rows = list(csv.DictReader(fh))
+
+        old_incident.refresh_from_db()
+        self.assertEqual(old_incident.report_count, 1)
+        self.assertFalse(Report.objects.filter(pk=old_report.pk).exists())
+        self.assertTrue(Report.objects.filter(pk=recent_report.pk).exists())
+        self.assertEqual(report_rows[0]["id"], str(old_report.pk))
+        self.assertEqual(link_rows[0]["incident_id"], str(old_incident.pk))
+        self.assertEqual(link_rows[0]["report_id"], str(old_report.pk))
+
+    def test_archive_old_reports_without_delete_does_not_backfill(self):
+        parent = self.create_parent_station("Bank")
+        old_report = self.create_report(
+            parent,
+            resolved=True,
+            start_time=datetime(2025, 1, 1, 9, 0, tzinfo=dt_timezone.utc),
+            end_time=datetime(2025, 1, 1, 10, 0, tzinfo=dt_timezone.utc),
+        )
+        old_incident = self.create_incident(
+            parent,
+            reports=[old_report],
+            resolved=True,
+            start_time=old_report.start_time,
+            end_time=old_report.end_time,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            call_command(
+                "archive_old_reports",
+                "--before",
+                "2026-01-01T00:00:00Z",
+                "--output-dir",
+                temp_dir,
+                "--batch-size",
+                "1",
+            )
+
+        old_incident.refresh_from_db()
+        self.assertIsNone(old_incident.report_count)
+        self.assertTrue(Report.objects.filter(pk=old_report.pk).exists())
+
+    def test_archive_old_reports_keeps_reports_linked_to_unresolved_incidents(self):
+        parent = self.create_parent_station("Bank")
+        old_report = self.create_report(
+            parent,
+            resolved=True,
+            start_time=datetime(2025, 1, 1, 9, 0, tzinfo=dt_timezone.utc),
+            end_time=datetime(2025, 1, 1, 10, 0, tzinfo=dt_timezone.utc),
+        )
+        self.create_incident(
+            parent,
+            reports=[old_report],
+            resolved=False,
+            start_time=old_report.start_time,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            call_command(
+                "archive_old_reports",
+                "--before",
+                "2026-01-01T00:00:00Z",
+                "--output-dir",
+                temp_dir,
+                "--batch-size",
+                "1",
+                "--delete",
+            )
+
+        self.assertTrue(Report.objects.filter(pk=old_report.pk).exists())
+
+    @patch("incidents.management.commands.archive_old_reports.time.sleep")
+    def test_archive_old_reports_retries_database_locked_operations(self, sleep_mock):
+        command = ArchiveOldReportsCommand()
+        command.lock_timeout = 10
+        command.retry_delay = 0.1
+        attempts = []
+
+        def operation():
+            attempts.append(None)
+            if len(attempts) == 1:
+                raise OperationalError("database is locked")
+            return "ok"
+
+        self.assertEqual(command._with_lock_retry("test operation", operation), "ok")
+        sleep_mock.assert_called_once_with(0.1)
 
     def test_prepare_incidents_only_shows_predictions_from_stronger_buckets(self):
         parent = self.create_parent_station("Waterloo")
@@ -1431,6 +1570,23 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(payload["incidents"][0]["concurrent_incidents"], 0)
         self.assertEqual(payload["incidents"][1]["concurrent_incidents"], 1)
 
+    def test_api_training_data_uses_denormalized_report_count(self):
+        parent = self.create_parent_station("Farringdon", naptan_id="ZFD")
+        self.create_incident(
+            parent,
+            text="Faulty lift",
+            resolved=True,
+            start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
+            end_time=datetime(2026, 7, 1, 11, 0, tzinfo=dt_timezone.utc),
+            report_count=7,
+        )
+
+        response = self.client.get("/api/training-data/?key=verysecret")
+        payload = json.loads(b"".join(response.streaming_content).decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["incidents"][0]["num_reports"], 7)
+
     def test_detail_and_api_exclude_resolved_incidents_older_than_twelve_hours(self):
         parent = self.create_parent_station("Tottenham Court Road", naptan_id="TCR")
         recent = self.create_incident(
@@ -1835,3 +1991,73 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         ):
             with self.assertRaises(CommandError):
                 call_command("update_incidents")
+
+
+@override_settings(ROOT_URLCONF="updown.urls")
+class MaintenanceSnapshotTests(StationFactoryMixin, TestCase):
+    def _snapshot_file(self):
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False
+        )
+        tmp.close()
+        os.unlink(tmp.name)  # we only want the path; the middleware creates it
+        return tmp.name
+
+    def test_serves_static_snapshot_without_db_access_when_enabled(self):
+        self.create_parent_station("Bank")
+        path = self._snapshot_file()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        with override_settings(MAINTENANCE_SNAPSHOT_PATH=path), patch.dict(
+            os.environ, {"MAINTENANCE_SNAPSHOT": "1"}
+        ):
+            # First request renders + writes the snapshot (one DB read).
+            first = self.client.get("/")
+            self.assertEqual(first.status_code, 200)
+            self.assertTrue(os.path.exists(path))
+
+            with open(path, encoding="utf-8") as fh:
+                snapshot_html = fh.read()
+
+            # Second request must be served from the file with no DB
+            # queries at all — that's the whole point of the freeze.
+            with CaptureQueriesContext(connection) as queries:
+                second = self.client.get("/")
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(second.content.decode("utf-8"), snapshot_html)
+            self.assertEqual(
+                len(queries), 0, "snapshot serving must not touch the database"
+            )
+
+    def test_intercepts_update_endpoint_so_cron_cannot_write(self):
+        path = self._snapshot_file()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        with override_settings(MAINTENANCE_SNAPSHOT_PATH=path), patch.dict(
+            os.environ, {"MAINTENANCE_SNAPSHOT": "1"}
+        ):
+            # Pre-create the snapshot via a normal GET.
+            self.client.get("/")
+            with patch(
+                "incidents.views.call_command"
+            ) as call_command_mock:
+                resp = self.client.post(
+                    "/functions/update_incidents", {"key": "verysecret"}
+                )
+            # The update view never ran — the middleware short-circuited it.
+            call_command_mock.assert_not_called()
+            self.assertEqual(resp.status_code, 200)
+
+    def test_removes_snapshot_and_serves_normally_when_disabled(self):
+        self.create_parent_station("Bank")
+        path = self._snapshot_file()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("stale snapshot")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        with override_settings(MAINTENANCE_SNAPSHOT_PATH=path):
+            # Env var not set → normal serving, and the stale file is cleared.
+            response = self.client.get("/")
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(b"stale snapshot", response.content)
+            self.assertFalse(os.path.exists(path))

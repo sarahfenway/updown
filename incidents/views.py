@@ -6,7 +6,8 @@ from math import sqrt
 from django.conf import settings
 from django.core.cache import cache
 from django.core.management import call_command
-from django.db.models import CharField, Count, Max, Prefetch, Q
+from django.db.models import CharField, Count, IntegerField, Max, OuterRef, Prefetch, Q
+from django.db.models import Subquery, Value
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Now
@@ -1315,20 +1316,31 @@ def api_training_data(request):
 
     last_incident_at_station = {}
     active_end_times = []
-    incident_rows = (
-        base_qs.annotate(num_reports=Count("reports"))
-        .order_by("start_time", "id")
-        .values_list(
-            "id",
-            "station_id",
-            "information",
-            "text",
-            "start_time",
-            "end_time",
-            "estimated_duration",
-            "num_reports",
-        )
+    report_count_subquery = (
+        Incident.reports.through.objects.filter(incident_id=OuterRef("pk"))
+        .order_by()
+        .values("incident_id")
+        .annotate(count=Count("report_id"))
+        .values("count")
     )
+    incident_rows = base_qs.annotate(
+        num_reports=Coalesce(
+            "report_count",
+            Subquery(report_count_subquery, output_field=IntegerField()),
+            Value(0),
+            output_field=IntegerField(),
+        )
+    ).values_list(
+        "id",
+        "station_id",
+        "information",
+        "text",
+        "start_time",
+        "end_time",
+        "estimated_duration",
+        "num_reports",
+    )
+    incident_rows = incident_rows.order_by("start_time", "id")
 
     def generate():
         yield '{"incidents":['

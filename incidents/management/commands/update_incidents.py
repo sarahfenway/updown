@@ -20,18 +20,35 @@ def refresh_prediction(incident):
     incident.save(update_fields=["estimated_duration", "prediction_confidence"])
 
 
+def _attach_report(incident, report):
+    through = Incident.reports.through
+    if through.objects.filter(incident_id=incident.pk, report_id=report.pk).exists():
+        if incident.report_count is None:
+            incident.report_count = incident.reports.count()
+            incident.save(update_fields=["report_count"])
+        return
+
+    count_was_unknown = incident.report_count is None
+    incident.reports.add(report)
+    incident.report_count = (
+        incident.reports.count()
+        if count_was_unknown
+        else incident.report_count + 1
+    )
+    incident.save(update_fields=["report_count"])
+
+
 def consolidate_incidents():
     """Fold unresolved reports into incidents and detect resolutions.
 
     Returns a list of tweet/bluesky message strings to be sent *after*
-    the database work commits. We deliberately do not send them inline:
-    on SQLite the whole consolidation runs in one transaction (so the
-    dozens of small writes become a single commit instead of one
-    durable write each), and holding the single write-lock open across
-    a blocking HTTP call to Twitter/Bluesky is exactly what was stalling
-    the cron.
+    the database work commits. SQLite has one writer, so the transaction
+    below is kept to the cheap consolidation writes only. Predictions and
+    social posts can involve model loading, history reads, and HTTP calls;
+    they happen after the write lock has been released.
     """
     pending_posts = []
+    prediction_incident_ids = set()
 
     with transaction.atomic():
         # Take all the reports and consolidate them into incidents
@@ -72,6 +89,7 @@ def consolidate_incidents():
                     start_time=report.start_time,
                     end_time=report.end_time,
                     resolved=report.resolved,
+                    report_count=0,
                 )
                 incident.save()
                 should_predict = True
@@ -105,9 +123,9 @@ def consolidate_incidents():
                     should_predict = True
 
             # Add the report to the incident
-            incident.reports.add(report)
+            _attach_report(incident, report)
             if should_predict:
-                refresh_prediction(incident)
+                prediction_incident_ids.add(incident.pk)
 
         Report.objects.filter(
             source=Report.SOURCE_USER, resolved=False, end_time__lt=timezone.now()
@@ -133,9 +151,15 @@ def consolidate_incidents():
                 incident.end_time = timezone.now()
                 incident.save()
 
-                reports_count = incident.reports.count()
+                reports_count = (
+                    incident.report_count
+                    if incident.report_count is not None
+                    else incident.reports.count()
+                )
                 first_report_source = (
-                    incident.reports.values_list("source", flat=True).first()
+                    incident.reports.order_by()
+                    .values_list("source", flat=True)
+                    .first()
                 )
                 if (
                     reports_count > 1
@@ -144,6 +168,13 @@ def consolidate_incidents():
                     pending_posts.append(
                         f"Step free access has been restored at {incident.station.name}"
                     )
+
+    for incident in (
+        Incident.objects.filter(pk__in=prediction_incident_ids)
+        .select_related("station", "station__parent_station")
+        .order_by("id")
+    ):
+        refresh_prediction(incident)
 
     return pending_posts
 

@@ -73,6 +73,12 @@ MIDDLEWARE = [
     # separate static-site service needed on Fly. Must come right after
     # SecurityMiddleware per the project's docs.
     "whitenoise.middleware.WhiteNoiseMiddleware",
+    # Database-maintenance freeze mode. When MAINTENANCE_SNAPSHOT is set it
+    # serves a one-off static render of the homepage and touches the DB
+    # zero times — letting the SQLite file be taken offline for surgery.
+    # Sits after WhiteNoise so /static/ still serves and the frozen page
+    # renders correctly.
+    "incidents.middleware.MaintenanceSnapshotMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -130,6 +136,9 @@ if os.getenv("DB_ENGINE", "postgres").lower() == "sqlite":
                 # lock. The default 5s is easy to hit during ML batches.
                 "timeout": 20,
             },
+            # Reuse the connection inside the web worker so we don't run the
+            # SQLite setup pragmas on every request.
+            "CONN_MAX_AGE": 60,
         }
     }
 else:

@@ -30,6 +30,7 @@ class Incident(models.Model):
     end_time = models.DateTimeField(null=True, blank=True)
     resolved = models.BooleanField(default=False)
     reports = models.ManyToManyField("incidents.Report")
+    report_count = models.PositiveIntegerField(null=True, blank=True)
     estimated_duration = models.DurationField(
         null=True,
         blank=True,
@@ -46,6 +47,8 @@ class Incident(models.Model):
             reports_count = self.reports_count
         elif hasattr(self, "prefetched_reports"):
             reports_count = len(self.prefetched_reports)
+        elif self.report_count is not None:
+            reports_count = self.report_count
         else:
             reports_count = self.reports.count()
 
@@ -69,6 +72,23 @@ class Incident(models.Model):
                 fields=["id"],
                 name="incident_unresolved_idx",
                 condition=models.Q(resolved=False),
+            ),
+            models.Index(
+                fields=["station_id", "-start_time"],
+                name="incident_station_start_idx",
+            ),
+            models.Index(
+                fields=["start_time", "id"],
+                name="incident_training_idx",
+                condition=models.Q(resolved=True, end_time__isnull=False),
+            ),
+            models.Index(
+                fields=["end_time"],
+                name="incident_prediction_end_idx",
+                condition=models.Q(
+                    resolved=True,
+                    estimated_duration__isnull=False,
+                ),
             ),
         ]
         ordering = ["-start_time", "-id"]
@@ -107,25 +127,12 @@ class Report(models.Model):
 
     class Meta:
         indexes = [
-            models.Index(
-                fields=["station_id", "source", "information", "resolved", "text"]
-            ),
             models.Index(fields=["resolved", "source"]),
             models.Index(fields=["-start_time", "-id"], name="idx_start_time_id"),
-            models.Index(fields=["station_id"], name="idx_station_id"),
-            models.Index(
-                fields=[
-                    "-start_time",
-                    "-id",
-                    "information",
-                    "station_id",
-                    "text",
-                    "end_time",
-                    "resolved",
-                    "source",
-                ],
-                name="idx_covering",
-            ),
+            # Note: a standalone station_id index is intentionally omitted —
+            # the ForeignKey already creates one
+            # (incidents_report_station_id_*), so an explicit idx_station_id
+            # was a pure duplicate. Removed in migration 0010.
             models.Index(
                 fields=["id"],
                 name="report_unresolved_idx",

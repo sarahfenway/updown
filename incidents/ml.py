@@ -3,6 +3,7 @@ import os
 import warnings
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta
+from functools import lru_cache
 
 from django.conf import settings
 
@@ -477,6 +478,19 @@ def predict_duration(incident):
         return None, None
 
 
+@lru_cache(maxsize=512)
+def _station_family_ids(station_id):
+    from django.db.models import Q
+
+    from stations.models import Station
+
+    return tuple(
+        Station.objects.filter(Q(pk=station_id) | Q(parent_station_id=station_id))
+        .order_by()
+        .values_list("id", flat=True)
+    )
+
+
 def _predict_duration(incident):
     """Returns (timedelta, confidence) or (None, None).
 
@@ -515,10 +529,11 @@ def _predict_duration(incident):
     text = feature_text.lower()
     start_time_local = _to_local(incident.start_time) if use_v2_features else incident.start_time
 
-    # Historical filter: the effective station itself, or any of its
-    # children. Covers both possibilities regardless of which record the
-    # incident was originally filed against.
-    station_filter = Q(station=station) | Q(station__parent_station=station)
+    # Historical filter: resolve the small station family once, then keep
+    # incident queries on incident.station_id so SQLite can use the
+    # station/start-time indexes without joining stations on every
+    # prediction.
+    station_filter = Q(station_id__in=_station_family_ids(station.pk))
 
     # Per-station historical stats from resolved incidents. We pull the raw
     # start/end times so we can compute both mean duration and mean block
@@ -548,6 +563,8 @@ def _predict_duration(incident):
         num_reports = len(incident.prefetched_reports)
     elif hasattr(incident, "num_reports"):
         num_reports = incident.num_reports or 0
+    elif getattr(incident, "report_count", None) is not None:
+        num_reports = incident.report_count
     elif incident.pk:
         num_reports = incident.reports.count()
     else:

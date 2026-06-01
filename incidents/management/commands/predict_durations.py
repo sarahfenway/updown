@@ -1,7 +1,8 @@
 from datetime import timedelta
 
 from django.core.management.base import BaseCommand
-from django.db.models import Count, Q
+from django.db.models import Count, IntegerField, OuterRef, Q, Subquery, Value
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from incidents.models import Incident
@@ -92,7 +93,23 @@ class Command(BaseCommand):
 
         incidents = (
             incidents.select_related("station", "station__parent_station")
-            .annotate(num_reports=Count("reports", distinct=True))
+            .annotate(
+                num_reports=Coalesce(
+                    "report_count",
+                    Subquery(
+                        Incident.reports.through.objects.filter(
+                            incident_id=OuterRef("pk")
+                        )
+                        .order_by()
+                        .values("incident_id")
+                        .annotate(count=Count("report_id"))
+                        .values("count"),
+                        output_field=IntegerField(),
+                    ),
+                    Value(0),
+                    output_field=IntegerField(),
+                )
+            )
             .only(*PREDICTION_INCIDENT_FIELDS)
             .order_by("id")
         )
