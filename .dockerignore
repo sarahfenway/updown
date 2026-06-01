@@ -1,0 +1,47 @@
+# Source control
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Virtual environments
+venv
+.venv
+env
+.env
+.env.*
+
+# Editor / IDE
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Local artifacts
+last_updated
+ml_model.joblib
+db.sqlite3
+db.sqlite3-*
+
+# Things not needed in the production image
+tests
+ml
+packages
+BUILDING.md
+README.md
+LICENSE
+project.yml
+pytest.ini
+
+# Static output is re-generated inside the container
+staticfiles

@@ -1,0 +1,28 @@
+# Litestream configuration.
+#
+# Continuous backup of the SQLite database to Backblaze B2. On boot, the
+# entrypoint runs ``litestream restore`` against this config — if the
+# local DB is missing but a replica exists in B2, it's pulled down before
+# the app starts. After that, every write to the SQLite WAL is streamed
+# to B2 within a second or two.
+#
+# Credentials come from env vars set as Fly secrets:
+#   LITESTREAM_ACCESS_KEY_ID      — B2 application key ID
+#   LITESTREAM_SECRET_ACCESS_KEY  — B2 application key (the secret half)
+
+dbs:
+  - path: /data/db.sqlite3
+    replicas:
+      - type: s3
+        bucket: updownlondon-litestream
+        path: db
+        endpoint: https://s3.us-west-001.backblazeb2.com
+        region: us-west-001
+        access-key-id: ${LITESTREAM_ACCESS_KEY_ID}
+        secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
+        # Hold 24 hours of WAL fragments on B2 before compacting into a
+        # fresh snapshot. Keeps storage tiny while giving 24h of
+        # point-in-time recovery granularity.
+        retention: 24h
+        retention-check-interval: 1h
+        snapshot-interval: 24h

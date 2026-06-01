@@ -1,0 +1,14 @@
+environment:
+  FUNCTIONS_URL_BASE: ${FUNCTIONS_URL_BASE}
+  FUNCTIONS_SECRET_KEY: ${FUNCTIONS_SECRET_KEY}
+packages:
+  - name: updown
+    functions:
+      - name: update_incidents
+        runtime: 'python:default'
+        web: false
+        triggers:
+          - name: trigger-update-incidents
+            sourceType: scheduler
+            sourceDetails:
+              cron: "* * * * *"

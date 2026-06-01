@@ -1,0 +1,324 @@
+{% load static %}
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{% block title %}{% endblock %}Stats</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <link rel="shortcut icon" href="{% static "favicon.ico" %}" type="image/x-icon" />
+    <!-- Apple Touch Icons -->
+    <link rel="apple-touch-icon" sizes="60x60" href="{% static "apple-touch-icon-60x60.png" %}"/>
+    <link rel="apple-touch-icon" sizes="76x76" href="{% static "apple-touch-icon-76x76.png" %}"/>
+    <link rel="apple-touch-icon" sizes="120x120" href="{% static "apple-touch-icon-120x120.png" %}"/>
+    <link rel="apple-touch-icon" sizes="152x152" href="{% static "apple-touch-icon-152x152.png" %}"/>
+
+    <!-- Bootstrap -->
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css"
+          integrity="sha384-BVYiiSIFeK1dGmJRAkycuHAHRg32OmUcww7on3RYdg4Va+PmSTsz/K68vbdEjh4u" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap-theme.min.css"
+          integrity="sha384-rHyoN1iRsVXV4nD0JutlnGaslCJuC7uwjduW9SVrLvRYooPp2bWYgmgJQIXwl/Sp" crossorigin="anonymous">
+
+    <!-- Our stuff -->
+    <link href="//netdna.bootstrapcdn.com/font-awesome/3.2.1/css/font-awesome.css" rel="stylesheet">
+    {% if debug %}
+        <link rel="stylesheet" type="text/css" href="{% static "updown.min.css" %}updown.min.css" %}">
+    {% else %}
+        <link rel="stylesheet" type="text/css" href="{% static "updown.css" %}">
+    {% endif %}
+    <link href='https://fonts.googleapis.com/css?family=Montserrat:400,700' rel='stylesheet' type='text/css'>
+</head>
+<body>
+<div class="container">
+    <div class="row header-box">
+        <div class="col-md-12">
+            <h1>In the last 30 days</h1>
+            <h2>Total</h2>
+            <p>Count: {{ total_count }}</p>
+            <p>Duration: {{ total_delays }}</p>
+            
+            <h2>Unavailable Staff</h2>
+            <p>Count: {{ station_staff_count }} ({{ station_staff_count_percentage }}%)</p>
+            <p>Duration: {{  station_staff_delays }} ({{ station_staff_delays_percentage }}%)</p>
+            
+            <h2>Faulty Lift</h2>
+            <p>Count: {{ faulty_lift_count }} ({{ faulty_lift_count_percentage }}%)</p>
+            <p>Duration: {{  faulty_lift_delays }} ({{ faulty_lift_delays_percentage }}%)</p>
+            
+            <h2>Planned Maintenance</h2>
+            <p>Count: {{ planned_maintenance_count }} ({{ planned_maintenance_count_percentage }}%)</p>
+            <p>Duration: {{ planned_maintenance_delays }} ({{ planned_maintenance_delays_percentage }}%)</p>
+
+            <h2>Duration Predictions (BETA)</h2>
+            {% if prediction_count %}
+                <p>Predictions made: {{ prediction_count }}</p>
+                <p>Fixed by the predicted time: {{ prediction_correct_count }} / {{ prediction_count }} ({{ prediction_accuracy_pct }}%)</p>
+                <p><i>Each prediction is a "fixed by" bound. It is "correct" if the actual fix happened at or before the predicted time, allowing {{ prediction_boundary_grace_minutes }} minutes of grace either side of a block boundary. Being fixed earlier still counts.</i></p>
+                <p><i>User-facing predictions are only shown when a confidence bucket has at least {{ prediction_display_min_samples }} recent examples and a conservative estimated accuracy above {{ prediction_display_min_accuracy_pct }}%. We use the last {{ prediction_display_primary_window_days }} days when possible, and fall back to the last {{ prediction_display_fallback_window_days }} days if a bucket is too sparse.</i></p>
+                <p><i>A narrow exception applies for {{ prediction_station_override_bucket_label }} predictions: they can still be shown when that station has at least {{ prediction_station_override_min_samples }} resolved predictions in the last {{ prediction_station_override_window_days }} days and at least {{ prediction_station_override_min_accuracy_pct }}% close accuracy.</i></p>
+
+                {% if confidence_chart %}
+                <h3>Confidence vs Accuracy</h3>
+                <p><i>Taller bars = more accurate. Does higher confidence mean more correct predictions?</i></p>
+                <svg viewBox="0 0 500 220" style="width:100%;max-width:500px;font-family:Montserrat,sans-serif;font-size:11px">
+                    <!-- Y axis -->
+                    <text x="0" y="10" fill="#333">% correct</text>
+                    <line x1="60" y1="20" x2="490" y2="20" stroke="#eee"/>
+                    <text x="45" y="24" text-anchor="end" fill="#999">100%</text>
+                    <line x1="60" y1="100" x2="490" y2="100" stroke="#eee"/>
+                    <text x="45" y="104" text-anchor="end" fill="#999">50%</text>
+                    <line x1="60" y1="180" x2="490" y2="180" stroke="#ccc"/>
+                    <text x="45" y="184" text-anchor="end" fill="#999">0%</text>
+                    <!-- X axis label -->
+                    <text x="275" y="210" text-anchor="middle" fill="#333">Confidence bucket</text>
+                    <!-- Bars -->
+                    {% for bucket in confidence_chart %}
+                        {% if bucket.accuracy_pct != None %}
+                            <rect x="{{ bucket.x }}" y="{{ bucket.y }}"
+                                  width="35" height="{{ bucket.h }}" rx="2"
+                                  fill="{% if bucket.show_prediction %}#5cb85c{% else %}#bbb{% endif %}" opacity="0.8">
+                                <title>{{ bucket.label }}: {{ bucket.accuracy_pct }}% correct in the last 30 days (n={{ bucket.count }}){% if bucket.show_prediction and bucket.prediction_label %}; shown as &quot;{{ bucket.prediction_label }}&quot;{% if bucket.used_fallback_window and bucket.policy_window_days %} using a {{ bucket.policy_window_days }}-day fallback window{% endif %}{% else %}; hidden from users{% endif %}</title>
+                            </rect>
+                        {% else %}
+                            <rect x="{{ bucket.x }}" y="{{ bucket.y }}"
+                                  width="35" height="{{ bucket.h }}" rx="2"
+                                  fill="#eee">
+                                <title>{{ bucket.label }}: no data</title>
+                            </rect>
+                        {% endif %}
+                        <text x="{{ bucket.text_x }}" y="195" fill="#666"
+                              text-anchor="middle" style="font-size:9px">{{ bucket.label }}</text>
+                    {% endfor %}
+                </svg>
+                {% endif %}
+
+                <h3>Current Prediction Visibility</h3>
+                <p><i>For unresolved issues right now, this is why beta predictions are shown or hidden.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Current unresolved issues split by whether the beta prediction is shown, hidden because there are too few similar examples, hidden because similar predictions have not been accurate enough, hidden because the predicted time has already passed, or hidden because there is no usable prediction.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Status</th>
+                                <th scope="col">Count</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Current unresolved issues</td>
+                                <td>{{ current_issue_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Shown in beta</td>
+                                <td>{{ current_prediction_visible_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Hidden: too few similar examples</td>
+                                <td>{{ current_prediction_hidden_sparse_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Hidden: similar predictions not accurate enough</td>
+                                <td>{{ current_prediction_hidden_low_accuracy_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Hidden: predicted time has passed</td>
+                                <td>{{ current_prediction_hidden_past_due_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Hidden: no usable prediction</td>
+                                <td>{{ current_prediction_hidden_missing_count }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                {% if current_hidden_low_accuracy_bucket_rows or current_hidden_low_accuracy_station_rows %}
+                <h3>Hidden Low-Accuracy Diagnostics</h3>
+                <p><i>These tables only look at current unresolved issues hidden because similar predictions have not been accurate enough.</i></p>
+
+                {% if current_hidden_low_accuracy_bucket_rows %}
+                <h4>By confidence bucket</h4>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Current unresolved issues hidden because similar predictions have not been accurate enough, grouped by confidence bucket.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Confidence bucket</th>
+                                <th scope="col">Current hidden issues</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in current_hidden_low_accuracy_bucket_rows %}
+                            <tr>
+                                <td>{{ row.label }}</td>
+                                <td>{{ row.count }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+
+                {% if current_hidden_low_accuracy_category_rows %}
+                <h4>By category</h4>
+                <p><i>Categories are inferred from the incident text.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Current unresolved issues hidden because similar predictions have not been accurate enough, grouped by inferred category.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Category</th>
+                                <th scope="col">Current hidden issues</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in current_hidden_low_accuracy_category_rows %}
+                            <tr>
+                                <td>{{ row.label }}</td>
+                                <td>{{ row.count }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+
+                {% if current_hidden_low_accuracy_network_rows %}
+                <h4>By network</h4>
+                <p><i>A station can appear in more than one network, so these counts can add up to more than the number of current hidden issues.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Current unresolved issues hidden because similar predictions have not been accurate enough, grouped by station network.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Network</th>
+                                <th scope="col">Current hidden issues</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in current_hidden_low_accuracy_network_rows %}
+                            <tr>
+                                <td>{{ row.label }}</td>
+                                <td>{{ row.count }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+
+                {% if current_hidden_low_accuracy_station_rows %}
+                <h4>By station</h4>
+                <p><i>Recent station accuracy is only shown when that station has at least {{ prediction_station_diagnostic_min_samples }} resolved predictions in the last {{ prediction_station_diagnostic_window_days }} days.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Stations with current unresolved issues hidden because similar predictions have not been accurate enough, with recent prediction history where available.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Station</th>
+                                <th scope="col">Current hidden issues</th>
+                                <th scope="col">Recent resolved predictions</th>
+                                <th scope="col">Recent close accuracy</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in current_hidden_low_accuracy_station_rows %}
+                            <tr>
+                                <td>{{ row.station_name }}</td>
+                                <td>{{ row.current_hidden_count }}</td>
+                                <td>{{ row.recent_prediction_count }}</td>
+                                <td>
+                                    {% if row.has_enough_history %}
+                                        {{ row.recent_accuracy_pct }}%
+                                    {% else %}
+                                        Not enough history
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+                {% endif %}
+
+                {% if recent_prediction_rows %}
+                <h3>Recent Prediction Checks</h3>
+                <p><i>The {{ prediction_review_limit }} most recent resolved incidents with predictions.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">Recent resolved incidents showing what we predicted, what actually happened, how certain we were, and whether we were right.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Station</th>
+                                <th scope="col">We thought</th>
+                                <th scope="col">Actually fixed</th>
+                                <th scope="col">Certainty</th>
+                                <th scope="col">Result</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in recent_prediction_rows %}
+                            <tr>
+                                <td>{{ row.station_name }}</td>
+                                <td>{{ row.predicted_block }}</td>
+                                <td>{{ row.actual_block }} <span class="text-muted">({{ row.actual_end_time|date:"H:i, d M" }})</span></td>
+                                <td>{{ row.confidence_pct }}%</td>
+                                <td>{{ row.outcome_text }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+            {% else %}
+                <p>No prediction data available yet.</p>
+            {% endif %}
+
+        </div>
+    </div>
+    <hr>
+    <div class="row header-box">
+        <div class="col-md-6 col-md-offset-3">
+            <h3>
+                <a href="https://updownlondon.com/" style="color: #333">Visit <i class="icon-arrow-up green"></i><i class="icon-arrow-down red"></i>
+                    UP DOWN LONDON for full lift status</a></h3>
+            </h3>
+        </div>
+    </div>
+
+
+</div>
+</body>
+<!-- jQuery -->
+<script src="https://code.jquery.com/jquery.js"></script>
+<script src="{% static 'jquery.fittext.js' %}"></script>
+<script>!function (d, s, id) {
+    var js, fjs = d.getElementsByTagName(s)[0], p = /^http:/.test(d.location) ? 'http' : 'https';
+    if (!d.getElementById(id)) {
+        js = d.createElement(s);
+        js.id = id;
+        js.src = p + '://platform.twitter.com/widgets.js';
+        fjs.parentNode.insertBefore(js, fjs);
+    }
+}(document, 'script', 'twitter-wjs');
+</script>
+<script>
+    (function (i, s, o, g, r, a, m) {
+        i['GoogleAnalyticsObject'] = r;
+        i[r] = i[r] || function () {
+            (i[r].q = i[r].q || []).push(arguments)
+        }, i[r].l = 1 * new Date();
+        a = s.createElement(o),
+            m = s.getElementsByTagName(o)[0];
+        a.async = 1;
+        a.src = g;
+        m.parentNode.insertBefore(a, m)
+    })(window, document, 'script', '//www.google-analytics.com/analytics.js', 'ga');
+
+    ga('create', 'UA-44056681-1', 'updownlondon.com');
+    ga('send', 'pageview');
+</script>
+<script>
+    jQuery("h1").fitText(1.25, {minFontSize: '30px'});
+</script>
+</html>

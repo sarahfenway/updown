@@ -1,0 +1,21 @@
+# In-container cron schedule, run by supercronic. Each line is a standard
+# cron expression followed by a command. Output goes to stdout/stderr,
+# which Fly captures into ``fly logs``.
+#
+# Format: minute hour day-of-month month day-of-week command
+#
+# We POST to the running web process's /functions/update_incidents
+# endpoint rather than running ``python -m django update_incidents`` as a
+# fresh process. This is the pattern the old Digital Ocean cron used, and
+# it matters: the work then runs inside the long-lived gunicorn worker
+# where the ~100MB ML model is already loaded and warm. A standalone
+# process would reload that model from cold every tick (~11s+) — which is
+# exactly what made updates slow after the move to Fly.
+#
+# Defensive wrappers:
+#   * ``flock -n`` skips this tick if the previous POST is still in
+#     flight, so ticks never queue up.
+#   * the request carries its own connect/read timeout, and gunicorn has
+#     its own worker timeout, so a stuck call can't hang forever.
+
+*/5 * * * * /usr/bin/flock -n /tmp/update_incidents.lock /opt/venv/bin/python -c "import os,requests; requests.post('http://127.0.0.1:8080/functions/update_incidents', data={'key': os.environ.get('FUNCTIONS_SECRET_KEY','verysecret')}, timeout=(5, 240))"

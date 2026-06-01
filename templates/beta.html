@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+
+{% block title %}Beta | {% endblock %}
+
+{% block menu %}
+    <div class="row menu-container">
+        <ul class="col-md-6 col-md-offset-3 col-xs-12 menu">
+            <a href="/beta/" class="no-arrow no-bold">
+                <li class="col-md-4 col-md-offset-2 col-xs-6 menu-item losenge-left menu-item-active">
+                    Status Beta
+                </li>
+            </a>
+            <a href="/faq/" class="no-arrow no-bold">
+                <li class="col-md-4 col-xs-6 menu-item losenge-right">
+                    FAQ
+                </li>
+            </a>
+        </ul>
+    </div>
+{% endblock %}
+
+{% block content %}
+    <div class="row">
+        <div class="col-md-6 col-md-offset-3">
+            <h2>Current Issues</h2>
+            <div class="current-issues">
+                {% if issues %}
+                    {% regroup issues by station as station_list %}
+                    {% for station in station_list %}
+                        <div class="issue">
+                            <h3>{{ station.grouper.name }}</h3>
+                            {% for issue in station.list %}
+                                <p>
+                                    {% if issue.text %}
+                                        {{ issue.text }}
+                                    {% else %}
+                                        There is no step free access at this station.
+                                    {% endif %}
+                                    <i>
+                                        {% if issue.is_single_user_report %}
+                                            This is a user report, which will be automatically closed at {{ issue.single_user_report_end_time|date:"H:i, d M" }} unless reported by TfL.
+                                        {% endif %}
+                                        {% if issue.start_time %}
+                                            <br>
+                                            {% if issue.show_prediction %}
+                                                {{ issue.start_time }}
+                                                <span class="beta-inline-status beta-inline-status-current" title="{{ issue.beta_current_status_title }}">
+                                                    <span class="beta-inline-status-main">
+                                                        <i class="icon-magic beta-inline-status-icon" aria-hidden="true"></i>
+                                                        <span>{{ issue.beta_current_status }}</span>
+                                                        <span class="sr-only">. AI prediction. {{ issue.beta_meter_help_text }}</span>
+                                                    </span>
+                                                    {% if issue.prediction_accuracy_pct is not None %}
+                                                        <span class="beta-inline-status-meter">
+                                                            <span class="beta-inline-meter" aria-hidden="true">
+                                                                <span class="beta-inline-meter-fill" style="width: {{ issue.prediction_accuracy_pct }}%;"></span>
+                                                            </span>
+                                                        </span>
+                                                    {% endif %}
+                                                </span>
+                                            {% else %}
+                                                {{ issue.start_time }}
+                                            {% endif %}
+                                        {% endif %}
+                                    </i>
+                                </p>
+                                {% if not forloop.last %}
+                                <hr style="border-top-color: #999">
+                                {% endif %}
+                            {% endfor %}
+                        </div>
+                    {% endfor %}
+                {% else %}
+                    <p>
+                        There are currently no reported step free access issues on London Underground, London
+                        Overground, Elizabeth Line or the DLR.
+                    </p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    {% if resolved %}
+        <div class="row">
+            <div class="col-md-6 col-md-offset-3">
+                <h2>Resolved Issues</h2>
+                <div class="resolved-issues">
+                    {% for issue in resolved %}
+                        <div class="issue">
+                            <h3>{{ issue.station }}</h3>
+                            <p>
+                                {% if issue.is_single_user_report %}
+                                    This was a user report, which we have automatically closed.
+                                {% else %}
+                                    Step free access has now been restored at this station.
+                                {% endif %}
+                                <i>
+                                        {% if issue.end_time %}
+                                            {% if issue.show_prediction and issue.prediction_was_correct is not None %}
+                                                {{ issue.end_time }}
+                                            <span class="beta-inline-status {% if issue.prediction_outcome == 'exact' %}beta-inline-status-good{% elif issue.prediction_outcome == 'near' %}beta-inline-status-near{% else %}beta-inline-status-miss{% endif %}" title="{{ issue.beta_resolved_status_title }}">
+                                                <span class="beta-inline-status-main">
+                                                    <i class="icon-magic beta-inline-status-icon" aria-hidden="true"></i>
+                                                    <span>{{ issue.beta_resolved_status }}</span>
+                                                    <span class="sr-only">. AI prediction result. {{ issue.beta_meter_help_text }}</span>
+                                                </span>
+                                                {% if issue.prediction_accuracy_pct is not None %}
+                                                    <span class="beta-inline-status-meter">
+                                                        <span class="beta-inline-meter" aria-hidden="true">
+                                                            <span class="beta-inline-meter-fill" style="width: {{ issue.prediction_accuracy_pct }}%;"></span>
+                                                        </span>
+                                                    </span>
+                                                {% endif %}
+                                            </span>
+                                        {% else %}
+                                            {{ issue.end_time }}
+                                        {% endif %}
+                                    {% endif %}
+                                </i>
+                            </p>
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    {% endif %}
+
+    {% if information %}
+        <div class="row">
+            <div class="col-md-6 col-md-offset-3">
+                <h2>Information</h2>
+                <div class="planned-maintenance">
+                    {% for issue in information %}
+                        <div class="issue">
+                            <h3>{{ issue.station }}</h3>
+                            <p>
+                                {{ issue.text|safe }}
+                            </p>
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    {% endif %}
+{% endblock %}
