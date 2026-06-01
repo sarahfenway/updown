@@ -35,10 +35,10 @@ primary_region = "lhr"
     hard_limit = 25
 
 [[vm]]
-  size = "shared-cpu-2x"
+  size = "shared-cpu-1x"
   memory = "512mb"
   cpu_kind = "shared"
-  cpus = 2
+  cpus = 1
 
 # Persistent disk for the SQLite database. Fly snapshots this daily, keeping
 # 5 days by default — that's our backup. Create the volume once with:
