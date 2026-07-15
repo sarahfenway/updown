@@ -1,3 +1,4 @@
+import logging
 import re
 
 import arrow
@@ -7,6 +8,8 @@ from arrow import ParserError
 from django.conf import settings
 from django.utils import timezone
 from django.utils.timezone import make_aware
+
+logger = logging.getLogger(__name__)
 
 A_DAY_IN_SECONDS = 60 * 60 * 24
 
@@ -37,40 +40,63 @@ def strip_step_free_prefix(text):
 
 
 def remove_tfl_specifics(text):
-    # We always reset this just in case there is an update
-    text = re.sub("(Please )?[Cc]all.*0[38]43 ?222 ?1234.*journey\.?", "", text)
-    text = re.sub("we ", "TfL ", text, re.IGNORECASE)
-    text = re.sub("member of staff", "member of TfL staff", text, re.IGNORECASE)
+    # NOTE: re.sub's 4th positional argument is ``count``, not ``flags`` —
+    # these all used to pass ``re.IGNORECASE`` (== 2) there, so matching was
+    # case-sensitive and silently capped at 2 replacements. They now pass
+    # ``flags=re.IGNORECASE`` properly. Patterns are raw strings so the
+    # ``\.`` escapes are valid (and don't emit SyntaxWarnings on 3.12+).
+    text = re.sub(r"(Please )?[Cc]all.*0[38]43 ?222 ?1234.*journey\.?", "", text)
+    # Word-bounded so case-insensitive matching turns TfL's first-person
+    # "we"/"We" into "TfL" without mangling words that merely end in "we"
+    # (e.g. "Crewe ").
+    text = re.sub(r"\bwe ", "TfL ", text, flags=re.IGNORECASE)
     text = re.sub(
-        "Call our Travel Information Centre on 0343 222 1234 if you need more help\.?",
+        r"member of staff", "member of TfL staff", text, flags=re.IGNORECASE
+    )
+    text = re.sub(
+        r"Call our Travel Information Centre on 0343 222 1234 if you need more help\.?",
         "",
         text,
-        re.IGNORECASE,
+        flags=re.IGNORECASE,
     )
     text = re.sub(
-        "Call our Travel Information Centre on 0343 222 1234 for further help\.?",
+        r"Call our Travel Information Centre on 0343 222 1234 for further help\.?",
         "",
         text,
-        re.IGNORECASE,
+        flags=re.IGNORECASE,
     )
     text = re.sub(
-        "Call our Travel Information Centre on 0343 222 1234 for help planning your journey\.?",
+        r"Call our Travel Information Centre on 0343 222 1234 for help planning your journey\.?",
         "",
         text,
-        re.IGNORECASE,
+        flags=re.IGNORECASE,
     )
     text = re.sub(
-        "Call us on 0343 222 1234 if you need more help\.?", "", text, re.IGNORECASE
-    )
-    text = re.sub("Call 0343 222 1234 for further help\.?", "", text, re.IGNORECASE)
-    text = re.sub(
-        "Call 0343 222 1234 if you need further help\.?", "", text, re.IGNORECASE
-    )
-    text = re.sub(
-        "Call us on 0343 222 1234 for further help\.?", "", text, re.IGNORECASE
+        r"Call us on 0343 222 1234 if you need more help\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
     )
     text = re.sub(
-        "Call us on 0343 222 1234 for further info\.?", "", text, re.IGNORECASE
+        r"Call 0343 222 1234 for further help\.?", "", text, flags=re.IGNORECASE
+    )
+    text = re.sub(
+        r"Call 0343 222 1234 if you need further help\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"Call us on 0343 222 1234 for further help\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"Call us on 0343 222 1234 for further info\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
     )
     return text
 
@@ -148,9 +174,11 @@ def send_tweet(tweet_text):
                 access_token_secret=settings.TWITTER_ACCESS_TOKEN_SECRET,
             )
             twitter.create_tweet(text=tweet_text)
-        # Except everything. TODO: Look into some of twitters annoying foibles
-        except:
-            pass
+        # Twitter has many transient foibles; never let a post failure break
+        # the update run — but log it so a broken integration is visible
+        # instead of silently posting nothing for weeks.
+        except Exception:
+            logger.exception("Failed to send tweet")
     else:
         print("Should have tweeted: " + tweet_text)
 
@@ -167,9 +195,8 @@ def send_bluesky(tweet_text):
 
             text = atproto.client_utils.TextBuilder().text(tweet_text)
             client.send_post(text)
-        # Except everything.
-        except:
-            pass
+        except Exception:
+            logger.exception("Failed to send Bluesky post")
     else:
         print("Should have posted on blue sky: " + tweet_text)
 
@@ -191,9 +218,8 @@ def send_bluesky_messages(messages):
             for message in messages:
                 text = atproto.client_utils.TextBuilder().text(message)
                 client.send_post(text)
-        # Except everything.
-        except:
-            pass
+        except Exception:
+            logger.exception("Failed to send Bluesky posts")
     else:
         for message in messages:
             print("Should have posted on blue sky: " + message)

@@ -62,7 +62,9 @@ def update_station_list():
             while not end_of_pages:
                 url = station_status_uri % (mode, page)
 
-                r = requests.get(url)
+                # Bound both connect and read so a hung TfL endpoint can't
+                # wedge the station-refresh run indefinitely.
+                r = requests.get(url, timeout=(5, 20))
                 data = r.json()
 
                 for stop_point in data.get("stopPoints", []):

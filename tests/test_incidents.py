@@ -182,6 +182,25 @@ class UtilityTests(SimpleTestCase):
             "Use the lift. Please allow extra time for your journey. <b>Thanks</b>",
         )
 
+    def test_remove_tfl_specifics_flag_fix_is_case_insensitive_and_unbounded(self):
+        # re.IGNORECASE used to be passed in the ``count`` position, so these
+        # rewrites were case-sensitive and capped at 2 replacements. Prove
+        # both are fixed, and that word-bounded "we" doesn't mangle "Crewe".
+        self.assertEqual(
+            remove_tfl_specifics("We are sorry. we will fix it."),
+            "TfL are sorry. TfL will fix it.",
+        )
+        self.assertEqual(
+            remove_tfl_specifics(
+                "member of staff, member of staff, member of staff"
+            ),
+            "member of TfL staff, member of TfL staff, member of TfL staff",
+        )
+        self.assertEqual(
+            remove_tfl_specifics("Crewe services are affected"),
+            "Crewe services are affected",
+        )
+
     def test_strip_step_free_prefix_handles_tfl_punctuation_variants(self):
         rest = "Step free access is not available between Victoria Dock Road and the footbridge due to a faulty lift."
 

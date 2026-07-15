@@ -1,0 +1,5 @@
+# Test/CI-only dependencies. Installed on top of requirements.txt.
+# The suite uses a hand-rolled conftest (tests/conftest.py), not
+# pytest-django, so plain pytest is all that's needed.
+-r requirements.txt
+pytest

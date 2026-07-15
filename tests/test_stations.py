@@ -114,7 +114,7 @@ class StationQueryTests(TestCase):
             ("national-rail", 1): {"stopPoints": [], "pageSize": 0, "total": 0},
         }
 
-        def fake_get(url):
+        def fake_get(url, **kwargs):
             mode = url.split("/Mode/")[1].split("?")[0]
             page = int(url.split("&page=")[1])
             return FakeResponse(payloads[(mode, page)])
@@ -160,7 +160,7 @@ class StationQueryTests(TestCase):
             },
         }
 
-        def fake_get(url):
+        def fake_get(url, **kwargs):
             mode = url.split("/Mode/")[1].split("?")[0]
             page = int(url.split("&page=")[1])
             return FakeResponse(payloads[(mode, page)])

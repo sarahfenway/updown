@@ -28,7 +28,6 @@ DEBUG = os.getenv("DEBUG", "").lower() == "true"
 
 ALLOWED_HOSTS = [
     "127.0.0.1",
-    "updownlondon-bayld.ondigitalocean.app",
     "updownlondon.com",
     "www.updownlondon.com",
     "updownlondon.info",
@@ -253,3 +252,36 @@ BLUESKY_USER_NAME = os.getenv("BLUESKY_USER_NAME")
 BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 
 LAST_UPDATED = None
+
+# Route our own loggers to stdout, which Fly captures into `fly logs`. Until
+# now the app had no LOGGING config, so the logger.warning/exception calls
+# guarding the TfL fetch, social posting and prediction paths went nowhere.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "simple"},
+    },
+    "root": {"handlers": ["console"], "level": "WARNING"},
+    "loggers": {
+        "incidents": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        "django": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+    },
+}
+
+# Optional error reporting. No-op unless SENTRY_DSN is set, so dev/test and
+# any deploy without the secret are unaffected. This is the only thing that
+# turns the app's many "log and carry on" failure paths into an actual alert.
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+if SENTRY_DSN:
+    import sentry_sdk
+
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        traces_sample_rate=0.0,
+        send_default_pii=False,
+        environment="production" if not DEBUG else "development",
+    )

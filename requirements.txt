@@ -9,3 +9,4 @@ atproto==0.0.55
 joblib==1.5.3
 scikit-learn==1.6.1
 whitenoise
+sentry-sdk

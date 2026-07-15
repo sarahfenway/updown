@@ -1,3 +1,5 @@
+import logging
+
 import requests
 from django.conf import settings
 from django.db import transaction
@@ -13,6 +15,8 @@ from incidents.utils import (
 )
 from incidents.sources.helpers import existing_report_lookup
 from stations.utils import find_station_from_naptan
+
+logger = logging.getLogger(__name__)
 
 
 def _is_step_free_disruption(issue):
@@ -138,5 +142,7 @@ def check():
 
     except requests.exceptions.RequestException:
         # Covers connection errors and timeouts alike — a flaky or slow
-        # TfL endpoint just means we skip this run, not crash or hang.
-        pass
+        # TfL endpoint just means we skip this run, not crash or hang. Log
+        # it (WARNING, not exception) so a prolonged TfL outage is visible
+        # instead of the site silently freezing on stale data.
+        logger.warning("TfL v1 disruption fetch failed; skipping this run", exc_info=True)

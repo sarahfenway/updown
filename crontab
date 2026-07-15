@@ -19,4 +19,4 @@
 #     gunicorn's --timeout (180s) so the cron client gives up before the
 #     worker-level timeout is ever a factor.
 
-*/5 * * * * /usr/bin/flock -n /tmp/update_incidents.lock /opt/venv/bin/python -c "import os,requests; requests.post('http://127.0.0.1:8080/functions/update_incidents', data={'key': os.environ.get('FUNCTIONS_SECRET_KEY','verysecret')}, timeout=(5, 170))"
+*/5 * * * * /usr/bin/flock -n /tmp/update_incidents.lock /opt/venv/bin/python -c "import os,requests; requests.post('http://127.0.0.1:8080/functions/update_incidents', data={'key': os.environ['FUNCTIONS_SECRET_KEY']}, timeout=(5, 170)).raise_for_status()"
