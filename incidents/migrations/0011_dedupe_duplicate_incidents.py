@@ -69,7 +69,7 @@ def dedupe_duplicate_incidents(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("incidents", "0007_mlmodel"),
+        ("incidents", "0010_remove_report_idx_station_id"),
     ]
 
     operations = [
