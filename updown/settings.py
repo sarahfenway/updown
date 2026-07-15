@@ -12,6 +12,8 @@ https://docs.djangoproject.com/en/4.1/ref/settings/
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,6 +53,24 @@ CSRF_TRUSTED_ORIGINS = [
 
 # Fly's edge terminates TLS and forwards via this header.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# Production hardening. Only enabled when DEBUG is off so local HTTP dev and
+# the test client (which speak plain HTTP) aren't force-redirected or handed
+# secure-only cookies they can't send back. /admin is on the public internet,
+# so these matter.
+if not DEBUG:
+    # Fly already forces HTTPS at the edge; this is belt-and-suspenders and
+    # relies on SECURE_PROXY_SSL_HEADER above to detect the terminated TLS.
+    SECURE_SSL_REDIRECT = True
+    # One year HSTS. Start smaller (e.g. 3600) if you're not ready to commit
+    # every served hostname to HTTPS, then ramp up.
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = "same-origin"
 
 
 # Application definition
@@ -209,7 +229,20 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 TFL_API_ID = os.getenv("TFL_API_ID")
 TFL_API_KEY = os.getenv("TFL_API_KEY")
 
-FUNCTIONS_SECRET_KEY = os.getenv("FUNCTIONS_SECRET_KEY", "verysecret")
+# Authenticates the update/upload/training endpoints, one of which
+# ultimately joblib.loads (i.e. unpickles) an uploaded model — so a weak or
+# defaulted value is close to remote code execution. Never fall back to a
+# committed literal in production: require the env var and fail the boot if
+# it is missing. The dev/test fallback only applies under DEBUG.
+FUNCTIONS_SECRET_KEY = os.getenv("FUNCTIONS_SECRET_KEY")
+if not FUNCTIONS_SECRET_KEY:
+    if DEBUG:
+        FUNCTIONS_SECRET_KEY = "verysecret"
+    else:
+        raise ImproperlyConfigured(
+            "FUNCTIONS_SECRET_KEY must be set — it authenticates the "
+            "update_incidents, upload_model and training-data endpoints."
+        )
 
 TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")

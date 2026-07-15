@@ -1,3 +1,4 @@
+import hmac
 import os
 from datetime import datetime
 from datetime import timedelta
@@ -34,6 +35,63 @@ from incidents.ml import (
 )
 from incidents.text_features import normalise_incident_text
 from stations.models import Station
+
+def _valid_functions_key(provided):
+    """Constant-time check of a request's secret against the configured key.
+
+    ``==`` on secrets leaks length and prefix through timing; the endpoints
+    guarded by this key can trigger a model reload or an unpickle, so the
+    comparison is worth doing right.
+    """
+    if not provided:
+        return False
+    return hmac.compare_digest(str(provided), settings.FUNCTIONS_SECRET_KEY)
+
+
+# feature_version values ml.py knows how to serve. Reject anything else at
+# upload time rather than letting predictions silently break at runtime.
+SUPPORTED_FEATURE_VERSIONS = frozenset({1, 2, 3})
+
+
+def _validate_model_payload(payload):
+    """Return an error string if ``payload`` isn't a usable model, else None.
+
+    This runs a real smoke prediction so a corrupt or incompatible upload is
+    rejected with a 400 instead of quietly bricking every prediction (the
+    runtime swallows load/predict errors and returns "no prediction").
+    NOTE: joblib.load has already unpickled ``payload`` by the time we get
+    here — this validates fitness for purpose, it is not a security boundary.
+    """
+    if not isinstance(payload, dict) or "model" not in payload:
+        return "Model payload must be a dict containing a 'model' key"
+
+    model = payload["model"]
+    if not hasattr(model, "predict_proba"):
+        return "Model object has no predict_proba()"
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return "Model payload is missing a metadata dict"
+    if metadata.get("feature_version") not in SUPPORTED_FEATURE_VERSIONS:
+        return (
+            "Unsupported feature_version "
+            f"{metadata.get('feature_version')!r} (supported: "
+            f"{sorted(SUPPORTED_FEATURE_VERSIONS)})"
+        )
+
+    feature_names = getattr(model, "feature_names_in_", None)
+    if feature_names is None:
+        return "Model is missing feature_names_in_"
+
+    try:
+        import numpy as np
+
+        model.predict_proba(np.zeros((1, len(feature_names)), dtype=float))
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"Smoke prediction failed: {exc}"
+
+    return None
+
 
 PREDICTION_POLICY_WINDOW_DAYS = 30
 PREDICTION_POLICY_FALLBACK_WINDOW_DAYS = (90, 180)
@@ -1284,7 +1342,7 @@ def alexa(request):
 @method_decorator(csrf_exempt, name="dispatch")
 class UpdateIncidentsView(View):
     def post(self, request, *args, **kwargs):
-        if request.POST.get("key") == settings.FUNCTIONS_SECRET_KEY:
+        if _valid_functions_key(request.POST.get("key")):
             call_command("update_incidents", timing=True)
             return HttpResponse(status=204)
         return HttpResponseNotFound()
@@ -1294,8 +1352,7 @@ def api_training_data(request):
     import heapq
     import json
 
-    key = request.GET.get("key")
-    if key != settings.FUNCTIONS_SECRET_KEY:
+    if not _valid_functions_key(request.GET.get("key")):
         return HttpResponseNotFound()
 
     base_qs = Incident.objects.filter(resolved=True, end_time__isnull=False)
@@ -1428,8 +1485,14 @@ def api_training_data(request):
 @method_decorator(csrf_exempt, name="dispatch")
 class UploadModelView(View):
     def post(self, request, *args, **kwargs):
-        key = request.POST.get("key")
-        if key != settings.FUNCTIONS_SECRET_KEY:
+        # SECURITY: the bytes below are ultimately joblib.loaded (unpickled)
+        # by the prediction path, which can execute arbitrary code. This
+        # secret is therefore the whole trust boundary — it must be strong
+        # (settings.py refuses to boot production without it) and compared in
+        # constant time. The current upload workflow (ml/train.py) POSTs here
+        # over the public URL, so we can't restrict this to a private network
+        # without changing that; keep the key secret and rotate it if leaked.
+        if not _valid_functions_key(request.POST.get("key")):
             return HttpResponseNotFound()
 
         model_file = request.FILES.get("model")
@@ -1441,12 +1504,31 @@ class UploadModelView(View):
             return JsonResponse({"error": "Model file too large"}, status=400)
 
         # Read the whole upload into memory — capped at 10 MB above so this
-        # is safe — and stash it in a new MLModel row. We keep historic rows
-        # around rather than overwriting, so rollbacks are trivial: just
-        # delete the bad row and _load_model() picks up the previous one.
+        # is safe — validate it actually loads and predicts, then stash it in
+        # a new MLModel row. We keep historic rows around rather than
+        # overwriting, so rollbacks are trivial: just delete the bad row and
+        # _load_model() picks up the previous one.
         from incidents.models import MLModel
 
         raw = b"".join(model_file.chunks())
+
+        # Reject a corrupt or incompatible model here, so a bad upload can't
+        # silently disable predictions site-wide until someone notices.
+        import io
+
+        import joblib
+
+        try:
+            candidate = joblib.load(io.BytesIO(raw))
+        except Exception as exc:
+            return JsonResponse(
+                {"error": f"Uploaded file is not a loadable joblib model: {exc}"},
+                status=400,
+            )
+        problem = _validate_model_payload(candidate)
+        if problem:
+            return JsonResponse({"error": problem}, status=400)
+
         MLModel.objects.create(data=raw, size_bytes=len(raw))
 
         # Prune: keep the last 5 uploads, drop the rest.

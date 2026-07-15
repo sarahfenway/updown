@@ -2303,3 +2303,79 @@ class AdminPerfTests(StationFactoryMixin, TestCase):
         self.create_report(parent)
         paginator2 = CachedCountPaginator(Report.objects.all(), 50)
         self.assertEqual(paginator2.count, 4)
+
+
+class SecurityTests(StationFactoryMixin, TestCase):
+    def _model_bytes(self, feature_version=3, as_dict=True, with_model=True):
+        import io
+
+        import joblib
+        import numpy as np
+        from sklearn.tree import DecisionTreeClassifier
+
+        X = np.array([[0.0, 0, 0], [1, 1, 1], [0, 1, 0], [1, 0, 1]])
+        y = np.array([0, 1, 2, 8])
+        clf = DecisionTreeClassifier(random_state=0).fit(X, y)
+        clf.feature_names_in_ = np.array(["a", "b", "c"], dtype=object)
+
+        payload = {
+            "model": clf,
+            "vectorizer": None,
+            "historical_baselines": None,
+            "metadata": {"feature_version": feature_version},
+        }
+        if not with_model:
+            payload.pop("model")
+        obj = payload if as_dict else clf
+        buf = io.BytesIO()
+        joblib.dump(obj, buf)
+        return buf.getvalue()
+
+    def _upload(self, raw, key="secret"):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        return self.client.post(
+            "/functions/upload_model",
+            {"key": key, "model": SimpleUploadedFile("m.joblib", raw)},
+        )
+
+    @override_settings(FUNCTIONS_SECRET_KEY="secret")
+    def test_upload_model_rejects_wrong_key_before_reading(self):
+        response = self._upload(self._model_bytes(), key="wrong")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(MLModel.objects.count(), 0)
+
+    @override_settings(FUNCTIONS_SECRET_KEY="secret")
+    def test_upload_model_rejects_unloadable_bytes(self):
+        response = self._upload(b"definitely not a joblib file")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(MLModel.objects.count(), 0)
+
+    @override_settings(FUNCTIONS_SECRET_KEY="secret")
+    def test_upload_model_rejects_unsupported_feature_version(self):
+        response = self._upload(self._model_bytes(feature_version=99))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(MLModel.objects.count(), 0)
+
+    @override_settings(FUNCTIONS_SECRET_KEY="secret")
+    def test_upload_model_rejects_non_dict_payload(self):
+        response = self._upload(self._model_bytes(as_dict=False))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(MLModel.objects.count(), 0)
+
+    @override_settings(FUNCTIONS_SECRET_KEY="secret")
+    def test_upload_model_accepts_valid_model(self):
+        with patch("incidents.views.predict_duration") as pred:
+            pred.cache_clear = MagicMock()
+            response = self._upload(self._model_bytes())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(MLModel.objects.count(), 1)
+
+    def test_valid_functions_key_is_constant_time_and_rejects_blank(self):
+        from incidents.views import _valid_functions_key
+
+        with override_settings(FUNCTIONS_SECRET_KEY="secret"):
+            self.assertTrue(_valid_functions_key("secret"))
+            self.assertFalse(_valid_functions_key("wrong"))
+            self.assertFalse(_valid_functions_key(""))
+            self.assertFalse(_valid_functions_key(None))
