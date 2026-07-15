@@ -635,7 +635,13 @@ def train_model(df, feature_cols):
     model.fit(X, y, sample_weight=sample_weights)
 
     historical_baselines = build_historical_baselines(df)
-    return model, historical_baselines
+    cv_metrics = {
+        "mean_resolved_by_bound": mean_exact,
+        "mean_resolved_by_bound_grace": mean_boundary,
+        "mean_within_one_block": mean_within,
+        "n_splits": tscv.n_splits,
+    }
+    return model, historical_baselines, cv_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -672,9 +678,15 @@ def upload_model(model, vectorizer, historical_baselines, upload_url, key):
 
 
 def calibration_report(df):
-    """Compare stored predictions to actuals using block accuracy."""
+    """Compare stored predictions to actuals using block accuracy.
+
+    Returns (resolved_by_bound_rate, n_with_predictions) describing how the
+    *incumbent* model has actually done on recently-resolved incidents, so a
+    scheduled retrain can refuse to ship a model that regresses against it.
+    Returns (None, 0) when there is nothing to compare against.
+    """
     if "estimated_duration_minutes" not in df.columns:
-        return
+        return None, 0
 
     df = df.copy()
     df["start_time_dt"] = pd.to_datetime(
@@ -691,7 +703,7 @@ def calibration_report(df):
 
     if n_with == 0:
         print("  No previous predictions to evaluate.")
-        return
+        return None, 0
 
     sub = df[has_prediction].copy()
     sub["predicted_end"] = sub["start_time_dt"] + pd.to_timedelta(
@@ -748,6 +760,8 @@ def calibration_report(df):
             f"{net_acc * 100:.1f}% within {int(PREDICTION_BOUNDARY_GRACE.total_seconds() / 60)}m"
         )
 
+    return float(close_enough), int(n_with)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -773,14 +787,80 @@ def main():
         required=True,
         help="Functions secret key for API authentication",
     )
+    parser.add_argument(
+        "--min-boundary-accuracy",
+        type=float,
+        default=0.0,
+        help=(
+            "Refuse to upload if the cross-validated 'resolved by bound "
+            "(+grace)' accuracy is below this fraction (0-1). Lets a "
+            "scheduled retrain gate on quality so a regressed model never "
+            "auto-ships. Default 0 (no gate)."
+        ),
+    )
+    parser.add_argument(
+        "--max-regression",
+        type=float,
+        default=0.05,
+        help=(
+            "Refuse to upload if the new model's cross-validated boundary "
+            "accuracy is more than this fraction below the incumbent model's "
+            "recent live accuracy (from the calibration report). Guards "
+            "against a scheduled retrain silently shipping a worse model. "
+            "Set to 1.0 to disable. Default 0.05."
+        ),
+    )
+    parser.add_argument(
+        "--min-calibration-samples",
+        type=int,
+        default=30,
+        help=(
+            "Only apply the no-regression gate when the incumbent has at "
+            "least this many scored predictions (below it the comparison is "
+            "too noisy). Default 30."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Train and report metrics but do not upload.",
+    )
     args = parser.parse_args()
 
     df = fetch_training_data(args.api_url, args.key)
-    calibration_report(df)
+    incumbent_accuracy, incumbent_n = calibration_report(df)
     df, feature_cols, vectorizer = prepare_features(df)
 
     print(f"\nTraining on {len(df)} incidents with {len(feature_cols)} features...")
-    model, historical_baselines = train_model(df, feature_cols)
+    model, historical_baselines, cv_metrics = train_model(df, feature_cols)
+
+    boundary_accuracy = cv_metrics["mean_resolved_by_bound_grace"]
+    if boundary_accuracy < args.min_boundary_accuracy:
+        print(
+            f"\nABORTING UPLOAD: cross-validated boundary accuracy "
+            f"{boundary_accuracy * 100:.1f}% is below the required "
+            f"{args.min_boundary_accuracy * 100:.1f}%. The current model is "
+            f"left in place."
+        )
+        sys.exit(2)
+
+    if (
+        incumbent_accuracy is not None
+        and incumbent_n >= args.min_calibration_samples
+        and boundary_accuracy < incumbent_accuracy - args.max_regression
+    ):
+        print(
+            f"\nABORTING UPLOAD: new model's cross-validated boundary "
+            f"accuracy {boundary_accuracy * 100:.1f}% regresses more than "
+            f"{args.max_regression * 100:.1f}% below the incumbent's recent "
+            f"{incumbent_accuracy * 100:.1f}% (n={incumbent_n}). The current "
+            f"model is left in place."
+        )
+        sys.exit(3)
+
+    if args.dry_run:
+        print("\n--dry-run: trained and validated, skipping upload.")
+        return
 
     upload_model(
         model,
