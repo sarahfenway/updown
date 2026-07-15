@@ -1,6 +1,7 @@
 import arrow
 import csv
 import gzip
+import importlib
 import json
 import os
 import tempfile
@@ -35,6 +36,7 @@ from incidents.utils import (
     get_last_updated,
     parse_date,
     remove_tfl_specifics,
+    strip_step_free_prefix,
     send_bluesky,
     send_bluesky_messages,
     send_tweet,
@@ -179,6 +181,26 @@ class UtilityTests(SimpleTestCase):
             ),
             "Use the lift. Please allow extra time for your journey. <b>Thanks</b>",
         )
+
+    def test_strip_step_free_prefix_handles_tfl_punctuation_variants(self):
+        rest = "Step free access is not available between Victoria Dock Road and the footbridge due to a faulty lift."
+
+        for prefix in (
+            "No Step Free Access - ",
+            "No Step Free Access- ",
+            "No Step Free Access -",
+            "No Step Free Access: ",
+            "No step free Access - ",
+            # TfL sometimes doubles the prefix (seen at Chadwell Heath
+            # and Imperial Wharf).
+            "No Step Free Access - No Step Free Access - ",
+        ):
+            self.assertEqual(strip_step_free_prefix(prefix + rest), rest)
+
+        # A sentence that merely *starts* with the phrase must survive:
+        # the separator is what marks it as a prefix.
+        sentence = "No step free access between the National Rail concourse and the eastbound Circle line due to a faulty lift."
+        self.assertEqual(strip_step_free_prefix(sentence), sentence)
 
     def test_parse_date_and_find_dates_cover_relative_and_multi_day_formats(self):
         with patch(
@@ -414,6 +436,39 @@ class SourceTests(StationFactoryMixin, TestCase):
         self.assertFalse(existing.resolved)
         self.assertIsNone(existing.end_time)
 
+    def test_tflapiv1_collapses_prefix_punctuation_variants_into_one_report(self):
+        # TfL publishes the same disruption twice, differing only in the
+        # prefix punctuation ("Access - " vs "Access- "), as seen at
+        # Royal Victoria. Both entries must normalise to a single report.
+        station = self.create_child_station(
+            self.create_parent_station("Royal Victoria")
+        )
+        rest = (
+            "Step free access is not available between Victoria Dock Road and "
+            "the footbridge due to a faulty lift. For trains to Beckton use "
+            "the entrance on Victoria Dock Rd."
+        )
+        payload = [
+            {
+                "description": f"Royal Victoria: No Step Free Access - {rest}",
+                "atcoCode": station.naptan_id,
+                "appearance": "RealTime",
+                "additionalInformation": "",
+            },
+            {
+                "description": f"Royal Victoria: No Step Free Access- {rest}",
+                "atcoCode": station.naptan_id,
+                "appearance": "RealTime",
+                "additionalInformation": "",
+            },
+        ]
+
+        with patch.object(tflapiv1.requests, "get", return_value=FakeResponse(payload)):
+            tflapiv1.check()
+
+        report = Report.objects.get(source=Report.SOURCE_TFLAPI_V1)
+        self.assertEqual(report.text, rest)
+
     def test_tflapiv1_connection_error_leaves_existing_reports_untouched(self):
         station = self.create_child_station(self.create_parent_station("Paddington"))
         existing = self.create_report(
@@ -580,6 +635,45 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         send_tweet_mock.assert_not_called()
         send_bluesky_messages_mock.assert_not_called()
 
+    def test_consolidate_matches_long_near_identical_texts_in_both_directions(self):
+        # Regression: with SequenceMatcher's default autojunk, these two
+        # real Royal Victoria texts (>=200 chars) had asymmetric ratios —
+        # 0.95 one way, 0.08 the other — so the stripped-text report
+        # never matched the prefixed-text incident and consolidation
+        # created (and announced) a brand-new duplicate incident on
+        # every single run.
+        parent = self.create_parent_station("Royal Victoria")
+        stripped = (
+            "Step free access is not available between Victoria Dock Road and "
+            "the footbridge due to a faulty lift. For trains to Beckton use "
+            "the entrance on Victoria Dock Rd. For trains to Tower Gateway "
+            "enter via Seagull Lane"
+        )
+        prefixed = "No Step Free Access- " + stripped
+
+        prefixed_report = self.create_report(
+            parent, text=prefixed, start_time=timezone.now() - timedelta(hours=2)
+        )
+        stripped_report = self.create_report(
+            parent, text=stripped, start_time=timezone.now() - timedelta(hours=1)
+        )
+        incident = self.create_incident(
+            parent,
+            reports=[prefixed_report],
+            text=prefixed,
+            start_time=prefixed_report.start_time,
+        )
+
+        posts = consolidate_incidents()
+        # A second run must be just as stable as the first.
+        posts += consolidate_incidents()
+
+        self.assertEqual(Incident.objects.count(), 1)
+        self.assertEqual(posts, [])
+        incident.refresh_from_db()
+        self.assertEqual(incident.reports.count(), 2)
+        self.assertIn(stripped_report, incident.reports.all())
+
     def test_consolidate_resolves_expired_single_user_reports_silently(self):
         parent = self.create_parent_station("Oxford Circus")
         report = self.create_report(
@@ -664,6 +758,85 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         self.assertEqual(incident.prediction_confidence, 0.8)
         send_tweet_mock.assert_not_called()
         send_bluesky_messages_mock.assert_not_called()
+
+
+class DedupeMigrationTests(StationFactoryMixin, TestCase):
+    def _run_dedupe(self):
+        from django.apps import apps as global_apps
+
+        module = importlib.import_module(
+            "incidents.migrations.0008_dedupe_duplicate_incidents"
+        )
+        module.dedupe_duplicate_incidents(global_apps, None)
+
+    def test_dedupe_collapses_open_duplicates_and_keeps_reports(self):
+        parent = self.create_parent_station("Royal Victoria")
+        report_a = self.create_report(parent, text="variant a")
+        report_b = self.create_report(parent, text="variant b")
+
+        start = timezone.now() - timedelta(hours=6)
+        # The loop stamped every duplicate with the same text; start_time
+        # varied between two values, so dedupe must ignore it for open rows.
+        older = self.create_incident(
+            parent, reports=[report_a], text="dupe text", start_time=start
+        )
+        middle = self.create_incident(
+            parent,
+            reports=[report_a],
+            text="dupe text",
+            start_time=start + timedelta(minutes=6),
+        )
+        keeper = self.create_incident(
+            parent, reports=[report_b], text="dupe text", start_time=start
+        )
+        # A different open incident at the same station must survive.
+        unrelated = self.create_incident(parent, text="something else entirely")
+
+        self._run_dedupe()
+
+        remaining = Incident.objects.filter(resolved=False)
+        self.assertEqual(
+            set(remaining.values_list("id", flat=True)), {keeper.id, unrelated.id}
+        )
+        # The deleted duplicates' report links were folded into the keeper.
+        self.assertEqual(
+            set(keeper.reports.all()), {report_a, report_b}
+        )
+
+        # Idempotent: a second run changes nothing.
+        self._run_dedupe()
+        self.assertEqual(Incident.objects.count(), 2)
+
+    def test_dedupe_leaves_legitimate_resolved_recurrences_alone(self):
+        parent = self.create_parent_station("Kew Gardens")
+        start = timezone.now() - timedelta(days=30)
+        end = start + timedelta(hours=8)
+
+        # Bug artifacts: identical text AND identical start_time.
+        artifact_kwargs = {
+            "text": "faulty lift",
+            "start_time": start,
+            "end_time": end,
+            "resolved": True,
+        }
+        self.create_incident(parent, **artifact_kwargs)
+        artifact_keeper = self.create_incident(parent, **artifact_kwargs)
+
+        # Legitimate recurrence: same text, different start_time.
+        recurrence = self.create_incident(
+            parent,
+            text="faulty lift",
+            start_time=start + timedelta(days=7),
+            end_time=end + timedelta(days=7),
+            resolved=True,
+        )
+
+        self._run_dedupe()
+
+        self.assertEqual(
+            set(Incident.objects.values_list("id", flat=True)),
+            {artifact_keeper.id, recurrence.id},
+        )
 
 
 class PredictionFeatureTests(StationFactoryMixin, TestCase):

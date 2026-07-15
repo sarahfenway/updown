@@ -5,7 +5,7 @@ from django.utils import timezone
 
 from incidents.models import Report
 from incidents.sources.helpers import existing_report_lookup
-from incidents.utils import remove_tfl_specifics
+from incidents.utils import remove_tfl_specifics, strip_step_free_prefix
 from stations.utils import find_station_from_naptan
 
 
@@ -34,9 +34,7 @@ def check():
 
                         first_colon = issue["message"].find(":")
                         status_details = issue["message"][first_colon + 1 :].strip()
-                        status_details = status_details.replace(
-                            "No Step Free Access - ", ""
-                        )
+                        status_details = strip_step_free_prefix(status_details)
                         status_details = remove_tfl_specifics(status_details)
 
                         key = (

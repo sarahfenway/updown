@@ -67,8 +67,18 @@ def consolidate_incidents():
 
             incident = None
             for item in incidents:
-                # if the same report station and similar text, then same incident
-                if SequenceMatcher(None, item.text, report.text).ratio() > 0.9:
+                # if the same report station and similar text, then same incident.
+                # autojunk must be off: for texts >=200 chars the default
+                # heuristic makes the ratio asymmetric and near-zero for
+                # near-identical strings (0.08 one way, 0.95 the other),
+                # which made this loop create a duplicate incident on
+                # every run instead of matching the existing one.
+                if (
+                    SequenceMatcher(
+                        None, item.text, report.text, autojunk=False
+                    ).ratio()
+                    > 0.9
+                ):
                     incident = item
                     break
 

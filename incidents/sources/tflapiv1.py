@@ -9,6 +9,7 @@ from incidents.utils import (
     find_dates,
     fix_additional_info_grammar,
     remove_tfl_specifics,
+    strip_step_free_prefix,
 )
 from incidents.sources.helpers import existing_report_lookup
 from stations.utils import find_station_from_naptan
@@ -39,7 +40,7 @@ def _parse_tfl_datetime(value):
 def _report_fields(issue, station):
     first_colon = issue["description"].find(":")
     status_details = issue["description"][first_colon + 1 :].strip()
-    status_details = status_details.replace("No Step Free Access - ", "")
+    status_details = strip_step_free_prefix(status_details)
     status_details = remove_tfl_specifics(status_details)
 
     if issue.get("additionalInformation"):

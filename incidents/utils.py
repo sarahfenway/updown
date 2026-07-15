@@ -16,6 +16,25 @@ TFL_NAME_CORRECTIONS = {
     "London Liverpool Street": "Liverpool Street",
 }
 
+# TfL spells this prefix inconsistently across otherwise-identical entries:
+# "No Step Free Access - ", "No Step Free Access- ", "No Step Free Access: ",
+# "No step free Access - ", and occasionally doubled. The separator is
+# required so that real sentences starting "No step free access between..."
+# are left alone.
+STEP_FREE_PREFIX = re.compile(
+    r"^(?:no step free access\s*[-–—:]+\s*)+", re.IGNORECASE
+)
+
+
+def strip_step_free_prefix(text):
+    """Remove TfL's "No Step Free Access" prefix, however it is punctuated.
+
+    An exact-string replace let spelling variants through as distinct
+    report texts for the same disruption, which is what fed the
+    duplicate-incident loop in consolidate_incidents.
+    """
+    return STEP_FREE_PREFIX.sub("", text)
+
 
 def remove_tfl_specifics(text):
     # We always reset this just in case there is an update
