@@ -5,10 +5,13 @@
 #      final image doesn't carry pip's cache or apt build tools.
 #   2. ``runtime`` is a slim base with just the venv + the source tree.
 #
-# We use python:3.10-slim to match the local dev environment. Switch in
-# lockstep when bumping Python locally.
+# We use python:3.14-slim to match the local dev environment. Switch in
+# lockstep when bumping Python locally. Note: 3.14 forced scikit-learn to
+# 1.9.x (no 3.14 wheels below it), which cannot load a model pickled by the
+# old 1.6.1 — the model must be retrained (see the retrain workflow) after a
+# deploy that crosses this boundary.
 
-ARG PYTHON_VERSION=3.10
+ARG PYTHON_VERSION=3.14
 
 # ---------------------------------------------------------------------------
 # Builder

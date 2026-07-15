@@ -42,8 +42,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          # sklearn is pinned to 1.6.1 in ml/requirements.txt; 3.11 has wheels.
-          python-version: "3.11"
+          # Match the runtime (Dockerfile / requirements.txt) so the trained
+          # model is pickled by the same scikit-learn the app will load it with.
+          python-version: "3.14"
       - name: Install training dependencies
         run: |
           python -m pip install --upgrade pip
