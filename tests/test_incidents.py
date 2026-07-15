@@ -765,7 +765,7 @@ class DedupeMigrationTests(StationFactoryMixin, TestCase):
         from django.apps import apps as global_apps
 
         module = importlib.import_module(
-            "incidents.migrations.0008_dedupe_duplicate_incidents"
+            "incidents.migrations.0011_dedupe_duplicate_incidents"
         )
         module.dedupe_duplicate_incidents(global_apps, None)
 
@@ -2234,3 +2234,72 @@ class MaintenanceSnapshotTests(StationFactoryMixin, TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertNotIn(b"stale snapshot", response.content)
             self.assertFalse(os.path.exists(path))
+
+
+class AdminPerfTests(StationFactoryMixin, TestCase):
+    def setUp(self):
+        from django.contrib.auth.models import User
+
+        User.objects.create_superuser("admin", "admin@example.com", "password")
+        self.client.force_login(User.objects.get(username="admin"))
+
+    def test_incident_change_form_reports_are_bounded_queries(self):
+        parent = self.create_parent_station("Canary Wharf")
+        incident = self.create_incident(parent, text="Lift outage")
+        for _ in range(25):
+            incident.reports.add(self.create_report(parent))
+        incident.report_count = 25
+        incident.save(update_fields=["report_count"])
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(
+                f"/admin/incidents/incident/{incident.pk}/change/"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # The old through-table inline issued ~2 queries per linked report
+        # (50+ for this incident). The readonly link list is a single bounded
+        # fetch, so the whole page stays well under that regardless of report
+        # count.
+        self.assertLess(len(queries), 30)
+        self.assertContains(response, "25 report(s)")
+
+    def test_report_changelist_uses_cached_count_paginator(self):
+        from incidents.admin import CachedCountPaginator, ReportAdmin
+
+        self.assertIs(ReportAdmin.paginator, CachedCountPaginator)
+
+        parent = self.create_parent_station("Stratford")
+        for _ in range(3):
+            self.create_report(parent)
+
+        response = self.client.get("/admin/incidents/report/")
+        self.assertEqual(response.status_code, 200)
+
+    @override_settings(
+        CACHES={
+            "default": {
+                "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+                "LOCATION": "admin-paginator-test",
+            }
+        }
+    )
+    def test_cached_count_paginator_caches_the_count(self):
+        from django.core.cache import cache
+
+        from incidents.admin import CachedCountPaginator
+
+        parent = self.create_parent_station("Ealing Broadway")
+        for _ in range(4):
+            self.create_report(parent)
+
+        cache.clear()
+        qs = Report.objects.all()
+        paginator = CachedCountPaginator(qs, 50)
+        self.assertEqual(paginator.count, 4)
+
+        # A second paginator over an equivalent query reads the cached value
+        # even after more rows land, proving the count is served from cache.
+        self.create_report(parent)
+        paginator2 = CachedCountPaginator(Report.objects.all(), 50)
+        self.assertEqual(paginator2.count, 4)

@@ -119,16 +119,23 @@ def consolidate_incidents():
 
                 pending_posts.append(tweet)
             else:
-                # Update the existing incident
+                # Update the existing incident, but only write the row when
+                # something actually changed. In steady state the TfL text is
+                # byte-identical run after run, so an unconditional save() was
+                # a full-row UPDATE per unresolved report per 5-minute tick —
+                # pointless WAL frames shipped to B2 and time held inside the
+                # single-writer transaction that admin writes wait behind.
                 text_changed = incident.text != report.text
-                incident.information = report.information
-                incident.text = report.text
-                incident.start_time = (
-                    report.start_time
-                    if report.start_time < incident.start_time
-                    else incident.start_time
-                )
-                incident.save()
+                info_changed = incident.information != report.information
+                start_earlier = report.start_time < incident.start_time
+                if text_changed or info_changed or start_earlier:
+                    incident.information = report.information
+                    incident.text = report.text
+                    if start_earlier:
+                        incident.start_time = report.start_time
+                    incident.save(
+                        update_fields=["information", "text", "start_time"]
+                    )
                 if text_changed:
                     should_predict = True
 
