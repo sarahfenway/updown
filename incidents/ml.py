@@ -478,6 +478,35 @@ def predict_duration(incident):
         return None, None
 
 
+def predict_remaining_duration(incident, now):
+    """Conditional re-prediction for an incident still open past its bound.
+
+    Same model, but we condition on the fact that the incident is *still
+    open* at ``now``: every block offset the incident has already lived
+    through is impossible, so we zero that probability mass, renormalise,
+    and re-walk the cumulative distribution to the coverage target. The
+    result is P(resolved by X | not resolved after the elapsed time) — a
+    fresh, later "fixed by" bound — or ``(None, None)`` when the surviving
+    mass is entirely in the open-ended tail class (no honest bound left).
+    Display-only: the stored ``estimated_duration`` is never touched, so the
+    accuracy metric keeps scoring the original promise.
+    """
+    try:
+        result = _incident_offset_probs(incident)
+        if result is None:
+            return None, None
+        model, probs = result
+        start_idx = block_index(incident.start_time)
+        floor_offset = max(0, block_index(now) - start_idx)
+        return _decode_offset_bound(model, probs, incident, floor_offset)
+    except Exception:
+        logger.exception(
+            "predict_remaining_duration failed for incident %s",
+            getattr(incident, "pk", None),
+        )
+        return None, None
+
+
 @lru_cache(maxsize=512)
 def _station_family_ids(station_id):
     from django.db.models import Q
@@ -502,12 +531,100 @@ def _predict_duration(incident):
     therefore represents a one-sided "fixed by" bound, and ``confidence``
     is the cumulative probability mass under that bound.
     """
-    data = _load_model()
-    if data is None:
+    result = _incident_offset_probs(incident)
+    if result is None:
+        return None, None
+    model, probs = result
+    return _decode_offset_bound(model, probs, incident, floor_offset=0)
+
+
+def _decode_offset_bound(model, probs, incident, floor_offset=0):
+    """Turn a block-offset probability vector into a (duration, confidence).
+
+    ``floor_offset`` zeroes the probability mass for offsets the incident
+    has already lived past (used for conditional re-prediction); 0 means the
+    ordinary at-creation prediction. Returns (None, None) when no honest
+    finite bound survives — either nothing is left, or the coverage target
+    is only reached at the open-ended ``MAX_OFFSET_CLASS`` tail (which means
+    "at least this long, unbounded" and must not be shown as a concrete
+    "fixed by" time).
+    """
+    import numpy as np
+
+    order = np.argsort(model.classes_)
+    sorted_offsets = np.asarray(model.classes_)[order]
+    sorted_probs = np.asarray(probs)[order]
+
+    if floor_offset > 0:
+        keep = sorted_offsets >= floor_offset
+        sorted_offsets = sorted_offsets[keep]
+        sorted_probs = sorted_probs[keep]
+        if sorted_offsets.size == 0:
+            return None, None
+        total = sorted_probs.sum()
+        if total <= 0:
+            return None, None
+        sorted_probs = sorted_probs / total
+
+    cumulative = np.cumsum(sorted_probs)
+    target_pos = int(np.searchsorted(cumulative, PREDICTION_COVERAGE_TARGET))
+    if target_pos >= len(sorted_offsets):
+        target_pos = len(sorted_offsets) - 1
+    pred_offset = int(sorted_offsets[target_pos])
+    confidence = float(cumulative[target_pos])
+    confidence = max(0.05, min(0.95, confidence))
+
+    # The top class is open-ended ("resolves >= MAX_OFFSET_CLASS blocks
+    # out"), so decoding it to the end of that one block would promise a
+    # concrete "fixed by ~2 days" that the data doesn't support. When the
+    # coverage target only lands there, we have no honest bound.
+    if pred_offset >= MAX_OFFSET_CLASS:
         return None, None
 
+    start_idx = block_index(incident.start_time)
+    return _offset_to_duration(start_idx, pred_offset, incident.start_time, confidence)
+
+
+def _offset_to_duration(start_idx, pred_offset, start_time, confidence):
+    from django.utils import timezone as tz_module
+
+    # Decode offset → the end of that block. block_start_end returns naive
+    # datetimes in local (London) time, so attach the project's configured
+    # timezone before doing arithmetic with the (UTC-stored) start_time. We
+    # land one second inside the block so block_index() of the predicted end
+    # resolves to this block, not the next one (end boundaries are exclusive).
+    end_idx = start_idx + pred_offset
+    _, block_end_naive = block_start_end(end_idx)
+    local_tz = tz_module.get_default_timezone()
+    block_end_dt = block_end_naive.replace(tzinfo=local_tz)
+    end_time = block_end_dt - timedelta(seconds=1)
+
+    # Guarantee strictly positive duration of at least 5 minutes.
+    min_end = start_time + timedelta(minutes=5)
+    if end_time < min_end:
+        end_time = min_end
+
+    duration = end_time - start_time
+    # Clamp to 30-day ceiling like before.
+    max_duration = timedelta(days=30)
+    if duration > max_duration:
+        duration = max_duration
+
+    return duration, round(confidence, 2)
+
+
+def _incident_offset_probs(incident):
+    """Build features for ``incident`` and return (model, blended probs).
+
+    Returns None when there is no model or the incident is planned work
+    (whose duration is stated in the text, so we don't predict it).
+    """
+    data = _load_model()
+    if data is None:
+        return None
+
     if _is_planned_work(incident):
-        return None, None
+        return None
 
     model = data["model"]
     vectorizer = data.get("vectorizer")
@@ -662,46 +779,12 @@ def _predict_duration(incident):
         baseline_evidence,
         historical_baselines.get("config") if historical_baselines else None,
     )
-    # One-sided "fixed by" bound. classes_ is sorted ascending, so the
-    # cumulative sum of probs is P(resolved by the end of that block). We
-    # take the earliest block whose cumulative probability reaches the
-    # coverage target and tell the user it'll be fixed *by* then. When the
-    # model is confident this collapses to a single block; when it's unsure
-    # the bound widens automatically instead of pretending to precision.
-    order = np.argsort(model.classes_)
-    sorted_offsets = np.asarray(model.classes_)[order]
-    cumulative = np.cumsum(np.asarray(probs)[order])
-    target_pos = int(np.searchsorted(cumulative, PREDICTION_COVERAGE_TARGET))
-    if target_pos >= len(sorted_offsets):
-        target_pos = len(sorted_offsets) - 1
-    pred_offset = int(sorted_offsets[target_pos])
-    confidence = float(cumulative[target_pos])
-    confidence = max(0.05, min(0.95, confidence))
-
-    # Decode offset → the end of that block. block_start_end returns naive
-    # datetimes in local (London) time, so attach the project's configured
-    # timezone before doing arithmetic with the (UTC-stored) start_time.
-    # We land one second inside the block so block_index() of the predicted
-    # end resolves to this block, not the next one (end boundaries are
-    # exclusive).
-    end_idx = start_idx + pred_offset
-    _, block_end_naive = block_start_end(end_idx)
-    local_tz = tz_module.get_default_timezone()
-    block_end_dt = block_end_naive.replace(tzinfo=local_tz)
-    end_time = block_end_dt - timedelta(seconds=1)
-
-    # Guarantee strictly positive duration of at least 5 minutes.
-    min_end = incident.start_time + timedelta(minutes=5)
-    if end_time < min_end:
-        end_time = min_end
-
-    duration = end_time - incident.start_time
-    # Clamp to 30-day ceiling like before.
-    max_duration = timedelta(days=30)
-    if duration > max_duration:
-        duration = max_duration
-
-    return duration, round(confidence, 2)
+    # The blended probability vector over block-offset classes. classes_ is
+    # sorted ascending, so a cumulative sum is P(resolved by the end of that
+    # block). Decoding into a one-sided "fixed by" bound is done by the
+    # caller (_decode_offset_bound), which can also condition on elapsed time
+    # for the overdue re-prediction path.
+    return model, probs
 
 
 # Allow cache clearing when a new model is uploaded

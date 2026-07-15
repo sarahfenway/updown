@@ -1758,26 +1758,54 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(payload["incidents"][0]["month"], 7)
         self.assertNotIn("0343 222 1234", payload["incidents"][0]["text"])
         self.assertTrue(payload["incidents"][0]["has_faulty_lift"])
-        self.assertEqual(payload["incidents"][0]["num_reports"], 2)
+        # Causal count: only report_one (09:30) existed at the incident's
+        # 09:30 start; report_two (09:35) arrived later, so it is not counted
+        # — matching what num_reports can be at prediction time.
+        self.assertEqual(payload["incidents"][0]["num_reports"], 1)
         self.assertEqual(payload["incidents"][0]["concurrent_incidents"], 0)
         self.assertEqual(payload["incidents"][1]["concurrent_incidents"], 1)
 
-    def test_api_training_data_uses_denormalized_report_count(self):
+    def test_api_training_data_num_reports_is_causal_not_lifetime(self):
+        # num_reports must reflect only reports present at the incident's
+        # start (what's knowable at prediction time), NOT the lifetime total
+        # or the denormalized report_count (which leaked the future).
         parent = self.create_parent_station("Farringdon", naptan_id="ZFD")
+        start = datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc)
+        end = datetime(2026, 7, 1, 11, 0, tzinfo=dt_timezone.utc)
+        at_start = self.create_report(
+            parent, start_time=start, end_time=end, resolved=True
+        )
+        before_start = self.create_report(
+            parent,
+            text="Earlier report",
+            start_time=start - timedelta(minutes=10),
+            end_time=end,
+            resolved=True,
+        )
+        after_start = self.create_report(
+            parent,
+            text="Later report",
+            start_time=start + timedelta(hours=1),
+            end_time=end,
+            resolved=True,
+        )
         self.create_incident(
             parent,
             text="Faulty lift",
             resolved=True,
-            start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
-            end_time=datetime(2026, 7, 1, 11, 0, tzinfo=dt_timezone.utc),
-            report_count=7,
+            start_time=start,
+            end_time=end,
+            report_count=7,  # lifetime denorm — must be ignored
+            reports=[at_start, before_start, after_start],
         )
 
         response = self.client.get("/api/training-data/?key=verysecret")
         payload = json.loads(b"".join(response.streaming_content).decode("utf-8"))
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(payload["incidents"][0]["num_reports"], 7)
+        # Only the two reports at/before 09:30 count; the 10:30 one and the
+        # denormalized 7 are excluded.
+        self.assertEqual(payload["incidents"][0]["num_reports"], 2)
 
     def test_detail_and_api_exclude_resolved_incidents_older_than_twelve_hours(self):
         parent = self.create_parent_station("Tottenham Court Road", naptan_id="TCR")
@@ -2398,3 +2426,176 @@ class SecurityTests(StationFactoryMixin, TestCase):
             self.assertFalse(_valid_functions_key("wrong"))
             self.assertFalse(_valid_functions_key(""))
             self.assertFalse(_valid_functions_key(None))
+
+
+class RevisedPredictionTests(StationFactoryMixin, TestCase):
+    def _fake_model(self, classes):
+        class _M:
+            classes_ = np.array(classes)
+
+        return _M()
+
+    def _unsaved_incident_at(self, start):
+        parent = self.create_parent_station("RevTest")
+        return Incident(
+            station=parent,
+            text="Faulty lift",
+            information=False,
+            start_time=start,
+            resolved=False,
+        )
+
+    def test_decode_conditions_on_elapsed_and_returns_later_bound(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+        model = self._fake_model([0, 1, 2, 3, 4, 5, 6, 7, 8])
+        probs = np.zeros(9)
+        probs[0] = 0.8
+        probs[5] = 0.2
+        inc = self._unsaved_incident_at(
+            datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
+        )
+
+        dur0, conf0 = incidents_ml._decode_offset_bound(model, probs, inc, 0)
+        dur1, conf1 = incidents_ml._decode_offset_bound(model, probs, inc, 1)
+
+        # Original: 0.8 mass on offset 0 meets the 0.75 target -> early bound.
+        # Conditioned on being open past offset 0: only offset 5 remains ->
+        # a strictly later "fixed by" bound.
+        self.assertIsNotNone(dur0)
+        self.assertIsNotNone(dur1)
+        self.assertGreater(dur1, dur0)
+
+    def test_decode_returns_none_when_only_open_ended_tail_survives(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+        model = self._fake_model([0, 1, 2, 3, 4, 5, 6, 7, 8])
+        probs = np.zeros(9)
+        probs[0] = 0.8
+        probs[8] = 0.2
+        inc = self._unsaved_incident_at(
+            datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
+        )
+        # Conditioning past offset 0 leaves only the open-ended MAX class:
+        # no honest finite bound.
+        self.assertEqual(
+            incidents_ml._decode_offset_bound(model, probs, inc, 1), (None, None)
+        )
+
+    def test_decode_original_prediction_on_tail_class_is_not_shown(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+        model = self._fake_model([0, 1, 2, 3, 4, 5, 6, 7, 8])
+        probs = np.zeros(9)
+        probs[8] = 1.0
+        inc = self._unsaved_incident_at(
+            datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
+        )
+        # The 0.75 target is only reached at the open-ended tail -> (None, None),
+        # instead of a dishonest concrete "fixed by ~2 days".
+        self.assertEqual(
+            incidents_ml._decode_offset_bound(model, probs, inc, 0), (None, None)
+        )
+
+    def test_decode_returns_none_when_nothing_survives_the_floor(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+        model = self._fake_model([0, 1, 2])
+        probs = np.array([0.5, 0.3, 0.2])
+        inc = self._unsaved_incident_at(
+            datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
+        )
+        self.assertEqual(
+            incidents_ml._decode_offset_bound(model, probs, inc, 5), (None, None)
+        )
+
+    def test_refresh_revised_predictions_sets_overdue_and_clears_stale(self):
+        from incidents.management.commands.update_incidents import (
+            refresh_revised_predictions,
+        )
+
+        parent = self.create_parent_station("BankRev")
+        now = timezone.now()
+        overdue = self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=now - timedelta(hours=4),
+            estimated_duration=timedelta(hours=1),  # bound 3h ago -> overdue
+        )
+        not_overdue = self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=now - timedelta(minutes=10),
+            estimated_duration=timedelta(hours=5),  # bound in the future
+            revised_estimated_duration=timedelta(hours=9),  # stale, must clear
+            revised_prediction_confidence=0.5,
+        )
+
+        with patch(
+            "incidents.management.commands.update_incidents.predict_remaining_duration",
+            return_value=(timedelta(hours=6), 0.72),
+        ) as remaining_mock:
+            refresh_revised_predictions(now)
+
+        overdue.refresh_from_db()
+        not_overdue.refresh_from_db()
+        self.assertEqual(overdue.revised_estimated_duration, timedelta(hours=6))
+        self.assertEqual(overdue.revised_prediction_confidence, 0.72)
+        self.assertIsNone(not_overdue.revised_estimated_duration)
+        self.assertIsNone(not_overdue.revised_prediction_confidence)
+        remaining_mock.assert_called_once()
+
+    def test_prepare_incidents_displays_revised_bound_instead_of_hiding(self):
+        parent = self.create_parent_station("HolbornRev")
+        now = timezone.now()
+        incident = self.create_incident(
+            parent,
+            text="Faulty lift",
+            information=False,
+            start_time=now - timedelta(hours=4),
+            estimated_duration=timedelta(hours=1),  # original bound overdue
+            prediction_confidence=0.8,
+            revised_estimated_duration=timedelta(hours=6),  # future revised bound
+            revised_prediction_confidence=0.8,
+        )
+        policy = {
+            b: {"show_prediction": True, "count": 999, "label": "likely", "accuracy_pct": 90}
+            for b in range(0, 100, 10)
+        }
+
+        [prepared] = _prepare_incidents([incident], prediction_policy=policy, now=now)
+
+        self.assertTrue(prepared.prediction_is_revised)
+        self.assertIsNone(prepared.prediction_hidden_reason)
+        self.assertTrue(prepared.show_prediction)
+        self.assertEqual(
+            prepared.expected_end_time, incident.start_time + timedelta(hours=6)
+        )
+
+    def test_stats_reports_overdue_predictions_as_worst_case(self):
+        parent = self.create_parent_station("GreenParkRev", naptan_id="GPK")
+        now = timezone.now()
+        # One resolved, correctly-predicted incident so the headline exists.
+        self.create_incident(
+            parent,
+            text="Faulty lift",
+            resolved=True,
+            start_time=now - timedelta(days=1, hours=2),
+            end_time=now - timedelta(days=1, hours=1),
+            estimated_duration=timedelta(hours=3),
+            prediction_confidence=0.8,
+        )
+        # One open incident already past its predicted bound.
+        self.create_incident(
+            parent,
+            text="Faulty lift",
+            information=False,
+            start_time=now - timedelta(hours=6),
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.8,
+        )
+
+        response = self.client.get("/stats/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["current_prediction_overdue_count"], 1)
+        self.assertIn("prediction_accuracy_worst_case_pct", response.context)

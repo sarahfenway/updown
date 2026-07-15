@@ -687,8 +687,25 @@ def _prepare_incidents(
             reports[0].end_time if incident.is_single_user_report else None
         )
 
-        if incident.start_time and incident.estimated_duration:
-            incident.expected_end_time = incident.start_time + incident.estimated_duration
+        # For an unresolved incident that has overrun its original bound, a
+        # conditional re-prediction (revised_*) may exist. Prefer it for
+        # display so the incident shows a fresh "now expected by X" instead
+        # of a past-due time — but the original estimated_duration is what
+        # every accuracy metric scores, so it is left untouched.
+        incident.prediction_is_revised = bool(
+            not incident.resolved
+            and incident.revised_estimated_duration is not None
+            and incident.start_time
+        )
+        if incident.prediction_is_revised:
+            display_duration = incident.revised_estimated_duration
+            display_confidence = incident.revised_prediction_confidence
+        else:
+            display_duration = incident.estimated_duration
+            display_confidence = incident.prediction_confidence
+
+        if incident.start_time and display_duration:
+            incident.expected_end_time = incident.start_time + display_duration
             incident.expected_block = format_block_slot(
                 time_block_slot(incident.expected_end_time), now
             )
@@ -696,11 +713,11 @@ def _prepare_incidents(
             incident.expected_end_time = None
             incident.expected_block = None
 
-        if incident.prediction_confidence is not None:
-            incident.confidence_pct = int(incident.prediction_confidence * 100)
+        if display_confidence is not None:
+            incident.confidence_pct = int(display_confidence * 100)
         else:
             incident.confidence_pct = None
-        bucket = _prediction_confidence_bucket(incident.prediction_confidence)
+        bucket = _prediction_confidence_bucket(display_confidence)
         bucket_policy = prediction_policy.get(bucket, {}) if bucket is not None else {}
         incident.used_station_prediction_override = False
         if (
@@ -1160,6 +1177,24 @@ def _prediction_stats(since):
         for issue in current_issues
         if issue.prediction_hidden_reason == "missing_prediction"
     )
+    # Honesty: the headline hit-rate only scores *resolved* incidents, so
+    # incidents still open past their ORIGINAL predicted bound (guaranteed to
+    # have already broken the "fixed by" promise) are invisible to it until
+    # they resolve. Count them and offer a worst-case rate that assumes every
+    # one is a miss, so the figure can't silently overstate the promise.
+    current_prediction_overdue_count = sum(
+        1
+        for issue in current_issues
+        if issue.estimated_duration
+        and issue.start_time
+        and issue.start_time + issue.estimated_duration <= now
+    )
+    worst_case_denominator = count + current_prediction_overdue_count
+    prediction_accuracy_worst_case_pct = (
+        round(correct / worst_case_denominator * 100)
+        if worst_case_denominator
+        else metrics["prediction_accuracy_pct"]
+    )
     low_accuracy_diagnostics = _hidden_low_accuracy_diagnostics(current_issues, incidents)
 
     for incident in incidents:
@@ -1268,6 +1303,8 @@ def _prediction_stats(since):
             current_prediction_hidden_past_due_count
         ),
         "current_prediction_hidden_missing_count": current_prediction_hidden_missing_count,
+        "current_prediction_overdue_count": current_prediction_overdue_count,
+        "prediction_accuracy_worst_case_pct": prediction_accuracy_worst_case_pct,
         "recent_prediction_rows": recent_prediction_rows,
         "prediction_review_limit": PREDICTION_REVIEW_LIMIT,
         **low_accuracy_diagnostics,
@@ -1373,8 +1410,17 @@ def api_training_data(request):
 
     last_incident_at_station = {}
     active_end_times = []
-    report_count_subquery = (
-        Incident.reports.through.objects.filter(incident_id=OuterRef("pk"))
+    # Causal report count: only reports that existed at or before the
+    # incident's start_time. The stored ``report_count`` is the LIFETIME
+    # total, which leaks the future — longer incidents accrue more distinct
+    # report wordings, so training on it taught the model "many reports =>
+    # long" from a value it never sees live (at prediction time the count is
+    # ~1). Counting reports up to the start matches what's knowable then.
+    causal_report_count_subquery = (
+        Incident.reports.through.objects.filter(
+            incident_id=OuterRef("pk"),
+            report__start_time__lte=OuterRef("start_time"),
+        )
         .order_by()
         .values("incident_id")
         .annotate(count=Count("report_id"))
@@ -1382,8 +1428,7 @@ def api_training_data(request):
     )
     incident_rows = base_qs.annotate(
         num_reports=Coalesce(
-            "report_count",
-            Subquery(report_count_subquery, output_field=IntegerField()),
+            Subquery(causal_report_count_subquery, output_field=IntegerField()),
             Value(0),
             output_field=IntegerField(),
         )
