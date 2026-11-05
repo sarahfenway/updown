@@ -1263,7 +1263,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_prepare_incidents_only_shows_predictions_from_stronger_buckets(self):
         parent = self.create_parent_station("Waterloo")
-        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        # Relative to now so the history stays inside the prediction policy's
+        # lookback windows (30/90/180 days) whenever the suite runs.
+        base = timezone.now() - timedelta(days=25)
 
         # One-sided scoring: a prediction is correct when the incident was
         # resolved at or before the predicted "fixed by" time. "Wrong"
@@ -1473,7 +1475,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_prepare_incidents_hides_overdue_current_prediction(self):
         parent = self.create_parent_station("Bank")
-        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        # Relative to now so the history stays inside the prediction policy's
+        # lookback windows (30/90/180 days) whenever the suite runs.
+        base = timezone.now() - timedelta(days=25)
         for i in range(15):
             self.create_incident(
                 parent,
@@ -1507,7 +1511,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_prepare_incidents_uses_more_than_a_week_for_long_range_prediction(self):
         parent = self.create_parent_station("Bank")
-        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        # Relative to now so the history stays inside the prediction policy's
+        # lookback windows (30/90/180 days) whenever the suite runs.
+        base = timezone.now() - timedelta(days=25)
         for i in range(15):
             self.create_incident(
                 parent,
@@ -1541,7 +1547,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_prepare_incidents_marks_resolved_miss_as_wrong(self):
         parent = self.create_parent_station("Bank")
-        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        # Relative to now so the history stays inside the prediction policy's
+        # lookback windows (30/90/180 days) whenever the suite runs.
+        base = timezone.now() - timedelta(days=25)
         for i in range(15):
             self.create_incident(
                 parent,
@@ -1602,7 +1610,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_beta_renders_inline_status_next_to_event_time(self):
         parent = self.create_parent_station("Bank")
-        base = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        # Relative to now so the history stays inside the prediction policy's
+        # lookback windows (30/90/180 days) whenever the suite runs.
+        base = timezone.now() - timedelta(days=25)
         for i in range(15):
             self.create_incident(
                 parent,
@@ -1941,7 +1951,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_stats_includes_recent_prediction_checks_table(self):
         parent = self.create_parent_station("Green Park")
-        start_time = datetime(2026, 7, 1, 7, 0, tzinfo=dt_timezone.utc)
+        # Relative to now: the stats view only lists predictions from the
+        # last 30 days, so a hardcoded date silently ages out of the window.
+        start_time = timezone.now() - timedelta(days=2)
         self.create_incident(
             parent,
             text="faulty lift",
