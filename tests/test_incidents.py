@@ -2961,3 +2961,15 @@ class MigrationMemoryTests(SimpleTestCase):
     @override_settings(MIGRATION_MODULES={})
     def test_models_have_no_unmigrated_changes(self):
         call_command("makemigrations", "--check", "--dry-run", stdout=StringIO())
+
+
+class AppStorePromoTests(TestCase):
+    def test_home_links_to_app_store_above_current_issues(self):
+        html = self.client.get("/", HTTP_HOST="testserver").content.decode()
+
+        link = '<a href="https://apps.apple.com/gb/app/up-down-london/id1613334023" class="app-store-badge">'
+        badge = '<img src="/static/app-store-badge.svg" alt="Download on the App Store"'
+        self.assertIn(link, html)
+        self.assertIn(badge, html)
+        self.assertLess(html.index(link), html.index(badge))
+        self.assertLess(html.index(badge), html.index("<h2>Current Issues</h2>"))
