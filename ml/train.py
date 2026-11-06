@@ -146,6 +146,11 @@ FEATURE_COLUMNS = [
 ]
 
 TARGET_COLUMN = "block_offset"
+
+# HistGradientBoostingClassifier allows a categorical feature at most
+# max_bins (255) distinct values. There are more stations than that, so only
+# the busiest keep a category of their own; see cap_station_categories.
+MAX_STATION_CATEGORIES = 255
 NETWORK_COLUMNS = ["tube", "dlr", "national_rail", "crossrail", "overground"]
 
 BASELINE_CATEGORY_OTHER = "other"
@@ -517,10 +522,30 @@ def _describe_class_distribution(y):
         print(f"  offset {cls:>2}: {n:>5} ({pct:.1f}%)")
 
 
+def cap_station_categories(station_ids, max_categories=MAX_STATION_CATEGORIES):
+    """Keep the ``max_categories`` busiest stations as categories of their
+    own and turn the rest into NaN, which the model treats as one group.
+
+    The app needs no matching change: at prediction time scikit-learn maps
+    any station it didn't learn to missing, which is this same NaN group.
+    """
+    counts = station_ids.value_counts()
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    keep = [station_id for station_id, _ in ranked[:max_categories]]
+    return station_ids.where(station_ids.isin(keep)).astype(float)
+
+
 def train_model(df, feature_cols):
     df = df.sort_values("start_time").reset_index(drop=True)
 
-    X = df[feature_cols]
+    X = df[feature_cols].copy()
+    X["station_id"] = cap_station_categories(df["station_id"])
+    grouped = int(X["station_id"].isna().sum())
+    if grouped:
+        print(
+            f"Grouped {df['station_id'].nunique() - MAX_STATION_CATEGORIES} quieter "
+            f"stations ({grouped} incidents) into one station category."
+        )
     y = df[TARGET_COLUMN]
 
     _describe_class_distribution(y)
