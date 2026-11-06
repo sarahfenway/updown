@@ -2862,3 +2862,29 @@ class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
         self.assertNotIn("verysecret", json.dumps(scrubbed))
         self.assertNotIn("SECRETKEY", json.dumps(scrubbed))
         self.assertIn("x=1", scrubbed["request"]["query_string"])
+
+
+class MigrationMemoryTests(SimpleTestCase):
+    """Migrations run on boot inside the 512 MB Fly machine, before gunicorn."""
+
+    # The SQLite schema editor can't run inside TestCase's transaction.
+    databases = {"default"}
+
+    @override_settings(MIGRATION_MODULES={})
+    def test_0012_does_not_rebuild_any_table_on_sqlite(self):
+        # Production outage, 6 Nov 2026: 0012 changed MLModel.id from
+        # AutoField to BigAutoField. Django applies that on SQLite by
+        # rebuilding incidents_mlmodel, copying every stored model blob in a
+        # single INSERT ... SELECT, and `migrate` was OOM-killed on every
+        # boot. Both types are INTEGER on SQLite, so there's nothing to
+        # rebuild for.
+        out = StringIO()
+        call_command("sqlmigrate", "incidents", "0012", stdout=out)
+        sql = out.getvalue()
+
+        self.assertNotIn('"new__', sql)
+        self.assertIn('CREATE INDEX "incident_station_start_idx"', sql)
+
+    @override_settings(MIGRATION_MODULES={})
+    def test_models_have_no_unmigrated_changes(self):
+        call_command("makemigrations", "--check", "--dry-run", stdout=StringIO())
