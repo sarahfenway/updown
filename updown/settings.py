@@ -146,14 +146,16 @@ if os.getenv("DB_ENGINE", "postgres").lower() == "sqlite":
             "NAME": os.getenv("SQLITE_PATH", os.path.join(BASE_DIR, "db.sqlite3")),
             # Pragmas tuned for production: WAL gives concurrent reads
             # alongside a single writer; NORMAL is the safe default under
-            # WAL; mmap speeds up reads; the temp store keeps small sorts
-            # off disk. ``foreign_keys`` mirrors Django's default but is
-            # cheap insurance against silently broken FKs.
+            # WAL; mmap speeds up reads. ``foreign_keys`` mirrors Django's
+            # default but is cheap insurance against silently broken FKs.
+            # Leave temp_store at its default: MEMORY keeps every temp file
+            # and statement journal in RAM with no cap, and helped OOM-kill
+            # a migration on the 512 MB machine. The default still keeps
+            # small sorts in memory and only spills large ones to disk.
             "OPTIONS": {
                 "init_command": (
                     "PRAGMA journal_mode=WAL;"
                     "PRAGMA synchronous=NORMAL;"
-                    "PRAGMA temp_store=MEMORY;"
                     "PRAGMA mmap_size=134217728;"
                     "PRAGMA foreign_keys=ON;"
                 ),
