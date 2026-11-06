@@ -27,6 +27,23 @@ h2 {
 	font-size: 18px;
 }
 
+/* Apple's badge rules: at least 40px tall on screen, with clear space of a
+   quarter of its height all round, unmodified. */
+.app-promo {
+	margin: 10px 0;
+	text-align: center;
+}
+
+.app-store-badge {
+	display: inline-block;
+	padding: 10px;
+}
+
+.app-store-badge img {
+	height: 40px;
+	width: auto;
+}
+
 h3 {
 	font-size: 14px;
 	font-weight: bold;
