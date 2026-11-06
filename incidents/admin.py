@@ -2,6 +2,7 @@ import hashlib
 
 from django.contrib import admin
 from django.core.cache import cache
+from django.core.exceptions import EmptyResultSet
 from django.core.paginator import Paginator
 from django.urls import reverse
 from django.utils.functional import cached_property
@@ -32,7 +33,13 @@ class CachedCountPaginator(Paginator):
         query = getattr(object_list, "query", None)
         if query is None:
             return super().count
-        key = "admin_count:" + hashlib.md5(str(query).encode("utf-8")).hexdigest()
+        try:
+            sql = str(query)
+        except EmptyResultSet:
+            # The query provably matches nothing (e.g. an out-of-range id
+            # filter or .none()); the stock Paginator counts that as 0.
+            return 0
+        key = "admin_count:" + hashlib.md5(sql.encode("utf-8")).hexdigest()
         cached = cache.get(key)
         if cached is not None:
             return cached

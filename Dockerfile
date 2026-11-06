@@ -90,10 +90,12 @@ COPY . .
 # Collect static files into STATIC_ROOT. WhiteNoise serves them in
 # production. We use ``python -m django`` rather than ``manage.py``
 # because the project's manage.py lives under updown/ (non-standard
-# Django layout) which doesn't put the project root on sys.path. A dummy
-# SECRET_KEY is fine for collectstatic — Django only uses it for
-# signing, which isn't exercised here.
-RUN SECRET_KEY=build-time-dummy DEBUG=false \
+# Django layout) which doesn't put the project root on sys.path. Dummy
+# SECRET_KEY / FUNCTIONS_SECRET_KEY values are fine for collectstatic —
+# settings require both to be set when DEBUG is off, but neither is used
+# here, and Fly runtime secrets aren't available at build time. Inline
+# env vars on a RUN line don't persist into the image.
+RUN SECRET_KEY=build-time-dummy FUNCTIONS_SECRET_KEY=build-time-dummy DEBUG=false \
     python -m django collectstatic --noinput --settings=updown.settings
 
 # Make the entrypoint executable while we still have root.

@@ -1,5 +1,5 @@
-import hmac
 import os
+import threading
 from datetime import datetime
 from datetime import timedelta
 from math import sqrt
@@ -12,12 +12,14 @@ from django.db.models import Subquery, Value
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Now
+from django.db.models.functions import NullIf
 import csv
 
 from django.http import HttpResponse, HttpResponseNotFound, StreamingHttpResponse
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
+from django.utils.crypto import constant_time_compare
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.cache import never_cache
@@ -45,7 +47,19 @@ def _valid_functions_key(provided):
     """
     if not provided:
         return False
-    return hmac.compare_digest(str(provided), settings.FUNCTIONS_SECRET_KEY)
+    # constant_time_compare works on bytes, so a non-ASCII key is simply a
+    # mismatch rather than the TypeError hmac.compare_digest raises on str.
+    return constant_time_compare(provided, settings.FUNCTIONS_SECRET_KEY)
+
+
+def _request_functions_key(request, params):
+    """The caller's functions key: the X-Functions-Key header, else ``key``.
+
+    Prefer the header — a ``?key=`` query param ends up in gunicorn's access
+    log (and anything else that records URLs). ``params`` is request.POST or
+    request.GET; the form/query fallback keeps existing callers working.
+    """
+    return request.headers.get("X-Functions-Key") or params.get("key")
 
 
 # feature_version values ml.py knows how to serve. Reject anything else at
@@ -692,8 +706,12 @@ def _prepare_incidents(
         # display so the incident shows a fresh "now expected by X" instead
         # of a past-due time — but the original estimated_duration is what
         # every accuracy metric scores, so it is left untouched.
+        # A revision is only meaningful while there is an original
+        # prediction to revise: if that was since cleared (planned work,
+        # tail class, model failure) any leftover revised_* value is stale.
         incident.prediction_is_revised = bool(
             not incident.resolved
+            and incident.estimated_duration is not None
             and incident.revised_estimated_duration is not None
             and incident.start_time
         )
@@ -1140,6 +1158,10 @@ def _prediction_stats(since):
             "start_time",
             "estimated_duration",
             "prediction_confidence",
+            # _prepare_incidents reads these for every open incident; leaving
+            # them deferred costs one or two queries per row.
+            "revised_estimated_duration",
+            "revised_prediction_confidence",
             "resolved",
         )
         .order_by("-start_time", "-id")
@@ -1376,20 +1398,33 @@ def alexa(request):
     return HttpResponse(alexa_string)
 
 
+# Serialises update runs within the gunicorn process. Under gthread the
+# worker heartbeat keeps ticking during a long request, so --timeout no
+# longer kills an overrunning update, and the cron client gives up (and
+# releases its flock) at 170s while the run carries on. Without this, the
+# next tick could start a second, concurrent update_incidents.
+_update_incidents_lock = threading.Lock()
+
+
 @method_decorator(csrf_exempt, name="dispatch")
 class UpdateIncidentsView(View):
     def post(self, request, *args, **kwargs):
-        if _valid_functions_key(request.POST.get("key")):
+        if not _valid_functions_key(_request_functions_key(request, request.POST)):
+            return HttpResponseNotFound()
+        if not _update_incidents_lock.acquire(blocking=False):
+            return HttpResponse("update already running", status=409)
+        try:
             call_command("update_incidents", timing=True)
-            return HttpResponse(status=204)
-        return HttpResponseNotFound()
+        finally:
+            _update_incidents_lock.release()
+        return HttpResponse(status=204)
 
 
 def api_training_data(request):
     import heapq
     import json
 
-    if not _valid_functions_key(request.GET.get("key")):
+    if not _valid_functions_key(_request_functions_key(request, request.GET)):
         return HttpResponseNotFound()
 
     base_qs = Incident.objects.filter(resolved=True, end_time__isnull=False)
@@ -1426,10 +1461,17 @@ def api_training_data(request):
         .annotate(count=Count("report_id"))
         .values("count")
     )
+    # Every incident is created from at least one report at its start, so a
+    # causal count of 0 only happens when archive_old_reports --delete has
+    # removed the link rows. Fall back to 1 (the typical value at prediction
+    # time) rather than exporting a 0 the model never sees live.
     incident_rows = base_qs.annotate(
         num_reports=Coalesce(
-            Subquery(causal_report_count_subquery, output_field=IntegerField()),
-            Value(0),
+            NullIf(
+                Subquery(causal_report_count_subquery, output_field=IntegerField()),
+                Value(0),
+            ),
+            Value(1),
             output_field=IntegerField(),
         )
     ).values_list(
@@ -1537,7 +1579,7 @@ class UploadModelView(View):
         # constant time. The current upload workflow (ml/train.py) POSTs here
         # over the public URL, so we can't restrict this to a private network
         # without changing that; keep the key secret and rotate it if leaked.
-        if not _valid_functions_key(request.POST.get("key")):
+        if not _valid_functions_key(_request_functions_key(request, request.POST)):
             return HttpResponseNotFound()
 
         model_file = request.FILES.get("model")

@@ -17,7 +17,19 @@ def refresh_prediction(incident):
     duration, confidence = predict_duration(incident)
     incident.estimated_duration = duration
     incident.prediction_confidence = confidence
-    incident.save(update_fields=["estimated_duration", "prediction_confidence"])
+    # A revision is relative to the original prediction it replaces, so any
+    # existing one is stale now. refresh_revised_predictions recomputes it
+    # (only for incidents that still have an original prediction).
+    incident.revised_estimated_duration = None
+    incident.revised_prediction_confidence = None
+    incident.save(
+        update_fields=[
+            "estimated_duration",
+            "prediction_confidence",
+            "revised_estimated_duration",
+            "revised_prediction_confidence",
+        ]
+    )
 
 
 def refresh_revised_predictions(now=None):

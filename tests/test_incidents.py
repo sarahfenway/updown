@@ -2611,3 +2611,254 @@ class RevisedPredictionTests(StationFactoryMixin, TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.context["current_prediction_overdue_count"], 1)
         self.assertIn("prediction_accuracy_worst_case_pct", response.context)
+
+
+class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
+    """Regression tests for the PR #8 review fixes."""
+
+    def test_production_settings_load_and_exempt_cron_from_ssl_redirect(self):
+        # Mirrors the Dockerfile's build-time env (dummy secrets, DEBUG off)
+        # and the cron's plain-HTTP POST straight to gunicorn.
+        import subprocess
+        import sys
+
+        script = (
+            "import django; django.setup()\n"
+            "from django.conf import settings\n"
+            "from django.test import Client\n"
+            "cron = Client(HTTP_HOST='127.0.0.1:8080')\n"
+            "print(cron.post('/functions/update_incidents', {'key': 'wrong'}).status_code)\n"
+            "print(Client(HTTP_HOST='updownlondon.com').get('/faq/').status_code)\n"
+            "print(settings.DATABASES['default']['OPTIONS'].get('transaction_mode'))\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                **os.environ,
+                "DJANGO_SETTINGS_MODULE": "updown.settings",
+                "DEBUG": "false",
+                "SECRET_KEY": "build-time-dummy",
+                "FUNCTIONS_SECRET_KEY": "build-time-dummy",
+                "DB_ENGINE": "sqlite",
+                "SQLITE_PATH": os.path.join(tmp, "db.sqlite3"),
+            }
+            env.pop("SENTRY_DSN", None)
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cron_status, public_status, transaction_mode = result.stdout.split()
+        # Wrong key → 404 from the view, i.e. not 301'd to https first.
+        self.assertEqual(cron_status, "404")
+        self.assertEqual(public_status, "301")
+        self.assertEqual(transaction_mode, "IMMEDIATE")
+
+    def test_non_ascii_functions_key_is_rejected_not_500(self):
+        self.assertEqual(
+            self.client.get("/api/training-data/", {"key": "é"}).status_code, 404
+        )
+        self.assertEqual(
+            self.client.post("/functions/update_incidents", {"key": "é"}).status_code,
+            404,
+        )
+
+    def test_update_incidents_skips_when_a_run_is_in_progress(self):
+        from incidents import views as incidents_views
+
+        self.assertTrue(incidents_views._update_incidents_lock.acquire(blocking=False))
+        try:
+            with patch("incidents.views.call_command") as call_command_mock:
+                response = self.client.post(
+                    "/functions/update_incidents",
+                    HTTP_X_FUNCTIONS_KEY="verysecret",
+                )
+        finally:
+            incidents_views._update_incidents_lock.release()
+
+        self.assertEqual(response.status_code, 409)
+        call_command_mock.assert_not_called()
+
+    def test_cached_count_paginator_counts_empty_result_as_zero(self):
+        from django.contrib.auth.models import User
+
+        from incidents.admin import CachedCountPaginator
+
+        self.assertEqual(CachedCountPaginator(Incident.objects.none(), 10).count, 0)
+
+        User.objects.create_superuser("admin", "admin@example.com", "password")
+        self.client.force_login(User.objects.get(username="admin"))
+        response = self.client.get(
+            "/admin/incidents/incident/", {"id": "99999999999999999999"}
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_refresh_prediction_clears_a_stale_revision(self):
+        from incidents.management.commands.update_incidents import refresh_prediction
+
+        parent = self.create_parent_station("Bank")
+        incident = self.create_incident(
+            parent,
+            start_time=timezone.now() - timedelta(hours=8),
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.8,
+            revised_estimated_duration=timedelta(hours=10),
+            revised_prediction_confidence=0.8,
+        )
+
+        with patch(
+            "incidents.management.commands.update_incidents.predict_duration",
+            return_value=(None, None),
+        ):
+            refresh_prediction(incident)
+
+        incident.refresh_from_db()
+        self.assertIsNone(incident.estimated_duration)
+        self.assertIsNone(incident.revised_estimated_duration)
+        self.assertIsNone(incident.revised_prediction_confidence)
+
+    def test_revision_without_original_prediction_is_not_shown(self):
+        parent = self.create_parent_station("Bank")
+        incident = self.create_incident(
+            parent,
+            start_time=timezone.now() - timedelta(hours=8),
+            estimated_duration=None,
+            revised_estimated_duration=timedelta(hours=10),
+            revised_prediction_confidence=0.8,
+        )
+
+        prepared = _prepare_incidents(Incident.objects.filter(id=incident.id))
+
+        self.assertFalse(prepared[0].prediction_is_revised)
+
+    def test_training_data_num_reports_survives_archived_reports(self):
+        parent = self.create_parent_station("Farringdon", naptan_id="ZFD2")
+        start = timezone.now() - timedelta(days=200)
+        # No linked reports: archive_old_reports --delete removed the links.
+        self.create_incident(
+            parent,
+            text="Faulty lift",
+            resolved=True,
+            start_time=start,
+            end_time=start + timedelta(hours=2),
+            report_count=3,
+        )
+
+        response = self.client.get(
+            "/api/training-data/", HTTP_X_FUNCTIONS_KEY="verysecret"
+        )
+        payload = json.loads(b"".join(response.streaming_content).decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["incidents"][0]["num_reports"], 1)
+
+    def test_stats_query_count_does_not_grow_with_revised_open_incidents(self):
+        def stats_queries(open_incidents):
+            parent = self.create_parent_station(f"Station {open_incidents}")
+            for i in range(open_incidents):
+                self.create_incident(
+                    parent,
+                    text=f"Lift {i} out of order",
+                    start_time=timezone.now() - timedelta(hours=6),
+                    estimated_duration=timedelta(hours=1),
+                    prediction_confidence=0.8,
+                    revised_estimated_duration=timedelta(hours=9),
+                    revised_prediction_confidence=0.8,
+                )
+            with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+                with CaptureQueriesContext(connection) as queries:
+                    response = self.client.get("/stats/")
+            self.assertEqual(response.status_code, 200)
+            Incident.objects.all().delete()
+            return len(queries)
+
+        self.assertEqual(stats_queries(2), stats_queries(6))
+
+    def test_remove_tfl_specifics_keeps_case_and_whole_sentences(self):
+        self.assertEqual(
+            remove_tfl_specifics("Member of staff available to help."),
+            "Member of TfL staff available to help.",
+        )
+        cleaned = remove_tfl_specifics(
+            "Lift not working. Please call us on 0343 222 1234 if you need more help."
+        )
+        self.assertEqual(cleaned.strip(), "Lift not working.")
+        cleaned = remove_tfl_specifics(
+            "Engineers have been called to fix the lift. "
+            "Call us on 0343 222 1234 to plan your journey."
+        )
+        self.assertEqual(cleaned.strip(), "Engineers have been called to fix the lift.")
+
+    def test_format_block_slot_uses_local_date_and_current_night(self):
+        from zoneinfo import ZoneInfo
+
+        from incidents.ml import format_block_slot, time_block_slot
+
+        london = ZoneInfo("Europe/London")
+        # 01:30, bound at the end of the current overnight block.
+        now = datetime(2026, 11, 5, 1, 30, tzinfo=london)
+        bound = datetime(2026, 11, 5, 4, 59, 59, tzinfo=london)
+        self.assertEqual(format_block_slot(time_block_slot(bound), now), "tonight")
+        # BST: 00:30 local is still the previous day in UTC.
+        now_bst = datetime(2026, 7, 15, 0, 30, tzinfo=london).astimezone(dt_timezone.utc)
+        morning = datetime(2026, 7, 15, 9, 59, tzinfo=london)
+        self.assertEqual(
+            format_block_slot(time_block_slot(morning), now_bst), "this morning"
+        )
+        # Unchanged daytime behaviour.
+        afternoon = datetime(2026, 11, 5, 14, 0, tzinfo=london)
+        evening = datetime(2026, 11, 5, 19, 59, tzinfo=london)
+        self.assertEqual(
+            format_block_slot(time_block_slot(evening), afternoon), "this evening"
+        )
+
+    @override_settings(
+        DEBUG=False,
+        TWITTER_API_KEY=None,
+        TWITTER_API_SECRET=None,
+        TWITTER_ACCESS_TOKEN=None,
+        TWITTER_ACCESS_TOKEN_SECRET=None,
+    )
+    def test_send_tweet_skips_quietly_without_credentials(self):
+        with patch("incidents.utils.tweepy.Client") as client_mock:
+            with self.assertNoLogs("incidents.utils", level="ERROR"):
+                send_tweet("Bank update")
+        client_mock.assert_not_called()
+
+    def test_tfl_fetch_failure_log_omits_credentials(self):
+        import requests
+
+        error = requests.exceptions.ConnectionError(
+            "Max retries exceeded with url: /Disruption?app_id=MYID&app_key=SECRETKEY"
+        )
+        with patch("incidents.sources.tflapiv1.requests.get", side_effect=error):
+            with self.assertLogs("incidents.sources.tflapiv1", level="WARNING") as logs:
+                tflapiv1.check()
+
+        record = logs.records[0]
+        self.assertIsNone(record.exc_info)
+        self.assertNotIn("SECRETKEY", record.getMessage())
+
+    def test_sentry_scrubber_redacts_functions_and_tfl_keys(self):
+        from updown import settings as project_settings
+
+        event = {
+            "request": {
+                "data": {"key": "verysecret"},
+                "query_string": "key=verysecret&x=1",
+                "url": "https://updownlondon.com/api/training-data/?key=verysecret",
+                "headers": {"X-Functions-Key": "verysecret"},
+            },
+            "exception": {
+                "values": [{"value": "url: /StopPoint?app_id=ID&app_key=SECRETKEY"}]
+            },
+        }
+        scrubbed = project_settings._sentry_before_send(event, {})
+
+        self.assertNotIn("verysecret", json.dumps(scrubbed))
+        self.assertNotIn("SECRETKEY", json.dumps(scrubbed))
+        self.assertIn("x=1", scrubbed["request"]["query_string"])

@@ -140,9 +140,14 @@ def check():
                     report.end_time = now
                     report.save()
 
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as exc:
         # Covers connection errors and timeouts alike — a flaky or slow
         # TfL endpoint just means we skip this run, not crash or hang. Log
         # it (WARNING, not exception) so a prolonged TfL outage is visible
-        # instead of the site silently freezing on stale data.
-        logger.warning("TfL v1 disruption fetch failed; skipping this run", exc_info=True)
+        # instead of the site silently freezing on stale data. Log only the
+        # exception type: requests' messages embed the full URL, which
+        # carries app_id/app_key.
+        logger.warning(
+            "TfL v1 disruption fetch failed (%s); skipping this run",
+            type(exc).__name__,
+        )

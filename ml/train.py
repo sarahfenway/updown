@@ -173,7 +173,8 @@ BASELINE_BLEND_COUNT_SCALE = 25.0
 
 def fetch_training_data(api_url, key):
     print(f"Fetching training data from {api_url}...")
-    response = requests.get(api_url, params={"key": key})
+    # Header, not ?key=: a query param lands in the server's access log.
+    response = requests.get(api_url, headers={"X-Functions-Key": key})
     response.raise_for_status()
 
     data = response.json()

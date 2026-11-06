@@ -50,8 +50,11 @@ fi
 # separate threads: admin/browsing runs concurrently with the update, and
 # the heartbeat thread keeps ticking so a long update no longer trips the
 # timeout. SQLite stays safe — Django gives each thread its own connection,
-# WAL allows concurrent readers, and the 20s busy_timeout serialises the
-# rare write contention.
+# WAL allows concurrent readers, and transactions BEGIN IMMEDIATE (see
+# settings.DATABASES) so the 20s busy_timeout serialises the rare write
+# contention. Note gthread's heartbeat also means --timeout no longer
+# bounds a long request, so UpdateIncidentsView takes a non-blocking
+# in-process lock to stop overlapping update runs.
 GUNICORN_ARGS="updown.wsgi:application --bind 0.0.0.0:8080 \
     --worker-class gthread --workers 1 --threads 4 --timeout 180 \
     --access-logfile - --error-logfile -"

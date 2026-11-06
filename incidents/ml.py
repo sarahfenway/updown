@@ -131,7 +131,13 @@ def time_block_slot(dt):
 def format_block_slot(slot, now):
     """Human-friendly label for a (date, block) slot relative to ``now``."""
     date, block = slot
-    today = now.date()
+    # The overnight block is dated by the evening it starts, so after
+    # midnight the night we're currently in carries yesterday's date.
+    if block == "overnight" and slot == time_block_slot(now):
+        return "tonight"
+    # Slots are in local time; compare against the local date, not UTC's
+    # (in BST, 00:00–01:00 local is still the previous day in UTC).
+    today = _to_local(now).date()
     delta = (date - today).days
     if delta == 0:
         return {
