@@ -22,6 +22,48 @@ class AlterFieldExceptOnSQLite(migrations.AlterField):
             super().database_backwards(app_label, schema_editor, from_state, to_state)
 
 
+# Production's database was changed by hand at some point (it has no
+# idx_covering), so the index and column operations below check what's
+# actually there instead of trusting the migration history.
+
+
+def _index_names(schema_editor, table):
+    connection = schema_editor.connection
+    with connection.cursor() as cursor:
+        return set(connection.introspection.get_constraints(cursor, table))
+
+
+def _column_names(schema_editor, table):
+    connection = schema_editor.connection
+    with connection.cursor() as cursor:
+        return {
+            column.name
+            for column in connection.introspection.get_table_description(cursor, table)
+        }
+
+
+class RemoveIndexIfExists(migrations.RemoveIndex):
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        model = from_state.apps.get_model(app_label, self.model_name)
+        if self.name in _index_names(schema_editor, model._meta.db_table):
+            super().database_forwards(app_label, schema_editor, from_state, to_state)
+
+
+class AddIndexIfMissing(migrations.AddIndex):
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        model = to_state.apps.get_model(app_label, self.model_name)
+        if self.index.name not in _index_names(schema_editor, model._meta.db_table):
+            super().database_forwards(app_label, schema_editor, from_state, to_state)
+
+
+class AddFieldIfMissing(migrations.AddField):
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        model = to_state.apps.get_model(app_label, self.model_name)
+        column = model._meta.get_field(self.name).column
+        if column not in _column_names(schema_editor, model._meta.db_table):
+            super().database_forwards(app_label, schema_editor, from_state, to_state)
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -30,20 +72,20 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RemoveIndex(
+        RemoveIndexIfExists(
             model_name='report',
             name='incidents_r_station_c6be78_idx',
         ),
-        migrations.RemoveIndex(
+        RemoveIndexIfExists(
             model_name='report',
             name='idx_covering',
         ),
-        migrations.AddField(
+        AddFieldIfMissing(
             model_name='incident',
             name='revised_estimated_duration',
             field=models.DurationField(blank=True, help_text='Re-predicted duration for an overdue open incident', null=True),
         ),
-        migrations.AddField(
+        AddFieldIfMissing(
             model_name='incident',
             name='revised_prediction_confidence',
             field=models.FloatField(blank=True, help_text='Confidence (0-1) of the revised prediction', null=True),
@@ -53,15 +95,15 @@ class Migration(migrations.Migration):
             name='id',
             field=models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID'),
         ),
-        migrations.AddIndex(
+        AddIndexIfMissing(
             model_name='incident',
             index=models.Index(fields=['station_id', '-start_time'], name='incident_station_start_idx'),
         ),
-        migrations.AddIndex(
+        AddIndexIfMissing(
             model_name='incident',
             index=models.Index(condition=models.Q(('end_time__isnull', False), ('resolved', True)), fields=['start_time', 'id'], name='incident_training_idx'),
         ),
-        migrations.AddIndex(
+        AddIndexIfMissing(
             model_name='incident',
             index=models.Index(condition=models.Q(('estimated_duration__isnull', False), ('resolved', True)), fields=['end_time'], name='incident_prediction_end_idx'),
         ),

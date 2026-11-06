@@ -152,10 +152,16 @@ if os.getenv("DB_ENGINE", "postgres").lower() == "sqlite":
             # and statement journal in RAM with no cap, and helped OOM-kill
             # a migration on the 512 MB machine. The default still keeps
             # small sorts in memory and only spills large ones to disk.
+            # secure_delete=FAST: Debian's SQLite defaults it to ON, which
+            # zeroes (and journals) every page freed by a DELETE or DROP.
+            # Dropping one text-heavy Report index wrote ~445 MB that way.
+            # FAST still scrubs deleted rows within pages, without the
+            # extra I/O. Nothing here is personal data.
             "OPTIONS": {
                 "init_command": (
                     "PRAGMA journal_mode=WAL;"
                     "PRAGMA synchronous=NORMAL;"
+                    "PRAGMA secure_delete=FAST;"
                     "PRAGMA mmap_size=134217728;"
                     "PRAGMA foreign_keys=ON;"
                 ),

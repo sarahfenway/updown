@@ -2878,20 +2878,85 @@ class MigrationMemoryTests(SimpleTestCase):
     # The SQLite schema editor can't run inside TestCase's transaction.
     databases = {"default"}
 
-    @override_settings(MIGRATION_MODULES={})
-    def test_0012_does_not_rebuild_any_table_on_sqlite(self):
-        # Production outage, 6 Nov 2026: 0012 changed MLModel.id from
-        # AutoField to BigAutoField. Django applies that on SQLite by
-        # rebuilding incidents_mlmodel, copying every stored model blob in a
-        # single INSERT ... SELECT, and `migrate` was OOM-killed on every
-        # boot. Both types are INTEGER on SQLite, so there's nothing to
-        # rebuild for.
-        out = StringIO()
-        call_command("sqlmigrate", "incidents", "0012", stdout=out)
-        sql = out.getvalue()
+    def _migrate_from_0011(self, drop_before_0012=()):
+        """Run the real migrations on a fresh SQLite file with production
+        settings, optionally dropping indexes first to mimic production."""
+        import subprocess
+        import sys
 
-        self.assertNotIn('"new__', sql)
-        self.assertIn('CREATE INDEX "incident_station_start_idx"', sql)
+        script = (
+            "import sys, django; django.setup()\n"
+            "from django.core.management import call_command\n"
+            "from django.db import connection\n"
+            "call_command('migrate', 'incidents', '0011', verbosity=0)\n"
+            "c = connection.cursor()\n"
+            "for name in sys.argv[1:]:\n"
+            "    c.execute('DROP INDEX \"%s\"' % name)\n"
+            "def rootpage():\n"
+            "    c.execute(\"SELECT rootpage FROM sqlite_master WHERE name = 'incidents_mlmodel'\")\n"
+            "    return c.fetchone()[0]\n"
+            "before = rootpage()\n"
+            "call_command('migrate', verbosity=0)\n"
+            "c = connection.cursor()\n"
+            "print('mlmodel_rebuilt', rootpage() != before)\n"
+            "c.execute(\"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'\")\n"
+            "print('indexes', ','.join(sorted(r[0] for r in c.fetchall())))\n"
+            "c.execute('PRAGMA table_info(incidents_incident)')\n"
+            "print('columns', ','.join(sorted(r[1] for r in c.fetchall())))\n"
+            "c.execute('PRAGMA secure_delete')\n"
+            "print('secure_delete', c.fetchone()[0])\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                **os.environ,
+                "DJANGO_SETTINGS_MODULE": "updown.settings",
+                "DEBUG": "false",
+                "SECRET_KEY": "x",
+                "FUNCTIONS_SECRET_KEY": "x",
+                "DB_ENGINE": "sqlite",
+                "SQLITE_PATH": os.path.join(tmp, "db.sqlite3"),
+            }
+            env.pop("SENTRY_DSN", None)
+            result = subprocess.run(
+                [sys.executable, "-c", script, *drop_before_0012],
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        return dict(line.split(" ", 1) for line in result.stdout.splitlines())
+
+    def _assert_0012_applied(self, out):
+        indexes = out["indexes"].split(",")
+        for name in ("incident_station_start_idx", "incident_training_idx", "incident_prediction_end_idx"):
+            self.assertIn(name, indexes)
+        for name in ("idx_covering", "incidents_r_station_c6be78_idx"):
+            self.assertNotIn(name, indexes)
+        columns = out["columns"].split(",")
+        self.assertIn("revised_estimated_duration", columns)
+        self.assertIn("revised_prediction_confidence", columns)
+        self.assertEqual(out["mlmodel_rebuilt"], "False")
+
+    def test_0012_applies_to_a_schema_built_from_migrations(self):
+        # Also guards the first 6 Nov 2026 fix: 0012's AutoField ->
+        # BigAutoField change must not rebuild incidents_mlmodel on SQLite
+        # (same INTEGER column; the rebuild copies every model blob).
+        self._assert_0012_applied(self._migrate_from_0011())
+
+    def test_0012_applies_when_production_already_dropped_idx_covering(self):
+        # Production outage, 6 Nov 2026 (second deploy): production's
+        # database had no idx_covering, so RemoveIndex failed with "no such
+        # index" on every boot.
+        self._assert_0012_applied(self._migrate_from_0011(["idx_covering"]))
+
+    def test_sqlite_secure_delete_is_fast(self):
+        # Debian's SQLite defaults secure_delete to ON, so dropping
+        # 0012's text-heavy Report index zeroed and journalled every page
+        # of it: ~445 MB of WAL, and with temp_store=MEMORY the same again
+        # in RAM. FAST (2) skips zeroing whole freed pages.
+        self.assertEqual(self._migrate_from_0011()["secure_delete"], "2")
 
     @override_settings(MIGRATION_MODULES={})
     def test_models_have_no_unmigrated_changes(self):
