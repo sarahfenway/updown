@@ -41,6 +41,20 @@ class Incident(models.Model):
         blank=True,
         help_text="ML prediction confidence (0-1)",
     )
+    # Conditional re-prediction for an incident that is still open past its
+    # original ``estimated_duration`` bound: P(resolved by X | still open
+    # now). Display-only — the accuracy metric always scores the original
+    # ``estimated_duration`` so "fixed by predicted time" stays honest.
+    revised_estimated_duration = models.DurationField(
+        null=True,
+        blank=True,
+        help_text="Re-predicted duration for an overdue open incident",
+    )
+    revised_prediction_confidence = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Confidence (0-1) of the revised prediction",
+    )
 
     def __str__(self):
         if hasattr(self, "reports_count"):

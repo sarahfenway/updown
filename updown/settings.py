@@ -10,7 +10,10 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.1/ref/settings/
 """
 import os
+import re
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,7 +29,6 @@ DEBUG = os.getenv("DEBUG", "").lower() == "true"
 
 ALLOWED_HOSTS = [
     "127.0.0.1",
-    "updownlondon-bayld.ondigitalocean.app",
     "updownlondon.com",
     "www.updownlondon.com",
     "updownlondon.info",
@@ -51,6 +53,29 @@ CSRF_TRUSTED_ORIGINS = [
 
 # Fly's edge terminates TLS and forwards via this header.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# Production hardening. Only enabled when DEBUG is off so local HTTP dev and
+# the test client (which speak plain HTTP) aren't force-redirected or handed
+# secure-only cookies they can't send back. /admin is on the public internet,
+# so these matter.
+if not DEBUG:
+    # Fly already forces HTTPS at the edge; this is belt-and-suspenders and
+    # relies on SECURE_PROXY_SSL_HEADER above to detect the terminated TLS.
+    SECURE_SSL_REDIRECT = True
+    # The in-container cron POSTs plain HTTP straight to gunicorn on
+    # 127.0.0.1:8080, bypassing Fly's proxy (so no X-Forwarded-Proto).
+    # Redirecting it to https would break every update tick. External
+    # http:// requests are still upgraded by Fly's force_https.
+    SECURE_REDIRECT_EXEMPT = [r"^functions/"]
+    # One year HSTS. Start smaller (e.g. 3600) if you're not ready to commit
+    # every served hostname to HTTPS, then ramp up.
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = "same-origin"
 
 
 # Application definition
@@ -135,6 +160,14 @@ if os.getenv("DB_ENGINE", "postgres").lower() == "sqlite":
                 # Wait up to 20s if another connection holds the write
                 # lock. The default 5s is easy to hit during ML batches.
                 "timeout": 20,
+                # gunicorn runs gthread (4 threads), so writers can now
+                # overlap in-process. With the default deferred BEGIN, a
+                # transaction that reads and then writes fails instantly
+                # with "database is locked" if another connection committed
+                # in between — the busy timeout doesn't apply to that
+                # upgrade. IMMEDIATE takes the write lock up front, so
+                # contention waits out the timeout instead of failing.
+                "transaction_mode": "IMMEDIATE",
             },
             # Reuse the connection inside the web worker so we don't run the
             # SQLite setup pragmas on every request.
@@ -209,7 +242,20 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 TFL_API_ID = os.getenv("TFL_API_ID")
 TFL_API_KEY = os.getenv("TFL_API_KEY")
 
-FUNCTIONS_SECRET_KEY = os.getenv("FUNCTIONS_SECRET_KEY", "verysecret")
+# Authenticates the update/upload/training endpoints, one of which
+# ultimately joblib.loads (i.e. unpickles) an uploaded model — so a weak or
+# defaulted value is close to remote code execution. Never fall back to a
+# committed literal in production: require the env var and fail the boot if
+# it is missing. The dev/test fallback only applies under DEBUG.
+FUNCTIONS_SECRET_KEY = os.getenv("FUNCTIONS_SECRET_KEY")
+if not FUNCTIONS_SECRET_KEY:
+    if DEBUG:
+        FUNCTIONS_SECRET_KEY = "verysecret"
+    else:
+        raise ImproperlyConfigured(
+            "FUNCTIONS_SECRET_KEY must be set — it authenticates the "
+            "update_incidents, upload_model and training-data endpoints."
+        )
 
 TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
@@ -220,3 +266,92 @@ BLUESKY_USER_NAME = os.getenv("BLUESKY_USER_NAME")
 BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 
 LAST_UPDATED = None
+
+# Route our own loggers to stdout, which Fly captures into `fly logs`. Until
+# now the app had no LOGGING config, so the logger.warning/exception calls
+# guarding the TfL fetch, social posting and prediction paths went nowhere.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "simple"},
+    },
+    "root": {"handlers": ["console"], "level": "WARNING"},
+    "loggers": {
+        "incidents": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        "django": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+    },
+}
+
+# Optional error reporting. No-op unless SENTRY_DSN is set, so dev/test and
+# any deploy without the secret are unaffected. This is the only thing that
+# turns the app's many "log and carry on" failure paths into an actual alert.
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+
+# Secrets travel as `key` (FUNCTIONS_SECRET_KEY, in form bodies and the
+# legacy ?key= query param) and `app_id`/`app_key` (TfL, in outbound URLs
+# that also appear in requests' exception messages). Sentry's default
+# scrubber doesn't know any of these names, and send_default_pii=False
+# doesn't drop request bodies or query strings, so redact them explicitly.
+_SECRET_QUERY_RE = re.compile(r"(?i)(^|[?&])(key|app_id|app_key)=[^&\s'\"]*")
+
+
+def _redact_secret_params(value):
+    if not isinstance(value, str):
+        return value
+    return _SECRET_QUERY_RE.sub(r"\1\2=[Filtered]", value)
+
+
+def _sentry_before_send(event, hint):
+    request = event.get("request")
+    if isinstance(request, dict):
+        data = request.get("data")
+        if isinstance(data, dict) and "key" in data:
+            data["key"] = "[Filtered]"
+        for field in ("query_string", "url"):
+            if field in request:
+                request[field] = _redact_secret_params(request[field])
+        headers = request.get("headers")
+        if isinstance(headers, dict):
+            for name in list(headers):
+                if name.lower() == "x-functions-key":
+                    headers[name] = "[Filtered]"
+    for exception in (event.get("exception") or {}).get("values") or []:
+        if isinstance(exception, dict) and "value" in exception:
+            exception["value"] = _redact_secret_params(exception["value"])
+    logentry = event.get("logentry")
+    if isinstance(logentry, dict):
+        for field in ("message", "formatted"):
+            if field in logentry:
+                logentry[field] = _redact_secret_params(logentry[field])
+    return event
+
+
+def _sentry_before_breadcrumb(crumb, hint):
+    data = crumb.get("data")
+    if isinstance(data, dict):
+        for field in ("http.query", "url"):
+            if field in data:
+                data[field] = _redact_secret_params(data[field])
+    if "message" in crumb:
+        crumb["message"] = _redact_secret_params(crumb["message"])
+    return crumb
+
+
+if SENTRY_DSN:
+    import sentry_sdk
+
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        traces_sample_rate=0.0,
+        send_default_pii=False,
+        # Frame locals include the WSGIRequest repr (full URL with any
+        # ?key=) and the TfL URL strings; don't ship them.
+        include_local_variables=False,
+        before_send=_sentry_before_send,
+        before_breadcrumb=_sentry_before_breadcrumb,
+        environment="production" if not DEBUG else "development",
+    )

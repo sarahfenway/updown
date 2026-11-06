@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import datetime
 from datetime import timedelta
 from math import sqrt
@@ -11,12 +12,14 @@ from django.db.models import Subquery, Value
 from django.db.models import ExpressionWrapper, DurationField, F, Sum
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Now
+from django.db.models.functions import NullIf
 import csv
 
 from django.http import HttpResponse, HttpResponseNotFound, StreamingHttpResponse
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
+from django.utils.crypto import constant_time_compare
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.cache import never_cache
@@ -34,6 +37,75 @@ from incidents.ml import (
 )
 from incidents.text_features import normalise_incident_text
 from stations.models import Station
+
+def _valid_functions_key(provided):
+    """Constant-time check of a request's secret against the configured key.
+
+    ``==`` on secrets leaks length and prefix through timing; the endpoints
+    guarded by this key can trigger a model reload or an unpickle, so the
+    comparison is worth doing right.
+    """
+    if not provided:
+        return False
+    # constant_time_compare works on bytes, so a non-ASCII key is simply a
+    # mismatch rather than the TypeError hmac.compare_digest raises on str.
+    return constant_time_compare(provided, settings.FUNCTIONS_SECRET_KEY)
+
+
+def _request_functions_key(request, params):
+    """The caller's functions key: the X-Functions-Key header, else ``key``.
+
+    Prefer the header — a ``?key=`` query param ends up in gunicorn's access
+    log (and anything else that records URLs). ``params`` is request.POST or
+    request.GET; the form/query fallback keeps existing callers working.
+    """
+    return request.headers.get("X-Functions-Key") or params.get("key")
+
+
+# feature_version values ml.py knows how to serve. Reject anything else at
+# upload time rather than letting predictions silently break at runtime.
+SUPPORTED_FEATURE_VERSIONS = frozenset({1, 2, 3})
+
+
+def _validate_model_payload(payload):
+    """Return an error string if ``payload`` isn't a usable model, else None.
+
+    This runs a real smoke prediction so a corrupt or incompatible upload is
+    rejected with a 400 instead of quietly bricking every prediction (the
+    runtime swallows load/predict errors and returns "no prediction").
+    NOTE: joblib.load has already unpickled ``payload`` by the time we get
+    here — this validates fitness for purpose, it is not a security boundary.
+    """
+    if not isinstance(payload, dict) or "model" not in payload:
+        return "Model payload must be a dict containing a 'model' key"
+
+    model = payload["model"]
+    if not hasattr(model, "predict_proba"):
+        return "Model object has no predict_proba()"
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return "Model payload is missing a metadata dict"
+    if metadata.get("feature_version") not in SUPPORTED_FEATURE_VERSIONS:
+        return (
+            "Unsupported feature_version "
+            f"{metadata.get('feature_version')!r} (supported: "
+            f"{sorted(SUPPORTED_FEATURE_VERSIONS)})"
+        )
+
+    feature_names = getattr(model, "feature_names_in_", None)
+    if feature_names is None:
+        return "Model is missing feature_names_in_"
+
+    try:
+        import numpy as np
+
+        model.predict_proba(np.zeros((1, len(feature_names)), dtype=float))
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"Smoke prediction failed: {exc}"
+
+    return None
+
 
 PREDICTION_POLICY_WINDOW_DAYS = 30
 PREDICTION_POLICY_FALLBACK_WINDOW_DAYS = (90, 180)
@@ -629,8 +701,29 @@ def _prepare_incidents(
             reports[0].end_time if incident.is_single_user_report else None
         )
 
-        if incident.start_time and incident.estimated_duration:
-            incident.expected_end_time = incident.start_time + incident.estimated_duration
+        # For an unresolved incident that has overrun its original bound, a
+        # conditional re-prediction (revised_*) may exist. Prefer it for
+        # display so the incident shows a fresh "now expected by X" instead
+        # of a past-due time — but the original estimated_duration is what
+        # every accuracy metric scores, so it is left untouched.
+        # A revision is only meaningful while there is an original
+        # prediction to revise: if that was since cleared (planned work,
+        # tail class, model failure) any leftover revised_* value is stale.
+        incident.prediction_is_revised = bool(
+            not incident.resolved
+            and incident.estimated_duration is not None
+            and incident.revised_estimated_duration is not None
+            and incident.start_time
+        )
+        if incident.prediction_is_revised:
+            display_duration = incident.revised_estimated_duration
+            display_confidence = incident.revised_prediction_confidence
+        else:
+            display_duration = incident.estimated_duration
+            display_confidence = incident.prediction_confidence
+
+        if incident.start_time and display_duration:
+            incident.expected_end_time = incident.start_time + display_duration
             incident.expected_block = format_block_slot(
                 time_block_slot(incident.expected_end_time), now
             )
@@ -638,11 +731,11 @@ def _prepare_incidents(
             incident.expected_end_time = None
             incident.expected_block = None
 
-        if incident.prediction_confidence is not None:
-            incident.confidence_pct = int(incident.prediction_confidence * 100)
+        if display_confidence is not None:
+            incident.confidence_pct = int(display_confidence * 100)
         else:
             incident.confidence_pct = None
-        bucket = _prediction_confidence_bucket(incident.prediction_confidence)
+        bucket = _prediction_confidence_bucket(display_confidence)
         bucket_policy = prediction_policy.get(bucket, {}) if bucket is not None else {}
         incident.used_station_prediction_override = False
         if (
@@ -1065,6 +1158,10 @@ def _prediction_stats(since):
             "start_time",
             "estimated_duration",
             "prediction_confidence",
+            # _prepare_incidents reads these for every open incident; leaving
+            # them deferred costs one or two queries per row.
+            "revised_estimated_duration",
+            "revised_prediction_confidence",
             "resolved",
         )
         .order_by("-start_time", "-id")
@@ -1101,6 +1198,24 @@ def _prediction_stats(since):
         1
         for issue in current_issues
         if issue.prediction_hidden_reason == "missing_prediction"
+    )
+    # Honesty: the headline hit-rate only scores *resolved* incidents, so
+    # incidents still open past their ORIGINAL predicted bound (guaranteed to
+    # have already broken the "fixed by" promise) are invisible to it until
+    # they resolve. Count them and offer a worst-case rate that assumes every
+    # one is a miss, so the figure can't silently overstate the promise.
+    current_prediction_overdue_count = sum(
+        1
+        for issue in current_issues
+        if issue.estimated_duration
+        and issue.start_time
+        and issue.start_time + issue.estimated_duration <= now
+    )
+    worst_case_denominator = count + current_prediction_overdue_count
+    prediction_accuracy_worst_case_pct = (
+        round(correct / worst_case_denominator * 100)
+        if worst_case_denominator
+        else metrics["prediction_accuracy_pct"]
     )
     low_accuracy_diagnostics = _hidden_low_accuracy_diagnostics(current_issues, incidents)
 
@@ -1210,6 +1325,8 @@ def _prediction_stats(since):
             current_prediction_hidden_past_due_count
         ),
         "current_prediction_hidden_missing_count": current_prediction_hidden_missing_count,
+        "current_prediction_overdue_count": current_prediction_overdue_count,
+        "prediction_accuracy_worst_case_pct": prediction_accuracy_worst_case_pct,
         "recent_prediction_rows": recent_prediction_rows,
         "prediction_review_limit": PREDICTION_REVIEW_LIMIT,
         **low_accuracy_diagnostics,
@@ -1281,21 +1398,33 @@ def alexa(request):
     return HttpResponse(alexa_string)
 
 
+# Serialises update runs within the gunicorn process. Under gthread the
+# worker heartbeat keeps ticking during a long request, so --timeout no
+# longer kills an overrunning update, and the cron client gives up (and
+# releases its flock) at 170s while the run carries on. Without this, the
+# next tick could start a second, concurrent update_incidents.
+_update_incidents_lock = threading.Lock()
+
+
 @method_decorator(csrf_exempt, name="dispatch")
 class UpdateIncidentsView(View):
     def post(self, request, *args, **kwargs):
-        if request.POST.get("key") == settings.FUNCTIONS_SECRET_KEY:
+        if not _valid_functions_key(_request_functions_key(request, request.POST)):
+            return HttpResponseNotFound()
+        if not _update_incidents_lock.acquire(blocking=False):
+            return HttpResponse("update already running", status=409)
+        try:
             call_command("update_incidents", timing=True)
-            return HttpResponse(status=204)
-        return HttpResponseNotFound()
+        finally:
+            _update_incidents_lock.release()
+        return HttpResponse(status=204)
 
 
 def api_training_data(request):
     import heapq
     import json
 
-    key = request.GET.get("key")
-    if key != settings.FUNCTIONS_SECRET_KEY:
+    if not _valid_functions_key(_request_functions_key(request, request.GET)):
         return HttpResponseNotFound()
 
     base_qs = Incident.objects.filter(resolved=True, end_time__isnull=False)
@@ -1316,18 +1445,33 @@ def api_training_data(request):
 
     last_incident_at_station = {}
     active_end_times = []
-    report_count_subquery = (
-        Incident.reports.through.objects.filter(incident_id=OuterRef("pk"))
+    # Causal report count: only reports that existed at or before the
+    # incident's start_time. The stored ``report_count`` is the LIFETIME
+    # total, which leaks the future — longer incidents accrue more distinct
+    # report wordings, so training on it taught the model "many reports =>
+    # long" from a value it never sees live (at prediction time the count is
+    # ~1). Counting reports up to the start matches what's knowable then.
+    causal_report_count_subquery = (
+        Incident.reports.through.objects.filter(
+            incident_id=OuterRef("pk"),
+            report__start_time__lte=OuterRef("start_time"),
+        )
         .order_by()
         .values("incident_id")
         .annotate(count=Count("report_id"))
         .values("count")
     )
+    # Every incident is created from at least one report at its start, so a
+    # causal count of 0 only happens when archive_old_reports --delete has
+    # removed the link rows. Fall back to 1 (the typical value at prediction
+    # time) rather than exporting a 0 the model never sees live.
     incident_rows = base_qs.annotate(
         num_reports=Coalesce(
-            "report_count",
-            Subquery(report_count_subquery, output_field=IntegerField()),
-            Value(0),
+            NullIf(
+                Subquery(causal_report_count_subquery, output_field=IntegerField()),
+                Value(0),
+            ),
+            Value(1),
             output_field=IntegerField(),
         )
     ).values_list(
@@ -1428,8 +1572,14 @@ def api_training_data(request):
 @method_decorator(csrf_exempt, name="dispatch")
 class UploadModelView(View):
     def post(self, request, *args, **kwargs):
-        key = request.POST.get("key")
-        if key != settings.FUNCTIONS_SECRET_KEY:
+        # SECURITY: the bytes below are ultimately joblib.loaded (unpickled)
+        # by the prediction path, which can execute arbitrary code. This
+        # secret is therefore the whole trust boundary — it must be strong
+        # (settings.py refuses to boot production without it) and compared in
+        # constant time. The current upload workflow (ml/train.py) POSTs here
+        # over the public URL, so we can't restrict this to a private network
+        # without changing that; keep the key secret and rotate it if leaked.
+        if not _valid_functions_key(_request_functions_key(request, request.POST)):
             return HttpResponseNotFound()
 
         model_file = request.FILES.get("model")
@@ -1441,12 +1591,31 @@ class UploadModelView(View):
             return JsonResponse({"error": "Model file too large"}, status=400)
 
         # Read the whole upload into memory — capped at 10 MB above so this
-        # is safe — and stash it in a new MLModel row. We keep historic rows
-        # around rather than overwriting, so rollbacks are trivial: just
-        # delete the bad row and _load_model() picks up the previous one.
+        # is safe — validate it actually loads and predicts, then stash it in
+        # a new MLModel row. We keep historic rows around rather than
+        # overwriting, so rollbacks are trivial: just delete the bad row and
+        # _load_model() picks up the previous one.
         from incidents.models import MLModel
 
         raw = b"".join(model_file.chunks())
+
+        # Reject a corrupt or incompatible model here, so a bad upload can't
+        # silently disable predictions site-wide until someone notices.
+        import io
+
+        import joblib
+
+        try:
+            candidate = joblib.load(io.BytesIO(raw))
+        except Exception as exc:
+            return JsonResponse(
+                {"error": f"Uploaded file is not a loadable joblib model: {exc}"},
+                status=400,
+            )
+        problem = _validate_model_payload(candidate)
+        if problem:
+            return JsonResponse({"error": problem}, status=400)
+
         MLModel.objects.create(data=raw, size_bytes=len(raw))
 
         # Prune: keep the last 5 uploads, drop the rest.

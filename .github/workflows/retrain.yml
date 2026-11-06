@@ -1,0 +1,62 @@
+name: Retrain model
+
+# Retrain the incident-duration model on a schedule and upload it only if it
+# passes the quality gates in ml/train.py:
+#   * absolute floor  (--min-boundary-accuracy)
+#   * no regression vs the incumbent's recent live accuracy (--max-regression)
+# If either gate fails, train.py exits non-zero and uploads nothing, so a
+# regressed model can never auto-ship — the run just goes red.
+#
+# Requires a repo secret FUNCTIONS_SECRET_KEY matching the app's env var
+# (the same key ml/train.py uses to read training data and upload the model).
+
+on:
+  schedule:
+    # 04:00 UTC on the 1st of each month — quiet time for the single machine.
+    - cron: "0 4 1 * *"
+  workflow_dispatch:
+    inputs:
+      min_boundary_accuracy:
+        description: "Absolute floor for CV boundary accuracy (0-1)"
+        required: false
+        default: "0.70"
+      max_regression:
+        description: "Max allowed drop vs incumbent live accuracy (0-1)"
+        required: false
+        default: "0.05"
+      dry_run:
+        description: "Train and validate but do not upload"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: retrain-model
+  cancel-in-progress: false
+
+jobs:
+  retrain:
+    name: Retrain and gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Match the runtime (Dockerfile / requirements.txt) so the trained
+          # model is pickled by the same scikit-learn the app will load it with.
+          python-version: "3.14"
+      - name: Install training dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ml/requirements.txt
+      - name: Train, validate and (if it passes) upload
+        env:
+          FUNCTIONS_SECRET_KEY: ${{ secrets.FUNCTIONS_SECRET_KEY }}
+        run: |
+          python ml/train.py \
+            --api-url https://updownlondon.com/api/training-data/ \
+            --upload-url https://updownlondon.com/functions/upload_model \
+            --key "$FUNCTIONS_SECRET_KEY" \
+            --min-boundary-accuracy "${{ github.event.inputs.min_boundary_accuracy || '0.70' }}" \
+            --max-regression "${{ github.event.inputs.max_regression || '0.05' }}" \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}

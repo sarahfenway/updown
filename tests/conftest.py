@@ -12,6 +12,11 @@ from django.test.utils import (
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "updown.test_settings")
+# settings.py branches on DEBUG at import time (security headers, the
+# required FUNCTIONS_SECRET_KEY). test_settings sets DEBUG=True but only
+# *after* importing settings, so make the dev/test intent explicit in the
+# environment before Django loads — mirroring how production sets DEBUG.
+os.environ.setdefault("DEBUG", "true")
 django.setup()
 
 

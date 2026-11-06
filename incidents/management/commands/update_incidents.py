@@ -10,14 +10,79 @@ from incidents.models import Report, Incident
 from incidents.sources.tflapiv1 import check as check_tflv1
 # from incidents.sources.tflapiv2 import check as check_tflv2
 from incidents.utils import send_tweet, update_last_updated, send_bluesky_messages
-from incidents.ml import predict_duration
+from incidents.ml import predict_duration, predict_remaining_duration
 
 
 def refresh_prediction(incident):
     duration, confidence = predict_duration(incident)
     incident.estimated_duration = duration
     incident.prediction_confidence = confidence
-    incident.save(update_fields=["estimated_duration", "prediction_confidence"])
+    # A revision is relative to the original prediction it replaces, so any
+    # existing one is stale now. refresh_revised_predictions recomputes it
+    # (only for incidents that still have an original prediction).
+    incident.revised_estimated_duration = None
+    incident.revised_prediction_confidence = None
+    incident.save(
+        update_fields=[
+            "estimated_duration",
+            "prediction_confidence",
+            "revised_estimated_duration",
+            "revised_prediction_confidence",
+        ]
+    )
+
+
+def refresh_revised_predictions(now=None):
+    """Re-predict open incidents that have overrun their original bound.
+
+    Runs after the consolidation transaction commits (like the initial
+    predictions) so the model work never holds the SQLite write lock. For
+    each unresolved incident whose original ``estimated_duration`` bound is
+    already in the past, we compute a conditional "given it's still open,
+    now fixed by X" bound and store it in the ``revised_*`` fields — leaving
+    ``estimated_duration`` untouched so the accuracy metric still scores the
+    original promise. Writes only when the value actually changes, to avoid
+    per-tick WAL churn.
+    """
+    if now is None:
+        now = timezone.now()
+
+    open_predicted = (
+        Incident.objects.filter(
+            resolved=False, estimated_duration__isnull=False
+        )
+        .select_related("station", "station__parent_station")
+    )
+    for incident in open_predicted:
+        original_end = incident.start_time + incident.estimated_duration
+        if original_end > now:
+            # Not overdue yet — clear any stale revision from a previous run
+            # (e.g. the original prediction was just recomputed on a text
+            # change and now sits in the future again).
+            if incident.revised_estimated_duration is not None:
+                incident.revised_estimated_duration = None
+                incident.revised_prediction_confidence = None
+                incident.save(
+                    update_fields=[
+                        "revised_estimated_duration",
+                        "revised_prediction_confidence",
+                    ]
+                )
+            continue
+
+        duration, confidence = predict_remaining_duration(incident, now)
+        if (
+            duration != incident.revised_estimated_duration
+            or confidence != incident.revised_prediction_confidence
+        ):
+            incident.revised_estimated_duration = duration
+            incident.revised_prediction_confidence = confidence
+            incident.save(
+                update_fields=[
+                    "revised_estimated_duration",
+                    "revised_prediction_confidence",
+                ]
+            )
 
 
 def _attach_report(incident, report):
@@ -119,16 +184,23 @@ def consolidate_incidents():
 
                 pending_posts.append(tweet)
             else:
-                # Update the existing incident
+                # Update the existing incident, but only write the row when
+                # something actually changed. In steady state the TfL text is
+                # byte-identical run after run, so an unconditional save() was
+                # a full-row UPDATE per unresolved report per 5-minute tick —
+                # pointless WAL frames shipped to B2 and time held inside the
+                # single-writer transaction that admin writes wait behind.
                 text_changed = incident.text != report.text
-                incident.information = report.information
-                incident.text = report.text
-                incident.start_time = (
-                    report.start_time
-                    if report.start_time < incident.start_time
-                    else incident.start_time
-                )
-                incident.save()
+                info_changed = incident.information != report.information
+                start_earlier = report.start_time < incident.start_time
+                if text_changed or info_changed or start_earlier:
+                    incident.information = report.information
+                    incident.text = report.text
+                    if start_earlier:
+                        incident.start_time = report.start_time
+                    incident.save(
+                        update_fields=["information", "text", "start_time"]
+                    )
                 if text_changed:
                     should_predict = True
 
@@ -185,6 +257,10 @@ def consolidate_incidents():
         .order_by("id")
     ):
         refresh_prediction(incident)
+
+    # Overdue open incidents get a fresh conditional bound so they show
+    # "taking longer than expected — now by X" instead of vanishing.
+    refresh_revised_predictions()
 
     return pending_posts
 

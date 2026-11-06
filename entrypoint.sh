@@ -40,12 +40,23 @@ if [ "${DB_ENGINE:-postgres}" = "sqlite" ] && [ ! -f "${DB_PATH}" ]; then
         || echo "[entrypoint] No B2 replica found; will start from a fresh DB"
 fi
 
-# Gunicorn config: one sync worker. The cron's ``update_incidents`` may
-# block traffic briefly while it runs, but the steady-state cost is
-# minimal and we don't pay GIL-on-shared-CPU overhead. Timeout bumped to
-# 180s so the cron has room to finish without SIGKILL.
+# Gunicorn config: one gthread worker with a small thread pool. A single
+# *sync* worker serialised every request behind the 5-minute in-worker
+# update_incidents POST (TfL fetch + consolidation + ML), so admin pages
+# and the site stalled — and because a sync worker's request blocks the
+# arbiter heartbeat, a long update risked a --timeout SIGKILL mid-write.
+# gthread keeps one process (so ml.py's ~1.3MB model cache is not
+# duplicated and we stay within the 512MB budget) but serves requests on
+# separate threads: admin/browsing runs concurrently with the update, and
+# the heartbeat thread keeps ticking so a long update no longer trips the
+# timeout. SQLite stays safe — Django gives each thread its own connection,
+# WAL allows concurrent readers, and transactions BEGIN IMMEDIATE (see
+# settings.DATABASES) so the 20s busy_timeout serialises the rare write
+# contention. Note gthread's heartbeat also means --timeout no longer
+# bounds a long request, so UpdateIncidentsView takes a non-blocking
+# in-process lock to stop overlapping update runs.
 GUNICORN_ARGS="updown.wsgi:application --bind 0.0.0.0:8080 \
-    --workers 1 --timeout 180 \
+    --worker-class gthread --workers 1 --threads 4 --timeout 180 \
     --access-logfile - --error-logfile -"
 
 # Background cron scheduler. supercronic runs as PID > 1, logs to stdout

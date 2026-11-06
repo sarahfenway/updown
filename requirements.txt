@@ -1,11 +1,19 @@
-arrow
-django
-gunicorn
-psycopg2-binary
-pytz
-requests>=2.20.1
-tweepy
-atproto==0.0.55
+# Pinned to the versions verified together on Python 3.14 (the app's test
+# suite passes against this exact set). Previously most of these floated,
+# so an image rebuild could silently jump a major (a local resolve pulled
+# Django 6 while the code was generated on 4.1). Keep these hard-pinned and
+# bump deliberately; a lockfile (pip-tools / uv) would pin transitives too.
+arrow==1.4.0
+Django==6.0.7
+gunicorn==26.0.0
+psycopg2-binary==2.9.12
+requests==2.34.2
+tweepy==4.17.0
+atproto==0.0.69
 joblib==1.5.3
-scikit-learn==1.6.1
-whitenoise
+# scikit-learn 1.9.x is the floor that ships Python 3.14 wheels. It cannot
+# unpickle a model trained on 1.6.1, so ml/requirements.txt is kept on the
+# same version and the model is retrained after crossing this boundary.
+scikit-learn==1.9.0
+whitenoise==6.12.0
+sentry-sdk==2.65.0

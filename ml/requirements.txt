@@ -1,4 +1,7 @@
-joblib
-pandas
-requests
-scikit-learn==1.6.1
+# Training dependencies. scikit-learn MUST match requirements.txt so the
+# uploaded model can be unpickled by the runtime — retraining on a different
+# major produces a model the app can't load.
+joblib==1.5.3
+pandas==3.0.3
+requests==2.34.2
+scikit-learn==1.9.0

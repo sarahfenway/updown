@@ -1,12 +1,17 @@
+import logging
 import re
 
 import arrow
+import requests
+import requests.adapters
 import tweepy
 import atproto
 from arrow import ParserError
 from django.conf import settings
 from django.utils import timezone
 from django.utils.timezone import make_aware
+
+logger = logging.getLogger(__name__)
 
 A_DAY_IN_SECONDS = 60 * 60 * 24
 
@@ -37,42 +42,47 @@ def strip_step_free_prefix(text):
 
 
 def remove_tfl_specifics(text):
-    # We always reset this just in case there is an update
-    text = re.sub("(Please )?[Cc]all.*0[38]43 ?222 ?1234.*journey\.?", "", text)
-    text = re.sub("we ", "TfL ", text, re.IGNORECASE)
-    text = re.sub("member of staff", "member of TfL staff", text, re.IGNORECASE)
+    # NOTE: re.sub's 4th positional argument is ``count``, not ``flags`` —
+    # these all used to pass ``re.IGNORECASE`` (== 2) there, so matching was
+    # case-sensitive and silently capped at 2 replacements. They now pass
+    # ``flags=re.IGNORECASE`` properly. Patterns are raw strings so the
+    # ``\.`` escapes are valid (and don't emit SyntaxWarnings on 3.12+).
+    # Only the "Call … 0343 222 1234 … journey." sentence: "call" must be a
+    # whole word and the match can't cross a full stop, so an earlier
+    # "Engineers have been called…" or a later "…journey." sentence survives.
     text = re.sub(
-        "Call our Travel Information Centre on 0343 222 1234 if you need more help\.?",
-        "",
-        text,
-        re.IGNORECASE,
+        r"(?:[Pp]lease )?\b[Cc]all\b[^.]*?0[38]43 ?222 ?1234[^.]*?journey\.?", "", text
     )
+    # Word-bounded so case-insensitive matching turns TfL's first-person
+    # "we"/"We" into "TfL" without mangling words that merely end in "we"
+    # (e.g. "Crewe ").
+    text = re.sub(r"\bwe ", "TfL ", text, flags=re.IGNORECASE)
+    # Capture the words so their capitalisation is kept: "Member of staff"
+    # becomes "Member of TfL staff", not "member of TfL staff".
     text = re.sub(
-        "Call our Travel Information Centre on 0343 222 1234 for further help\.?",
-        "",
-        text,
-        re.IGNORECASE,
+        r"\b(member of) (staff)\b", r"\1 TfL \2", text, flags=re.IGNORECASE
     )
-    text = re.sub(
-        "Call our Travel Information Centre on 0343 222 1234 for help planning your journey\.?",
-        "",
-        text,
-        re.IGNORECASE,
-    )
-    text = re.sub(
-        "Call us on 0343 222 1234 if you need more help\.?", "", text, re.IGNORECASE
-    )
-    text = re.sub("Call 0343 222 1234 for further help\.?", "", text, re.IGNORECASE)
-    text = re.sub(
-        "Call 0343 222 1234 if you need further help\.?", "", text, re.IGNORECASE
-    )
-    text = re.sub(
-        "Call us on 0343 222 1234 for further help\.?", "", text, re.IGNORECASE
-    )
-    text = re.sub(
-        "Call us on 0343 222 1234 for further info\.?", "", text, re.IGNORECASE
-    )
+    for pattern in HELPLINE_SENTENCES:
+        text = pattern.sub("", text)
     return text
+
+
+# TfL's boilerplate helpline sentences, removed by remove_tfl_specifics.
+# Matching is case-insensitive, so each also swallows a leading "Please "
+# ("Please call us on 0343…") — otherwise a dangling "Please " is left.
+HELPLINE_SENTENCES = [
+    re.compile(r"(?:please )?" + sentence + r"\.?", re.IGNORECASE)
+    for sentence in (
+        r"Call our Travel Information Centre on 0343 222 1234 if you need more help",
+        r"Call our Travel Information Centre on 0343 222 1234 for further help",
+        r"Call our Travel Information Centre on 0343 222 1234 for help planning your journey",
+        r"Call us on 0343 222 1234 if you need more help",
+        r"Call 0343 222 1234 for further help",
+        r"Call 0343 222 1234 if you need further help",
+        r"Call us on 0343 222 1234 for further help",
+        r"Call us on 0343 222 1234 for further info",
+    )
+]
 
 
 def parse_date(text):
@@ -137,9 +147,36 @@ def fix_additional_info_grammar(text):
     return text
 
 
+TWEET_TIMEOUT_SECONDS = 15
+
+
+class _DefaultTimeoutAdapter(requests.adapters.HTTPAdapter):
+    """Applies a timeout to requests that don't set one.
+
+    tweepy issues ``session.request`` without a timeout, so a stalled X API
+    call would block the update run (and its gunicorn thread) indefinitely.
+    """
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = TWEET_TIMEOUT_SECONDS
+        return super().send(request, **kwargs)
+
+
 def send_tweet(tweet_text):
     """Send a tweet"""
     if settings.DEBUG is False:
+        credentials = (
+            settings.TWITTER_API_KEY,
+            settings.TWITTER_API_SECRET,
+            settings.TWITTER_ACCESS_TOKEN,
+            settings.TWITTER_ACCESS_TOKEN_SECRET,
+        )
+        if not all(credentials):
+            # X posting is optional (the site no longer links to X). With no
+            # credentials configured, skip quietly rather than raising — and
+            # logging a traceback, and a Sentry event — for every post.
+            return
         try:
             twitter = tweepy.Client(
                 consumer_key=settings.TWITTER_API_KEY,
@@ -147,10 +184,13 @@ def send_tweet(tweet_text):
                 access_token=settings.TWITTER_ACCESS_TOKEN,
                 access_token_secret=settings.TWITTER_ACCESS_TOKEN_SECRET,
             )
+            twitter.session.mount("https://", _DefaultTimeoutAdapter())
             twitter.create_tweet(text=tweet_text)
-        # Except everything. TODO: Look into some of twitters annoying foibles
-        except:
-            pass
+        # Twitter has many transient foibles; never let a post failure break
+        # the update run — but log it so a broken integration is visible
+        # instead of silently posting nothing for weeks.
+        except Exception:
+            logger.exception("Failed to send tweet")
     else:
         print("Should have tweeted: " + tweet_text)
 
@@ -167,9 +207,8 @@ def send_bluesky(tweet_text):
 
             text = atproto.client_utils.TextBuilder().text(tweet_text)
             client.send_post(text)
-        # Except everything.
-        except:
-            pass
+        except Exception:
+            logger.exception("Failed to send Bluesky post")
     else:
         print("Should have posted on blue sky: " + tweet_text)
 
@@ -191,9 +230,8 @@ def send_bluesky_messages(messages):
             for message in messages:
                 text = atproto.client_utils.TextBuilder().text(message)
                 client.send_post(text)
-        # Except everything.
-        except:
-            pass
+        except Exception:
+            logger.exception("Failed to send Bluesky posts")
     else:
         for message in messages:
             print("Should have posted on blue sky: " + message)

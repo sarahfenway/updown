@@ -1,21 +1,41 @@
 name: Fly Deploy
 
-# Deploy to Fly.io on every push to master. Concurrency guard cancels an
-# in-flight deploy if a newer commit lands, so you never have two deploys
-# racing for the volume.
+# Run the test suite on every push/PR, and deploy to Fly.io on pushes to
+# master — but only if the tests pass. Previously every push deployed
+# straight to production with no test gate.
 on:
   push:
     branches:
       - master
+  pull_request:
 
 concurrency:
-  group: fly-deploy
+  group: fly-deploy-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Match the runtime image (Dockerfile ARG PYTHON_VERSION).
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run tests
+        run: pytest
+
   deploy:
     name: Deploy app
     runs-on: ubuntu-latest
+    # Gate: never deploy on a red build, and only from master (not PRs).
+    needs: test
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master

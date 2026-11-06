@@ -1,3 +1,5 @@
+import logging
+
 import requests
 from django.conf import settings
 from django.db import transaction
@@ -7,6 +9,8 @@ from incidents.models import Report
 from incidents.sources.helpers import existing_report_lookup
 from incidents.utils import remove_tfl_specifics, strip_step_free_prefix
 from stations.utils import find_station_from_naptan
+
+logger = logging.getLogger(__name__)
 
 
 def check():
@@ -68,7 +72,12 @@ def check():
                     report.end_time = now
                     report.save()
 
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as exc:
         # Covers connection errors and timeouts alike — a flaky or slow
-        # TfL endpoint just means we skip this run, not crash or hang.
-        pass
+        # TfL endpoint just means we skip this run, not crash or hang. Log
+        # it so a prolonged TfL outage is visible instead of silent. Only the
+        # exception type: requests' messages embed the URL with app_key.
+        logger.warning(
+            "TfL v2 lifts fetch failed (%s); skipping this run",
+            type(exc).__name__,
+        )
