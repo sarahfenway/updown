@@ -48,7 +48,9 @@ jobs:
       - name: Install training dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r ml/requirements.txt
+          pip install -r ml/requirements.txt pytest
+      - name: Test the training code
+        run: python -m pytest ml/test_train.py -q -p no:cacheprovider
       - name: Train, validate and (if it passes) upload
         env:
           FUNCTIONS_SECRET_KEY: ${{ secrets.FUNCTIONS_SECRET_KEY }}
