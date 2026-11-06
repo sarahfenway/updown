@@ -2630,6 +2630,10 @@ class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
             "print(cron.post('/functions/update_incidents', {'key': 'wrong'}).status_code)\n"
             "print(Client(HTTP_HOST='updownlondon.com').get('/faq/').status_code)\n"
             "print(settings.DATABASES['default']['OPTIONS'].get('transaction_mode'))\n"
+            "from django.db import connection\n"
+            "cursor = connection.cursor()\n"
+            "cursor.execute('PRAGMA temp_store')\n"
+            "print(cursor.fetchone()[0])\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
             env = {
@@ -2652,11 +2656,15 @@ class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        cron_status, public_status, transaction_mode = result.stdout.split()
+        cron_status, public_status, transaction_mode, temp_store = result.stdout.split()
         # Wrong key → 404 from the view, i.e. not 301'd to https first.
         self.assertEqual(cron_status, "404")
         self.assertEqual(public_status, "301")
         self.assertEqual(transaction_mode, "IMMEDIATE")
+        # temp_store=MEMORY (2) keeps every temp file and statement journal
+        # in RAM with no cap. It tripled 0012's footprint during the
+        # 6 Nov 2026 OOM; the default (0) spills to disk past a small limit.
+        self.assertNotEqual(temp_store, "2")
 
     def test_non_ascii_functions_key_is_rejected_not_500(self):
         self.assertEqual(
@@ -2862,3 +2870,29 @@ class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
         self.assertNotIn("verysecret", json.dumps(scrubbed))
         self.assertNotIn("SECRETKEY", json.dumps(scrubbed))
         self.assertIn("x=1", scrubbed["request"]["query_string"])
+
+
+class MigrationMemoryTests(SimpleTestCase):
+    """Migrations run on boot inside the 512 MB Fly machine, before gunicorn."""
+
+    # The SQLite schema editor can't run inside TestCase's transaction.
+    databases = {"default"}
+
+    @override_settings(MIGRATION_MODULES={})
+    def test_0012_does_not_rebuild_any_table_on_sqlite(self):
+        # Production outage, 6 Nov 2026: 0012 changed MLModel.id from
+        # AutoField to BigAutoField. Django applies that on SQLite by
+        # rebuilding incidents_mlmodel, copying every stored model blob in a
+        # single INSERT ... SELECT, and `migrate` was OOM-killed on every
+        # boot. Both types are INTEGER on SQLite, so there's nothing to
+        # rebuild for.
+        out = StringIO()
+        call_command("sqlmigrate", "incidents", "0012", stdout=out)
+        sql = out.getvalue()
+
+        self.assertNotIn('"new__', sql)
+        self.assertIn('CREATE INDEX "incident_station_start_idx"', sql)
+
+    @override_settings(MIGRATION_MODULES={})
+    def test_models_have_no_unmigrated_changes(self):
+        call_command("makemigrations", "--check", "--dry-run", stdout=StringIO())

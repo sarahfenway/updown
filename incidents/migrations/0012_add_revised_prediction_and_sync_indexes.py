@@ -3,6 +3,25 @@
 from django.db import migrations, models
 
 
+class AlterFieldExceptOnSQLite(migrations.AlterField):
+    """AlterField that leaves the database alone on SQLite.
+
+    AutoField and BigAutoField are both INTEGER on SQLite, so the schema
+    doesn't change, but Django would still rebuild the table to apply it.
+    For incidents_mlmodel that copies every stored model blob in one
+    INSERT ... SELECT, which got ``migrate`` OOM-killed on the 512 MB Fly
+    machine. Other databases still get the real int -> bigint change.
+    """
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        if schema_editor.connection.vendor != "sqlite":
+            super().database_forwards(app_label, schema_editor, from_state, to_state)
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        if schema_editor.connection.vendor != "sqlite":
+            super().database_backwards(app_label, schema_editor, from_state, to_state)
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -29,7 +48,7 @@ class Migration(migrations.Migration):
             name='revised_prediction_confidence',
             field=models.FloatField(blank=True, help_text='Confidence (0-1) of the revised prediction', null=True),
         ),
-        migrations.AlterField(
+        AlterFieldExceptOnSQLite(
             model_name='mlmodel',
             name='id',
             field=models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID'),
