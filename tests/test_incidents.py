@@ -1760,7 +1760,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
             end_time=datetime(2026, 7, 1, 12, 0, tzinfo=dt_timezone.utc),
         )
 
-        response = self.client.get("/api/training-data/?key=verysecret")
+        response = self.client.get(
+            "/api/training-data/", HTTP_X_FUNCTIONS_KEY="verysecret"
+        )
         payload = json.loads(b"".join(response.streaming_content).decode("utf-8"))
 
         self.assertEqual(response.status_code, 200)
@@ -1809,7 +1811,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
             reports=[at_start, before_start, after_start],
         )
 
-        response = self.client.get("/api/training-data/?key=verysecret")
+        response = self.client.get(
+            "/api/training-data/", HTTP_X_FUNCTIONS_KEY="verysecret"
+        )
         payload = json.loads(b"".join(response.streaming_content).decode("utf-8"))
 
         self.assertEqual(response.status_code, 200)
@@ -2295,6 +2299,262 @@ class MaintenanceSnapshotTests(StationFactoryMixin, TestCase):
             self.assertFalse(os.path.exists(path))
 
 
+@override_settings(ROOT_URLCONF="updown.urls")
+class RateLimitTests(StationFactoryMixin, TestCase):
+    # The test client's REMOTE_ADDR is 127.0.0.1, which the limiter treats
+    # as the in-container cron, so these tests arrive "through Fly's proxy"
+    # with a Fly-Client-IP header (TEST-NET addresses from RFC 5737/3849).
+    CLIENT = "203.0.113.10"
+    OTHER_CLIENT = "203.0.113.20"
+
+    def setUp(self):
+        from django.core.cache import caches
+
+        caches["ratelimit"].clear()
+        self.addCleanup(caches["ratelimit"].clear)
+
+    def _get(self, path, ip=CLIENT, **extra):
+        return self.client.get(path, HTTP_FLY_CLIENT_IP=ip, **extra)
+
+    def _post(self, path, data=None, ip=CLIENT, **extra):
+        return self.client.post(path, data or {}, HTTP_FLY_CLIENT_IP=ip, **extra)
+
+    def _frozen_clock(self, at):
+        clock = patch("incidents.ratelimit.time.time", return_value=at)
+        mocked = clock.start()
+        self.addCleanup(clock.stop)
+        return mocked
+
+    def test_incidents_tsv_allows_five_an_hour_then_429_with_retry_after(self):
+        for _ in range(5):
+            self.assertEqual(self._get("/api/incidents.tsv").status_code, 200)
+
+        blocked = self._get("/api/incidents.tsv")
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertTrue(1 <= int(blocked["Retry-After"]) <= 3600)
+
+    def test_limits_are_per_client(self):
+        for _ in range(6):
+            self._get("/api/incidents.tsv")
+
+        self.assertEqual(self._get("/api/incidents.tsv").status_code, 429)
+        self.assertEqual(
+            self._get("/api/incidents.tsv", ip=self.OTHER_CLIENT).status_code, 200
+        )
+
+    def test_retry_after_counts_down_to_the_end_of_the_window(self):
+        hour_start = 1_800_000_000 - (1_800_000_000 % 3600)
+        clock = self._frozen_clock(hour_start + 600)
+        for _ in range(5):
+            self._get("/api/incidents.tsv")
+
+        blocked = self._get("/api/incidents.tsv")
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked["Retry-After"], "3000")
+
+        clock.return_value = hour_start + 3600
+        self.assertEqual(self._get("/api/incidents.tsv").status_code, 200)
+
+    def test_falls_back_to_remote_addr_without_fly_client_ip(self):
+        for _ in range(5):
+            self.client.get("/api/incidents.tsv", REMOTE_ADDR="198.51.100.7")
+
+        blocked = self.client.get("/api/incidents.tsv", REMOTE_ADDR="198.51.100.7")
+        other = self.client.get("/api/incidents.tsv", REMOTE_ADDR="198.51.100.8")
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(other.status_code, 200)
+
+    def test_fly_client_ip_wins_over_remote_addr(self):
+        # Fly's proxy is the TCP peer for every public request, so keying on
+        # REMOTE_ADDR would put the whole internet in one bucket.
+        for i in range(6):
+            self.client.get(
+                "/api/incidents.tsv",
+                HTTP_FLY_CLIENT_IP=self.CLIENT,
+                REMOTE_ADDR="172.16.0.2",
+            )
+
+        other = self.client.get(
+            "/api/incidents.tsv",
+            HTTP_FLY_CLIENT_IP=self.OTHER_CLIENT,
+            REMOTE_ADDR="172.16.0.2",
+        )
+
+        self.assertEqual(other.status_code, 200)
+
+    def test_ipv6_clients_are_limited_per_64(self):
+        # One IPv6 host usually controls a whole /64, so per-address limits
+        # would be trivial to dodge.
+        for i in range(5):
+            self._get("/api/incidents.tsv", ip=f"2001:db8:1:2::{i + 1:x}")
+
+        same_64 = self._get("/api/incidents.tsv", ip="2001:db8:1:2:ffff::1")
+        other_64 = self._get("/api/incidents.tsv", ip="2001:db8:1:3::1")
+
+        self.assertEqual(same_64.status_code, 429)
+        self.assertEqual(other_64.status_code, 200)
+
+    def test_in_container_cron_is_never_limited(self):
+        # The cron POSTs straight to gunicorn on 127.0.0.1, with no
+        # Fly-Client-IP header. Far more ticks than any limit, wrong key
+        # included, must never see a 429.
+        with patch("incidents.views.call_command"):
+            for _ in range(15):
+                self.assertEqual(
+                    self.client.post(
+                        "/functions/update_incidents", {"key": "wrong"}
+                    ).status_code,
+                    404,
+                )
+            allowed = self.client.post(
+                "/functions/update_incidents", {"key": "verysecret"}
+            )
+
+        self.assertEqual(allowed.status_code, 204)
+        for _ in range(10):
+            self.assertEqual(self.client.get("/api/incidents.tsv").status_code, 200)
+
+    def test_loopback_peer_with_fly_client_ip_is_still_limited(self):
+        # Only a direct in-container connection is exempt. Anything Fly's
+        # proxy forwarded carries Fly-Client-IP and is limited by it.
+        for _ in range(5):
+            self.client.get(
+                "/api/incidents.tsv",
+                HTTP_FLY_CLIENT_IP=self.CLIENT,
+                REMOTE_ADDR="127.0.0.1",
+            )
+
+        blocked = self.client.get(
+            "/api/incidents.tsv",
+            HTTP_FLY_CLIENT_IP=self.CLIENT,
+            REMOTE_ADDR="127.0.0.1",
+        )
+
+        self.assertEqual(blocked.status_code, 429)
+
+    def test_api_allows_generous_polling_for_carrier_nat(self):
+        for _ in range(100):
+            self.assertEqual(self._get("/api/incidents/").status_code, 200)
+        for _ in range(20):
+            self.assertEqual(self._get("/api/stations/").status_code, 200)
+
+        self.assertEqual(self._get("/api/incidents/").status_code, 429)
+        self.assertEqual(self._get("/problems.txt").status_code, 429)
+
+    def test_pages_have_their_own_per_minute_limit(self):
+        for _ in range(60):
+            self.assertEqual(self._get("/faq/").status_code, 200)
+
+        blocked = self._get("/stats/")
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertTrue(1 <= int(blocked["Retry-After"]) <= 60)
+        # The iOS app's API budget is separate from page views.
+        self.assertEqual(self._get("/api/incidents/").status_code, 200)
+
+    def test_admin_login_posts_are_limited_to_ten_per_fifteen_minutes(self):
+        credentials = {"username": "admin", "password": "guess"}
+        for _ in range(10):
+            self.assertEqual(self._post("/admin/login/", credentials).status_code, 200)
+
+        blocked = self._post("/admin/login/", credentials)
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertTrue(1 <= int(blocked["Retry-After"]) <= 15 * 60)
+        # Loading the form is a normal page view.
+        self.assertEqual(self._get("/admin/login/").status_code, 200)
+
+    def test_failed_functions_keys_are_capped_across_endpoints(self):
+        for _ in range(5):
+            self.assertEqual(
+                self._post("/functions/update_incidents", {"key": "wrong"}).status_code,
+                404,
+            )
+        for _ in range(5):
+            self.assertEqual(
+                self._get(
+                    "/api/training-data/", HTTP_X_FUNCTIONS_KEY="wrong"
+                ).status_code,
+                404,
+            )
+
+        blocked = self._post("/functions/upload_model", {"key": "wrong"})
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertTrue(1 <= int(blocked["Retry-After"]) <= 3600)
+
+    def test_capped_client_is_refused_even_with_the_right_key(self):
+        # Otherwise 429-vs-200 would still tell an attacker when a guess is
+        # right, and the cap wouldn't slow guessing at all.
+        for _ in range(10):
+            self._post("/functions/update_incidents", {"key": "wrong"})
+
+        with patch("incidents.views.call_command") as call_command_mock:
+            response = self._post("/functions/update_incidents", {"key": "verysecret"})
+
+        self.assertEqual(response.status_code, 429)
+        call_command_mock.assert_not_called()
+
+    def test_successful_functions_calls_do_not_use_up_the_cap(self):
+        for _ in range(15):
+            response = self._get(
+                "/api/training-data/", HTTP_X_FUNCTIONS_KEY="verysecret"
+            )
+            self.assertEqual(response.status_code, 200)
+            b"".join(response.streaming_content)
+
+        self.assertEqual(
+            self._post("/functions/update_incidents", {"key": "wrong"}).status_code,
+            404,
+        )
+
+    def test_training_data_ignores_key_query_param(self):
+        # A ?key= lands in access logs; only the header is accepted for GET.
+        self.assertEqual(
+            self.client.get("/api/training-data/?key=verysecret").status_code, 404
+        )
+        response = self.client.get(
+            "/api/training-data/", HTTP_X_FUNCTIONS_KEY="verysecret"
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_api_incidents_is_cached_briefly_and_refreshed_by_update(self):
+        with override_settings(
+            CACHES={
+                "default": {
+                    "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+                    "LOCATION": "api-incidents-test",
+                },
+                "ratelimit": {
+                    "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+                    "LOCATION": "ratelimit-api-incidents-test",
+                },
+            }
+        ):
+            from django.core.cache import cache
+
+            self.addCleanup(cache.clear)
+            station = self.create_parent_station("Bank")
+            self.create_incident(station, text="Lift out of order")
+
+            first = self.client.get("/api/incidents/")
+            with self.assertNumQueries(0):
+                second = self.client.get("/api/incidents/")
+            self.assertEqual(first.content, second.content)
+            self.assertEqual(len(json.loads(second.content)["issues"]), 1)
+            self.assertIn("no-store", second["Cache-Control"])
+
+            Incident.objects.update(resolved=True, end_time=timezone.now())
+            with patch("incidents.views.call_command"):
+                self.client.post("/functions/update_incidents", {"key": "verysecret"})
+
+            refreshed = json.loads(self.client.get("/api/incidents/").content)
+            self.assertEqual(refreshed["issues"], [])
+            self.assertEqual(len(refreshed["resolved"]), 1)
+
+
 class AdminPerfTests(StationFactoryMixin, TestCase):
     def setUp(self):
         from django.contrib.auth.models import User
@@ -2668,7 +2928,10 @@ class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
 
     def test_non_ascii_functions_key_is_rejected_not_500(self):
         self.assertEqual(
-            self.client.get("/api/training-data/", {"key": "é"}).status_code, 404
+            self.client.get(
+                "/api/training-data/", HTTP_X_FUNCTIONS_KEY="é"
+            ).status_code,
+            404,
         )
         self.assertEqual(
             self.client.post("/functions/update_incidents", {"key": "é"}).status_code,
