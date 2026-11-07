@@ -2825,6 +2825,63 @@ class RateLimitTests(StationFactoryMixin, TestCase):
             self.assertEqual(refreshed["issues"], [])
             self.assertEqual(len(refreshed["resolved"]), 1)
 
+    def test_api_incidents_caches_all_predictions_separately(self):
+        with override_settings(
+            CACHES={
+                "default": {
+                    "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+                    "LOCATION": "api-incidents-all-test",
+                },
+                "ratelimit": {
+                    "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+                    "LOCATION": "ratelimit-api-incidents-all-test",
+                },
+            }
+        ):
+            from django.core.cache import cache
+
+            self.addCleanup(cache.clear)
+            station = self.create_parent_station("Oval", naptan_id="OVL")
+            self.create_incident(
+                station,
+                text="Faulty lift",
+                start_time=timezone.now() - timedelta(hours=1),
+                estimated_duration=timedelta(hours=5),
+                prediction_confidence=0.82,
+            )
+            hidden_policy = {
+                b: {"show_prediction": False, "count": 3, "accuracy_pct": 40}
+                for b in range(0, 100, 10)
+            }
+
+            def issues(query=""):
+                body = self.client.get(f"/api/incidents/{query}").content
+                return json.loads(body)["issues"]
+
+            with patch(
+                "incidents.views._prediction_display_policy",
+                return_value=hidden_policy,
+            ):
+                [default] = issues()
+                [everything] = issues("?predictions=all")
+                with self.assertNumQueries(0):
+                    [other_query] = issues("?anything=else")
+                    [everything_again] = issues("?predictions=all")
+
+                self.assertIsNone(default["prediction"])
+                self.assertIs(everything["prediction"]["reliable"], False)
+                self.assertIsNone(other_query["prediction"])
+                self.assertEqual(everything_again, everything)
+
+                Incident.objects.update(resolved=True, end_time=timezone.now())
+                with patch("incidents.views.call_command"):
+                    self.client.post(
+                        "/functions/update_incidents", {"key": "verysecret"}
+                    )
+
+                self.assertEqual(issues(), [])
+                self.assertEqual(issues("?predictions=all"), [])
+
 
 class AdminPerfTests(StationFactoryMixin, TestCase):
     def setUp(self):

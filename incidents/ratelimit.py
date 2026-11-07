@@ -181,35 +181,44 @@ class RateLimitMiddleware:
 
 
 API_INCIDENTS_CACHE_KEY = "response:api_incidents"
+# ?predictions=all (the iPhone app's "Show less reliable predictions") is a
+# different response, so it gets its own entry.
+API_INCIDENTS_ALL_PREDICTIONS_CACHE_KEY = "response:api_incidents:all_predictions"
 API_INCIDENTS_CACHE_SECONDS = 60
+
+
+def _api_incidents_cache_key(request):
+    if request.GET.get("predictions") == "all":
+        return API_INCIDENTS_ALL_PREDICTIONS_CACHE_KEY
+    return API_INCIDENTS_CACHE_KEY
 
 
 def cache_api_incidents(view):
     """Serve /api/incidents/ from the default cache for up to 60 seconds.
 
-    The data only changes when the 5-minute update runs, which clears this
-    entry (UpdateIncidentsView), so a burst of polls costs one set of
-    queries. The view takes no parameters, so one entry serves every query
-    string, and random query strings can't be used to bypass it.
+    The data only changes when the 5-minute update runs, which clears these
+    entries (UpdateIncidentsView), so a burst of polls costs one set of
+    queries. The only parameter the view reads is ``predictions=all``, which
+    has its own entry; every other query string shares the default one, so
+    random query strings can't be used to bypass it.
     """
 
     @wraps(view)
     def wrapped(request, *args, **kwargs):
         if request.method not in ("GET", "HEAD"):
             return view(request, *args, **kwargs)
-        response = cache.get(API_INCIDENTS_CACHE_KEY)
+        key = _api_incidents_cache_key(request)
+        response = cache.get(key)
         if response is None:
             response = view(request, *args, **kwargs)
             if response.status_code == 200 and not response.streaming:
-                cache.set(
-                    API_INCIDENTS_CACHE_KEY,
-                    response,
-                    timeout=API_INCIDENTS_CACHE_SECONDS,
-                )
+                cache.set(key, response, timeout=API_INCIDENTS_CACHE_SECONDS)
         return response
 
     return wrapped
 
 
 def invalidate_api_incidents_cache():
-    cache.delete(API_INCIDENTS_CACHE_KEY)
+    cache.delete_many(
+        [API_INCIDENTS_CACHE_KEY, API_INCIDENTS_ALL_PREDICTIONS_CACHE_KEY]
+    )
