@@ -46,6 +46,8 @@
                                             <br>
                                             {% if issue.show_prediction %}
                                                 <span title="BETA: {% if issue.prediction_is_revised %}Taking longer than first expected — now {{ issue.prediction_label }} to be fixed {{ issue.expected_block }}{% else %}{{ issue.prediction_label|capfirst }} to be fixed {{ issue.expected_block }}{% endif %}{% if issue.prediction_accuracy_pct %} (recently similar predictions were right {{ issue.prediction_accuracy_pct }}% of the time){% endif %}">{{ issue.start_time }}</span>
+                                            {% elif issue.long_running %}
+                                                <span title="BETA: {{ issue.beta_current_status }} (recently, {{ issue.long_running.accuracy_pct }}% of faults open this long were still open a day later)">{{ issue.start_time }}</span>
                                             {% else %}
                                                 {{ issue.start_time }}
                                             {% endif %}

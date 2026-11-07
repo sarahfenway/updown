@@ -2371,7 +2371,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
                 response = self.client.get("/stats/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertLessEqual(len(queries), 3)
+        # 4th: the hourly-cached long-running ("some time") policy, which
+        # is only queried here because the test cache starts empty.
+        self.assertLessEqual(len(queries), 4)
 
     def test_faq_and_privacy_pages_render(self):
         faq_response = self.client.get("/faq/")
@@ -3177,6 +3179,264 @@ class MigrationMemoryTests(SimpleTestCase):
     @override_settings(MIGRATION_MODULES={})
     def test_models_have_no_unmigrated_changes(self):
         call_command("makemigrations", "--check", "--dry-run", stdout=StringIO())
+
+
+LONG_RUNNING_TEST_POLICY = {
+    5: {"show": True, "label": "maybe", "accuracy_pct": 60, "count": 400},
+    8: {"show": True, "label": "likely", "accuracy_pct": 72, "count": 300},
+    12: {"show": True, "label": "likely", "accuracy_pct": 80, "count": 200},
+    28: {"show": True, "label": "very likely", "accuracy_pct": 88, "count": 90},
+}
+OPEN_PREDICTION_POLICY = {
+    b: {"show_prediction": True, "count": 999, "label": "likely", "accuracy_pct": 90}
+    for b in range(0, 100, 10)
+}
+
+
+class LongRunningPolicyTests(SimpleTestCase):
+    # 20 Nov 2026 is GMT, so local time == UTC and block maths is easy to
+    # follow: 12:00 is the daytime block.
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=dt_timezone.utc)
+    start = datetime(2026, 11, 10, 12, 0, tzinfo=dt_timezone.utc)
+
+    def _end_at_offset(self, hours_after_start):
+        return self.start + timedelta(hours=hours_after_start)
+
+    def test_scores_still_open_a_day_later_per_age_band(self):
+        from incidents.views import _long_running_policy_from_rows
+
+        rows = [
+            # (start_time, end_time, resolved, text, information)
+            # Fixed at offset 4 (same block next day): never reached age 5.
+            (self.start, self._end_at_offset(24), True, "Faulty lift", False),
+            # Fixed at offset 6 (overnight next day): reached 5, not 9.
+            (self.start, self._end_at_offset(33), True, "Faulty lift", False),
+            # Fixed at offset 9 (evening two days later): reached 5 and 8.
+            (self.start, self._end_at_offset(52), True, "Faulty lift", False),
+            # Still open after 10 days: a success at every band.
+            (self.start, None, False, "Faulty lift", False),
+            # Still open, only 6 blocks old: outcome unknown, ignored.
+            (self.now - timedelta(hours=36), None, False, "Faulty lift", False),
+            # Planned work and information notices never count.
+            (self.start, self._end_at_offset(52), True, "Planned works until Friday", False),
+            (self.start, self._end_at_offset(52), True, "Faulty lift", True),
+        ]
+
+        policy = _long_running_policy_from_rows(rows, self.now)
+
+        self.assertEqual(policy[5]["count"], 3)
+        self.assertEqual(policy[5]["accuracy_pct"], 67)
+        self.assertEqual(policy[8]["count"], 2)
+        self.assertEqual(policy[8]["accuracy_pct"], 50)
+        self.assertFalse(policy[5]["show"])  # far too few samples
+
+    def test_shows_band_once_recent_evidence_is_strong_enough(self):
+        from incidents.views import _long_running_policy_from_rows
+
+        rows = [(self.start, None, False, "Faulty lift", False)] * 20
+
+        policy = _long_running_policy_from_rows(rows, self.now)
+
+        self.assertTrue(policy[5]["show"])
+        self.assertEqual(policy[5]["label"], "very likely")
+
+
+class LongRunningDisplayTests(StationFactoryMixin, TestCase):
+    def _prepare(self, incident, now, long_running_policy=LONG_RUNNING_TEST_POLICY):
+        [prepared] = _prepare_incidents(
+            [incident],
+            prediction_policy=OPEN_PREDICTION_POLICY,
+            long_running_policy=long_running_policy,
+            now=now,
+        )
+        return prepared
+
+    def test_overdue_incident_two_days_old_shows_some_time_status(self):
+        parent = self.create_parent_station("Wembley Central")
+        now = timezone.now()
+        incident = self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=now - timedelta(days=2),
+            estimated_duration=timedelta(hours=3),
+            prediction_confidence=0.8,
+        )
+
+        prepared = self._prepare(incident, now)
+
+        self.assertFalse(prepared.show_prediction)
+        self.assertEqual(prepared.long_running["label"], "likely")
+        self.assertEqual(prepared.long_running["accuracy_pct"], 72)
+        self.assertEqual(prepared.beta_current_status, "Likely to be some time")
+
+    def test_incident_with_no_model_bound_also_gets_some_time_status(self):
+        parent = self.create_parent_station("Willesden Junction")
+        now = timezone.now()
+        incident = self.create_incident(
+            parent, text="Faulty lift", start_time=now - timedelta(days=12)
+        )
+
+        prepared = self._prepare(incident, now)
+
+        self.assertEqual(prepared.long_running["label"], "very likely")
+        self.assertEqual(prepared.beta_current_status, "Very likely to be some time")
+
+    def test_young_incident_does_not_get_some_time_status(self):
+        parent = self.create_parent_station("Goodmayes")
+        now = timezone.now()
+        incident = self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=now - timedelta(days=1),
+            estimated_duration=timedelta(hours=3),
+            prediction_confidence=0.8,
+        )
+
+        self.assertIsNone(self._prepare(incident, now).long_running)
+
+    def test_shown_revised_bound_wins_over_some_time_status(self):
+        parent = self.create_parent_station("Southall")
+        now = timezone.now()
+        incident = self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=now - timedelta(days=2),
+            estimated_duration=timedelta(hours=3),
+            prediction_confidence=0.8,
+            revised_estimated_duration=timedelta(days=3),
+            revised_prediction_confidence=0.8,
+        )
+
+        prepared = self._prepare(incident, now)
+
+        self.assertTrue(prepared.show_prediction)
+        self.assertIsNone(prepared.long_running)
+
+    def test_planned_work_never_gets_some_time_status(self):
+        parent = self.create_parent_station("Canada Water")
+        now = timezone.now()
+        incident = self.create_incident(
+            parent,
+            text="Until Spring 2027, no step-free access at this station",
+            start_time=now - timedelta(days=40),
+        )
+
+        self.assertIsNone(self._prepare(incident, now).long_running)
+
+    def test_band_hidden_by_policy_gets_no_status(self):
+        parent = self.create_parent_station("Shenfield")
+        now = timezone.now()
+        incident = self.create_incident(
+            parent, text="Faulty lift", start_time=now - timedelta(days=2)
+        )
+        policy = {**LONG_RUNNING_TEST_POLICY, 8: {"show": False, "count": 3}}
+
+        self.assertIsNone(self._prepare(incident, now, policy).long_running)
+
+    def test_without_a_long_running_policy_nothing_changes(self):
+        parent = self.create_parent_station("Morden")
+        now = timezone.now()
+        incident = self.create_incident(
+            parent, text="Faulty lift", start_time=now - timedelta(days=2)
+        )
+
+        self.assertIsNone(self._prepare(incident, now, None).long_running)
+
+    def _create_two_day_old_overdue_incident(self):
+        parent = self.create_parent_station("Canary Wharf", naptan_id="CWF")
+        return self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=timezone.now() - timedelta(days=2, hours=1),
+            estimated_duration=timedelta(hours=3),
+            prediction_confidence=0.8,
+        )
+
+    def _patched_policies(self):
+        return (
+            patch(
+                "incidents.views._prediction_display_policy",
+                return_value=OPEN_PREDICTION_POLICY,
+            ),
+            patch(
+                "incidents.views._long_running_policy",
+                return_value=LONG_RUNNING_TEST_POLICY,
+            ),
+        )
+
+    def test_api_exposes_some_time_prediction(self):
+        self._create_two_day_old_overdue_incident()
+        display, long_running = self._patched_policies()
+
+        with display, long_running:
+            [issue] = self.client.get("/api/incidents/").json()["issues"]
+
+        self.assertEqual(
+            issue["prediction"],
+            {
+                "kind": "some_time",
+                "fixed_by": None,
+                "fixed_by_label": None,
+                "likelihood": "likely",
+                "confidence_pct": None,
+                "recent_accuracy_pct": 72,
+                "revised": False,
+            },
+        )
+
+    def test_api_marks_ordinary_predictions_as_fixed_by(self):
+        parent = self.create_parent_station("Euston", naptan_id="EUS")
+        self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.8,
+        )
+        display, long_running = self._patched_policies()
+
+        with display, long_running:
+            [issue] = self.client.get("/api/incidents/").json()["issues"]
+
+        self.assertEqual(issue["prediction"]["kind"], "fixed_by")
+
+    def test_home_and_beta_pages_show_some_time_status(self):
+        self._create_two_day_old_overdue_incident()
+
+        for url in ("/", "/beta/"):
+            display, long_running = self._patched_policies()
+            with display, long_running:
+                html = self.client.get(url).content.decode()
+            self.assertIn("Likely to be some time", html, url)
+
+    def test_stats_counts_some_time_separately_from_hidden(self):
+        incident = self._create_two_day_old_overdue_incident()
+        now = timezone.now()
+        # A resolved prediction so the stats prediction section renders.
+        self.create_incident(
+            incident.station,
+            text="Faulty lift",
+            resolved=True,
+            start_time=now - timedelta(days=1, hours=2),
+            end_time=now - timedelta(days=1, hours=1),
+            estimated_duration=timedelta(hours=3),
+            prediction_confidence=0.8,
+        )
+
+        with patch(
+            "incidents.views._long_running_policy",
+            return_value=LONG_RUNNING_TEST_POLICY,
+        ):
+            response = self.client.get("/stats/")
+
+        self.assertEqual(response.context["current_prediction_long_running_count"], 1)
+        self.assertEqual(response.context["current_prediction_hidden_past_due_count"], 0)
+        self.assertContains(response, "Shown in beta: likely to be some time")
+        self.assertEqual(
+            [row["age_label"] for row in response.context["long_running_rows"]],
+            ["1¼ to 2 days", "2 to 3 days", "3 to 7 days", "7+ days"],
+        )
+        self.assertContains(response, "<td>Very likely</td>", html=False)
 
 
 class AppStorePromoTests(TestCase):
