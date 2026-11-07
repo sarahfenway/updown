@@ -1729,6 +1729,188 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(len(payload["resolved"]), 1)
         self.assertEqual(len(payload["information"]), 1)
 
+    def _api_payload_with_open_policy(self):
+        policy = {
+            b: {
+                "show_prediction": True,
+                "count": 999,
+                "label": "likely",
+                "accuracy_pct": 90,
+            }
+            for b in range(0, 100, 10)
+        }
+        with patch(
+            "incidents.views._prediction_display_policy", return_value=policy
+        ):
+            response = self.client.get("/api/incidents/")
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _assert_close_to(self, iso_value, expected_dt):
+        actual = datetime.fromisoformat(iso_value)
+        self.assertLess(abs(actual - expected_dt), timedelta(seconds=1))
+
+    def test_api_incidents_includes_shown_prediction_for_current_issue(self):
+        parent = self.create_parent_station("Euston", naptan_id="EUS")
+        incident = self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.82,
+        )
+
+        [issue] = self._api_payload_with_open_policy()["issues"]
+
+        prediction = issue["prediction"]
+        self._assert_close_to(
+            prediction["fixed_by"], incident.start_time + timedelta(hours=5)
+        )
+        self.assertIsInstance(prediction["fixed_by_label"], str)
+        self.assertEqual(prediction["likelihood"], "likely")
+        self.assertEqual(prediction["confidence_pct"], 82)
+        self.assertEqual(prediction["recent_accuracy_pct"], 90)
+        self.assertFalse(prediction["revised"])
+        self.assertNotIn("outcome", prediction)
+
+    def test_api_incidents_omits_predictions_the_site_hides(self):
+        parent = self.create_parent_station("Angel", naptan_id="ANG")
+        self.create_incident(parent, text="No prediction at all")
+        self.create_incident(
+            parent,
+            text="Past its bound with no revision",
+            start_time=timezone.now() - timedelta(hours=6),
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.8,
+        )
+
+        issues = self._api_payload_with_open_policy()["issues"]
+
+        self.assertEqual(len(issues), 2)
+        for issue in issues:
+            self.assertIn("prediction", issue)
+            self.assertIsNone(issue["prediction"], issue["text"])
+
+    def test_api_incidents_omits_prediction_when_bucket_policy_hides_it(self):
+        parent = self.create_parent_station("Oval", naptan_id="OVL")
+        self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.82,
+        )
+        hidden_policy = {
+            b: {"show_prediction": False, "count": 999} for b in range(0, 100, 10)
+        }
+
+        with patch(
+            "incidents.views._prediction_display_policy",
+            return_value=hidden_policy,
+        ):
+            [issue] = self.client.get("/api/incidents/").json()["issues"]
+
+        self.assertIsNone(issue["prediction"])
+
+    def test_api_incidents_flags_revised_prediction(self):
+        parent = self.create_parent_station("Holborn", naptan_id="HOL")
+        incident = self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=timezone.now() - timedelta(hours=4),
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.8,
+            revised_estimated_duration=timedelta(hours=6),
+            revised_prediction_confidence=0.7,
+        )
+
+        [issue] = self._api_payload_with_open_policy()["issues"]
+
+        prediction = issue["prediction"]
+        self.assertTrue(prediction["revised"])
+        self.assertEqual(prediction["confidence_pct"], 70)
+        self._assert_close_to(
+            prediction["fixed_by"], incident.start_time + timedelta(hours=6)
+        )
+
+    def test_api_incidents_includes_outcome_for_recently_resolved(self):
+        parent = self.create_parent_station("Pimlico", naptan_id="PIM")
+        now = timezone.now()
+        self.create_incident(
+            parent,
+            text="Fixed early",
+            resolved=True,
+            start_time=now - timedelta(hours=4),
+            end_time=now - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.8,
+        )
+        self.create_incident(
+            parent,
+            text="Fixed late",
+            resolved=True,
+            start_time=now - timedelta(hours=10),
+            end_time=now - timedelta(hours=1),
+            estimated_duration=timedelta(hours=2),
+            prediction_confidence=0.8,
+        )
+
+        resolved = {
+            item["text"]: item
+            for item in self._api_payload_with_open_policy()["resolved"]
+        }
+
+        self.assertEqual(resolved["Fixed early"]["prediction"]["outcome"], "exact")
+        self.assertEqual(resolved["Fixed late"]["prediction"]["outcome"], "miss")
+
+    def test_api_incidents_query_count_does_not_grow_with_incidents(self):
+        def query_count():
+            with CaptureQueriesContext(connection) as ctx:
+                self._api_payload_with_open_policy()
+            return len(ctx.captured_queries)
+
+        parent = self.create_parent_station("Temple", naptan_id="TMP")
+        self.create_incident(
+            parent,
+            text="Lift one",
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.8,
+        )
+        baseline = query_count()
+        for i in range(5):
+            other = self.create_parent_station(f"Temple {i}", naptan_id=f"TMP{i}")
+            self.create_incident(
+                other,
+                text=f"Lift {i}",
+                estimated_duration=timedelta(hours=5),
+                prediction_confidence=0.8,
+            )
+            self.create_incident(
+                other,
+                text=f"Fixed {i}",
+                resolved=True,
+                end_time=timezone.now() - timedelta(minutes=5),
+                estimated_duration=timedelta(hours=5),
+                prediction_confidence=0.8,
+            )
+
+        self.assertEqual(query_count(), baseline)
+
+    def test_api_incidents_never_includes_predictions_for_information(self):
+        parent = self.create_parent_station("Bank", naptan_id="BNK")
+        self.create_incident(
+            parent,
+            text="Planned works",
+            information=True,
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.82,
+        )
+
+        [item] = self._api_payload_with_open_policy()["information"]
+
+        self.assertIsNone(item["prediction"])
+
     def test_api_training_data_uses_local_time_and_clean_text(self):
         parent = self.create_parent_station("Liverpool Street", naptan_id="LST")
         report_one = self.create_report(
@@ -2611,6 +2793,40 @@ class RevisedPredictionTests(StationFactoryMixin, TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.context["current_prediction_overdue_count"], 1)
         self.assertIn("prediction_accuracy_worst_case_pct", response.context)
+
+    def test_stats_overdue_count_excludes_incidents_still_within_grace(self):
+        # An incident 10 minutes past its bound can still resolve inside the
+        # 30-minute grace and score as correct, so it is not yet a guaranteed
+        # miss and must not be counted against the worst-case rate.
+        parent = self.create_parent_station("GreenParkGrace", naptan_id="GPG")
+        now = timezone.now()
+        self.create_incident(
+            parent,
+            text="Faulty lift",
+            resolved=True,
+            start_time=now - timedelta(days=1, hours=2),
+            end_time=now - timedelta(days=1, hours=1),
+            estimated_duration=timedelta(hours=3),
+            prediction_confidence=0.8,
+        )
+        self.create_incident(
+            parent,
+            text="Faulty lift within grace",
+            start_time=now - timedelta(minutes=70),
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.8,
+        )
+        self.create_incident(
+            parent,
+            text="Faulty lift beyond grace",
+            start_time=now - timedelta(hours=2),
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.8,
+        )
+
+        response = self.client.get("/stats/")
+
+        self.assertEqual(response.context["current_prediction_overdue_count"], 1)
 
 
 class ReviewFixRegressionTests(StationFactoryMixin, TestCase):

@@ -918,42 +918,96 @@ def beta_detail(request):
     return render(request, "beta.html", _status_page_context())
 
 
+API_INCIDENT_FIELDS = (
+    "id", "text", "start_time", "end_time",
+    "resolved", "information", "station_name", "station_naptan",
+)
+
+
+def _api_prediction(incident):
+    """The beta prediction exactly as the site shows it, or None.
+
+    Mirrors the homepage: information notices never carry one, and a
+    prediction the display policy hides (sparse or inaccurate bucket, bound
+    already passed with no revision, no usable prediction) is omitted rather
+    than exposed, so API clients can't show what the site deliberately hides.
+    """
+    if (
+        incident.information
+        or not incident.show_prediction
+        or incident.expected_end_time is None
+    ):
+        return None
+    prediction = {
+        "fixed_by": incident.expected_end_time,
+        "fixed_by_label": incident.expected_block,
+        "likelihood": incident.prediction_label,
+        "confidence_pct": incident.confidence_pct,
+        "recent_accuracy_pct": incident.prediction_accuracy_pct,
+        "revised": incident.prediction_is_revised,
+    }
+    if incident.resolved:
+        prediction["outcome"] = incident.prediction_outcome
+    return prediction
+
+
+def _api_incident_rows(incidents):
+    return [
+        {
+            **{field: getattr(incident, field) for field in API_INCIDENT_FIELDS},
+            "prediction": _api_prediction(incident),
+        }
+        for incident in incidents
+    ]
+
+
 @never_cache
 def api_incidents(request):
-    API_FIELDS = (
-        "id", "text", "start_time", "end_time",
-        "resolved", "information", "station_name", "station_naptan",
+    now = timezone.now()
+    prediction_policy = _prediction_display_policy(now)
+    base_qs = (
+        Incident.objects.select_related("station", "station__parent_station")
+        .order_by("-start_time", "station__parent_station")
+        .annotate(
+            station_name=Coalesce(
+                "station__parent_station__name",
+                "station__name",
+                output_field=CharField(),
+            ),
+            station_naptan=Coalesce(
+                "station__parent_station__naptan_id",
+                "station__parent_station__hub_naptan_id",
+                "station__naptan_id",
+                "station__hub_naptan_id",
+                output_field=CharField(),
+            ),
+        )
     )
 
-    base_qs = Incident.objects.order_by(
-        "-start_time", "station__parent_station"
-    ).annotate(
-        station_name=Coalesce(
-            "station__parent_station__name",
-            "station__name",
-            output_field=CharField(),
+    raw_issues = list(base_qs.filter(resolved=False, information=False))
+    issues = _prepare_incidents(
+        raw_issues,
+        prediction_policy=prediction_policy,
+        station_prediction_overrides=_prediction_station_overrides(
+            raw_issues, prediction_policy, now
         ),
-        station_naptan=Coalesce(
-            "station__parent_station__naptan_id",
-            "station__parent_station__hub_naptan_id",
-            "station__naptan_id",
-            "station__hub_naptan_id",
-            output_field=CharField(),
-        ),
+        now=now,
+    )
+    resolved = _prepare_incidents(
+        base_qs.filter(resolved=True, end_time__gte=now - timedelta(hours=12)),
+        prediction_policy=prediction_policy,
+        now=now,
+    )
+    information = _prepare_incidents(
+        base_qs.filter(resolved=False, information=True),
+        prediction_policy=prediction_policy,
+        now=now,
     )
 
     data = {
-        "issues": list(
-            base_qs.filter(resolved=False, information=False).values(*API_FIELDS)
-        ),
-        "resolved": list(
-            base_qs.filter(
-                resolved=True, end_time__gte=timezone.now() - timedelta(hours=12)
-            ).values(*API_FIELDS)
-        ),
-        "information": list(
-            base_qs.filter(resolved=False, information=True).values(*API_FIELDS)
-        ),
+        "issues": _api_incident_rows(issues),
+        "resolved": _api_incident_rows(resolved),
+        "information": _api_incident_rows(information),
         "last_updated": datetime.now().isoformat(),
     }
 
@@ -1204,12 +1258,15 @@ def _prediction_stats(since):
     # have already broken the "fixed by" promise) are invisible to it until
     # they resolve. Count them and offer a worst-case rate that assumes every
     # one is a miss, so the figure can't silently overstate the promise.
+    # Scoring allows PREDICTION_BOUNDARY_GRACE past the bound, so an incident
+    # is only a guaranteed miss once it is open beyond bound + grace.
     current_prediction_overdue_count = sum(
         1
         for issue in current_issues
         if issue.estimated_duration
         and issue.start_time
-        and issue.start_time + issue.estimated_duration <= now
+        and issue.start_time + issue.estimated_duration + PREDICTION_BOUNDARY_GRACE
+        < now
     )
     worst_case_denominator = count + current_prediction_overdue_count
     prediction_accuracy_worst_case_pct = (
