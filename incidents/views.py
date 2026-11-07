@@ -893,6 +893,7 @@ def _prepare_incidents(
                 incident.used_station_prediction_override = True
         incident.prediction_label = bucket_policy.get("label")
         incident.prediction_accuracy_pct = bucket_policy.get("accuracy_pct")
+        incident.prediction_bucket_shown = bool(bucket_policy.get("show_prediction"))
         incident.prediction_hidden_reason = (
             None
             if incident.resolved
@@ -1080,13 +1081,23 @@ API_INCIDENT_FIELDS = (
 )
 
 
-def _api_prediction(incident):
+# Hidden only because recent predictions like it were too few or too often
+# wrong; ?predictions=all exposes these, flagged reliable: false.
+LESS_RELIABLE_HIDDEN_REASONS = ("bucket_too_sparse", "bucket_accuracy_too_low")
+
+
+def _api_prediction(incident, include_less_reliable=False, now=None):
     """The beta prediction exactly as the site shows it, or None.
 
     Mirrors the homepage: information notices never carry one, and a
     prediction the display policy hides (sparse or inaccurate bucket, bound
     already passed with no revision, no usable prediction) is omitted rather
     than exposed, so API clients can't show what the site deliberately hides.
+
+    ``include_less_reliable`` (``?predictions=all``) is the exception: current
+    predictions hidden only by a sparse or inaccurate bucket are included with
+    ``reliable: false`` and likelihood "maybe". Past-due and missing
+    predictions are never exposed.
 
     ``kind`` is "fixed_by" for an ordinary bound, or "some_time" for a
     long-running fault that is probably not fixed within the next day (no
@@ -1103,28 +1114,44 @@ def _api_prediction(incident):
             "confidence_pct": None,
             "recent_accuracy_pct": incident.long_running["accuracy_pct"],
             "revised": False,
+            "reliable": True,
         }
-    if not incident.show_prediction or incident.expected_end_time is None:
+    if incident.expected_end_time is None:
+        return None
+    if now is None:
+        now = timezone.now()
+    if incident.show_prediction:
+        likelihood = incident.prediction_label
+        reliable = incident.prediction_bucket_shown
+    elif (
+        include_less_reliable
+        and incident.prediction_hidden_reason in LESS_RELIABLE_HIDDEN_REASONS
+        and incident.expected_end_time > now
+    ):
+        likelihood = "maybe"
+        reliable = False
+    else:
         return None
     prediction = {
         "kind": "fixed_by",
         "fixed_by": incident.expected_end_time,
         "fixed_by_label": incident.expected_block,
-        "likelihood": incident.prediction_label,
+        "likelihood": likelihood,
         "confidence_pct": incident.confidence_pct,
         "recent_accuracy_pct": incident.prediction_accuracy_pct,
         "revised": incident.prediction_is_revised,
+        "reliable": reliable,
     }
     if incident.resolved:
         prediction["outcome"] = incident.prediction_outcome
     return prediction
 
 
-def _api_incident_rows(incidents):
+def _api_incident_rows(incidents, include_less_reliable=False, now=None):
     return [
         {
             **{field: getattr(incident, field) for field in API_INCIDENT_FIELDS},
-            "prediction": _api_prediction(incident),
+            "prediction": _api_prediction(incident, include_less_reliable, now),
         }
         for incident in incidents
     ]
@@ -1133,6 +1160,7 @@ def _api_incident_rows(incidents):
 @never_cache
 def api_incidents(request):
     now = timezone.now()
+    include_less_reliable = request.GET.get("predictions") == "all"
     prediction_policy = _prediction_display_policy(now)
     base_qs = (
         Incident.objects.select_related("station", "station__parent_station")
@@ -1175,9 +1203,9 @@ def api_incidents(request):
     )
 
     data = {
-        "issues": _api_incident_rows(issues),
-        "resolved": _api_incident_rows(resolved),
-        "information": _api_incident_rows(information),
+        "issues": _api_incident_rows(issues, include_less_reliable, now),
+        "resolved": _api_incident_rows(resolved, include_less_reliable, now),
+        "information": _api_incident_rows(information, include_less_reliable, now),
         "last_updated": datetime.now().isoformat(),
     }
 
