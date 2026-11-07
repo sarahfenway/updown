@@ -25,9 +25,14 @@ PASSWORD_HASHERS = [
 STATICFILES_DIRS = [f"{BASE_DIR}/static"]
 
 # Dummy cache so per-test state never leaks via the prediction-policy
-# cache we use in production.
+# cache we use in production. The rate limiter needs real counters; its
+# tests clear them, and the test client's 127.0.0.1 is exempt anyway.
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.dummy.DummyCache",
-    }
+    },
+    "ratelimit": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "ratelimit-tests",
+    },
 }

@@ -58,9 +58,10 @@ def _valid_functions_key(provided):
 def _request_functions_key(request, params):
     """The caller's functions key: the X-Functions-Key header, else ``key``.
 
-    Prefer the header — a ``?key=`` query param ends up in gunicorn's access
-    log (and anything else that records URLs). ``params`` is request.POST or
-    request.GET; the form/query fallback keeps existing callers working.
+    ``params`` is request.POST: the cron and ml/train.py's model upload send
+    ``key`` in the form body. Never pass request.GET — a ``?key=`` query
+    param ends up in gunicorn's access log (and anything else that records
+    URLs), so GET endpoints accept the header only.
     """
     return request.headers.get("X-Functions-Key") or params.get("key")
 
@@ -1656,6 +1657,9 @@ class UpdateIncidentsView(View):
             call_command("update_incidents", timing=True)
         finally:
             _update_incidents_lock.release()
+        from incidents.ratelimit import invalidate_api_incidents_cache
+
+        invalidate_api_incidents_cache()
         return HttpResponse(status=204)
 
 
@@ -1663,7 +1667,7 @@ def api_training_data(request):
     import heapq
     import json
 
-    if not _valid_functions_key(_request_functions_key(request, request.GET)):
+    if not _valid_functions_key(request.headers.get("X-Functions-Key")):
         return HttpResponseNotFound()
 
     base_qs = Incident.objects.filter(resolved=True, end_time__isnull=False)

@@ -98,6 +98,11 @@ MIDDLEWARE = [
     # separate static-site service needed on Fly. Must come right after
     # SecurityMiddleware per the project's docs.
     "whitenoise.middleware.WhiteNoiseMiddleware",
+    # Per-client rate limits (429 + Retry-After). After WhiteNoise so static
+    # files aren't counted, and before everything that touches the database
+    # so a refused request costs almost nothing. Never limits the
+    # in-container cron (a direct loopback connection).
+    "incidents.ratelimit.RateLimitMiddleware",
     # Database-maintenance freeze mode. When MAINTENANCE_SNAPSHOT is set it
     # serves a one-off static render of the homepage and touches the DB
     # zero times — letting the SQLite file be taken offline for surgery.
@@ -131,6 +136,23 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "updown.wsgi.application"
+
+# Both caches are per-process memory, which is right for the single
+# gunicorn process (gthread, 4 threads). The rate-limit counters get their
+# own alias so they can't evict, or be evicted by, the default cache's
+# entries (300 max by default), and so tests can swap one without the other.
+# 10,000 counters is a few MB. With more than one process or machine the
+# "ratelimit" alias must move to a shared cache, or each one counts alone.
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+    },
+    "ratelimit": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "ratelimit",
+        "OPTIONS": {"MAX_ENTRIES": 10000},
+    },
+}
 
 
 # Database
@@ -299,8 +321,8 @@ LOGGING = {
 # turns the app's many "log and carry on" failure paths into an actual alert.
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 
-# Secrets travel as `key` (FUNCTIONS_SECRET_KEY, in form bodies and the
-# legacy ?key= query param) and `app_id`/`app_key` (TfL, in outbound URLs
+# Secrets travel as `key` (FUNCTIONS_SECRET_KEY, in form bodies, and the
+# retired ?key= query param that old clients may still send) and `app_id`/`app_key` (TfL, in outbound URLs
 # that also appear in requests' exception messages). Sentry's default
 # scrubber doesn't know any of these names, and send_default_pii=False
 # doesn't drop request bodies or query strings, so redact them explicitly.
