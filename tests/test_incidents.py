@@ -1911,6 +1911,93 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
         self.assertIsNone(item["prediction"])
 
+    def _api_payload_with_hidden_policy(self, query=""):
+        policy = {
+            b: {"show_prediction": False, "count": 3, "accuracy_pct": 40}
+            for b in range(0, 100, 10)
+        }
+        with patch(
+            "incidents.views._prediction_display_policy", return_value=policy
+        ):
+            response = self.client.get(f"/api/incidents/{query}")
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def test_api_incidents_marks_shown_predictions_reliable(self):
+        parent = self.create_parent_station("Euston", naptan_id="EUS")
+        self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.82,
+        )
+
+        [issue] = self._api_payload_with_open_policy()["issues"]
+
+        self.assertIs(issue["prediction"]["reliable"], True)
+
+    def test_api_incidents_all_predictions_includes_hidden_ones_as_unreliable(self):
+        parent = self.create_parent_station("Oval", naptan_id="OVL")
+        incident = self.create_incident(
+            parent,
+            text="Faulty lift",
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.82,
+        )
+
+        [default] = self._api_payload_with_hidden_policy()["issues"]
+        [issue] = self._api_payload_with_hidden_policy("?predictions=all")["issues"]
+
+        self.assertIsNone(default["prediction"])
+        prediction = issue["prediction"]
+        self.assertEqual(prediction["kind"], "fixed_by")
+        self.assertIs(prediction["reliable"], False)
+        self.assertEqual(prediction["likelihood"], "maybe")
+        self.assertEqual(prediction["recent_accuracy_pct"], 40)
+        self.assertEqual(prediction["confidence_pct"], 82)
+        self.assertIsInstance(prediction["fixed_by_label"], str)
+        self._assert_close_to(
+            prediction["fixed_by"], incident.start_time + timedelta(hours=5)
+        )
+
+    def test_api_incidents_all_predictions_still_omits_past_due_and_missing(self):
+        parent = self.create_parent_station("Angel", naptan_id="ANG")
+        self.create_incident(parent, text="No prediction at all")
+        self.create_incident(
+            parent,
+            text="Past its bound",
+            start_time=timezone.now() - timedelta(hours=6),
+            estimated_duration=timedelta(hours=1),
+            prediction_confidence=0.8,
+        )
+
+        issues = self._api_payload_with_hidden_policy("?predictions=all")["issues"]
+
+        self.assertEqual(len(issues), 2)
+        for issue in issues:
+            self.assertIsNone(issue["prediction"], issue["text"])
+
+    def test_api_incidents_resolved_prediction_reliable_follows_bucket(self):
+        parent = self.create_parent_station("Pimlico", naptan_id="PIM")
+        now = timezone.now()
+        self.create_incident(
+            parent,
+            text="Fixed",
+            resolved=True,
+            start_time=now - timedelta(hours=4),
+            end_time=now - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
+            prediction_confidence=0.8,
+        )
+
+        [shown] = self._api_payload_with_open_policy()["resolved"]
+        [hidden] = self._api_payload_with_hidden_policy("?predictions=all")["resolved"]
+
+        self.assertIs(shown["prediction"]["reliable"], True)
+        self.assertIs(hidden["prediction"]["reliable"], False)
+
     def test_api_training_data_uses_local_time_and_clean_text(self):
         parent = self.create_parent_station("Liverpool Street", naptan_id="LST")
         report_one = self.create_report(
@@ -2737,6 +2824,63 @@ class RateLimitTests(StationFactoryMixin, TestCase):
             refreshed = json.loads(self.client.get("/api/incidents/").content)
             self.assertEqual(refreshed["issues"], [])
             self.assertEqual(len(refreshed["resolved"]), 1)
+
+    def test_api_incidents_caches_all_predictions_separately(self):
+        with override_settings(
+            CACHES={
+                "default": {
+                    "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+                    "LOCATION": "api-incidents-all-test",
+                },
+                "ratelimit": {
+                    "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+                    "LOCATION": "ratelimit-api-incidents-all-test",
+                },
+            }
+        ):
+            from django.core.cache import cache
+
+            self.addCleanup(cache.clear)
+            station = self.create_parent_station("Oval", naptan_id="OVL")
+            self.create_incident(
+                station,
+                text="Faulty lift",
+                start_time=timezone.now() - timedelta(hours=1),
+                estimated_duration=timedelta(hours=5),
+                prediction_confidence=0.82,
+            )
+            hidden_policy = {
+                b: {"show_prediction": False, "count": 3, "accuracy_pct": 40}
+                for b in range(0, 100, 10)
+            }
+
+            def issues(query=""):
+                body = self.client.get(f"/api/incidents/{query}").content
+                return json.loads(body)["issues"]
+
+            with patch(
+                "incidents.views._prediction_display_policy",
+                return_value=hidden_policy,
+            ):
+                [default] = issues()
+                [everything] = issues("?predictions=all")
+                with self.assertNumQueries(0):
+                    [other_query] = issues("?anything=else")
+                    [everything_again] = issues("?predictions=all")
+
+                self.assertIsNone(default["prediction"])
+                self.assertIs(everything["prediction"]["reliable"], False)
+                self.assertIsNone(other_query["prediction"])
+                self.assertEqual(everything_again, everything)
+
+                Incident.objects.update(resolved=True, end_time=timezone.now())
+                with patch("incidents.views.call_command"):
+                    self.client.post(
+                        "/functions/update_incidents", {"key": "verysecret"}
+                    )
+
+                self.assertEqual(issues(), [])
+                self.assertEqual(issues("?predictions=all"), [])
 
 
 class AdminPerfTests(StationFactoryMixin, TestCase):
@@ -3644,6 +3788,7 @@ class LongRunningDisplayTests(StationFactoryMixin, TestCase):
                 "confidence_pct": None,
                 "recent_accuracy_pct": 72,
                 "revised": False,
+                "reliable": True,
             },
         )
 
