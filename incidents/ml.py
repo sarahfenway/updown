@@ -340,9 +340,14 @@ def _clear_model_cache():
     _cached_model_row_id = None
 
 
+def is_planned_work_text(text, information=False):
+    """Planned work states its own end date, so we never predict it."""
+    text = normalise_incident_text(text).lower()
+    return "planned" in text or "until " in text or bool(information)
+
+
 def _is_planned_work(incident):
-    text = normalise_incident_text(incident.text).lower()
-    return "planned" in text or "until " in text or incident.information
+    return is_planned_work_text(incident.text, incident.information)
 
 
 def _prediction_category_from_text(text):

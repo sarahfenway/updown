@@ -42,18 +42,18 @@
                                         {% endif %}
                                         {% if issue.start_time %}
                                             <br>
-                                            {% if issue.show_prediction %}
+                                            {% if issue.show_prediction or issue.long_running %}
                                                 {{ issue.start_time }}
                                                 <span class="beta-inline-status beta-inline-status-current" title="{{ issue.beta_current_status_title }}">
                                                     <span class="beta-inline-status-main">
                                                         <i class="icon-magic beta-inline-status-icon" aria-hidden="true"></i>
                                                         <span>{{ issue.beta_current_status }}</span>
-                                                        <span class="sr-only">. AI prediction. {{ issue.beta_meter_help_text }}</span>
+                                                        <span class="sr-only">. {% if issue.long_running %}Estimate from recent long-running faults{% else %}AI prediction{% endif %}. {{ issue.beta_meter_help_text }}</span>
                                                     </span>
-                                                    {% if issue.prediction_accuracy_pct is not None %}
+                                                    {% if issue.beta_meter_pct is not None %}
                                                         <span class="beta-inline-status-meter">
                                                             <span class="beta-inline-meter" aria-hidden="true">
-                                                                <span class="beta-inline-meter-fill" style="width: {{ issue.prediction_accuracy_pct }}%;"></span>
+                                                                <span class="beta-inline-meter-fill" style="width: {{ issue.beta_meter_pct }}%;"></span>
                                                             </span>
                                                         </span>
                                                     {% endif %}

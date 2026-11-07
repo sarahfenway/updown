@@ -94,6 +94,34 @@
                 </svg>
                 {% endif %}
 
+                {% if long_running_rows %}
+                <h3>Long-Running Faults</h3>
+                <p><i>The model can't predict a fix time more than about two days ahead. Once a fault has lasted past the same time the next day, we instead say it is likely to be some time, meaning it probably won't be fixed within the next day. That claim is "correct" if the fault was still open a day later. Each row is scored on faults from the last {{ long_running_window_days }} days at the start of the age range, and is only shown under the same rule as other predictions.</i></p>
+                <div class="table-responsive">
+                    <table class="table table-striped table-condensed">
+                        <caption class="sr-only">For faults that have been open for each age range, how often they were still open a day later, and whether the "some time" label is shown.</caption>
+                        <thead>
+                            <tr>
+                                <th scope="col">Open for</th>
+                                <th scope="col">Still open a day later</th>
+                                <th scope="col">Faults</th>
+                                <th scope="col">Shown as</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in long_running_rows %}
+                            <tr>
+                                <td>{{ row.age_label }}</td>
+                                <td>{% if row.accuracy_pct is not None %}{{ row.accuracy_pct }}%{% else %}–{% endif %}</td>
+                                <td>{{ row.count }}</td>
+                                <td>{% if row.show %}{{ row.label|capfirst }}{% else %}Hidden{% endif %}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+
                 <h3>Current Prediction Visibility</h3>
                 <p><i>For unresolved issues right now, this is why beta predictions are shown or hidden.</i></p>
                 <div class="table-responsive">
@@ -113,6 +141,10 @@
                             <tr>
                                 <td>Shown in beta</td>
                                 <td>{{ current_prediction_visible_count }}</td>
+                            </tr>
+                            <tr>
+                                <td>Shown in beta: likely to be some time</td>
+                                <td>{{ current_prediction_long_running_count }}</td>
                             </tr>
                             <tr>
                                 <td>Hidden: too few similar examples</td>
