@@ -60,6 +60,40 @@ A different model family (a discrete-time survival model) was tested against
 the current 9-class classifier plus a tail table. At an equal hit rate it was
 no tighter, and it was less well calibrated. The classifier stays.
 
+### History from previous faults
+
+The model today knows a station's average fault length, how many faults it
+has had, and the days since the last one began. Richer history carries real
+signal (same test year, unplanned faults):
+
+| Situation | Lasts 2+ days | Fixed within ~10 h |
+|---|---|---|
+| All faults | 8.5% | 61% |
+| Same fault seen before, last one took 2+ days | 27.7% | 36% |
+| Same fault seen before, last one fixed within ~10 h | 4.8% | 73% |
+| Lift fault back within 12 h of being "fixed" | 20.4% | 27% |
+| Station's last fault took 2+ days | 25.4% | 38% |
+
+"Same fault" means the same station with the same fault text, which in
+practice identifies the lift or platform.
+
+Adding these to the model, measured at an equal 96% right first time:
+
+| Features | Edge over plain averages | Dates within 1 day | Typical date | 1 in 10 beyond |
+|---|---|---|---|---|
+| As backtested above | 9% | 23% | 2.25 d ahead | 7.0 d |
+| + time of day, network load (already in the live model) | 14% | 23% | 2.25 d ahead | 7.0 d |
+| + richer station history | 15% | 30% | 2.25 d ahead | 7.75 d |
+| + same-fault history | 16% | 33% | 2.0 d ahead | 7.5 d |
+
+So history lets about ten more faults in every hundred get a date within a
+day. It does not shorten the far end: a fault with no reassuring history
+still needs a date about a week out to be right 96% of the time.
+
+Not helped by more compute or more of the same data: a model eight times
+larger got worse (hit rate fell from 94% to 88%), and doubling the training
+history improved the error by about 1%.
+
 Other findings that shaped the design:
 
 - TfL's own stated end dates held only 86% of the time (31 of 36 parseable
@@ -86,6 +120,18 @@ the bar.
   maintenance is kept and trained on like any other fault. `train.py`
   computes this itself from `information` and `text`; the API's
   `is_planned_work` field stays as it is but is no longer used.
+- **History features.** Built only from faults that had already ended when
+  the new fault began, for three groupings: the station family, the station
+  and category, and the same fault (station plus normalised, lower-cased
+  text). For each grouping: number of past faults; mean, median, 90th
+  percentile and maximum block offset over the last 50 (offsets capped at 60
+  blocks); share lasting 2+ days; the last fault's offset; the mean of the
+  last three; days since the last one ended. For the station and the same
+  fault: faults started in the last 7, 30 and 90 days. For the station:
+  other faults open now. Also minute of day and faults started network-wide
+  in the last 24 hours. These replace `station_mean_duration`,
+  `station_incident_count` and `station_mean_offset`. The implementation
+  plan may drop any that an ablation shows add nothing.
 - **Tail table.** From the training rows, count resolved faults by block
   offset for every offset from `MAX_OFFSET_CLASS` (8) up to a 120-block
   horizon (30 days), per category (`faulty_lift`, `staff_issue`,
@@ -115,6 +161,11 @@ the bar.
     least 30 faults, otherwise the all-categories table.
   The bound is the first offset where the curve reaches 0.95. If it is not
   reached within the horizon there is no prediction.
+- **History features at prediction time.** `_incident_offset_probs` already
+  loads the station family's past faults; that query gains the fault text so
+  the same values as training can be computed in Python from one result set,
+  with no extra queries per grouping. A version 3 bundle keeps the old
+  features.
 - **Day-level bounds.** A bound 8 or more blocks out is rounded up to the
   last block of that service day (the overnight block ending 05:00). The
   label names the day, not a five-hour block: "by end of Tuesday", or
@@ -194,7 +245,8 @@ Supporting changes:
 ### 7. Memory and speed
 
 The tail table is about 600 integers. The model keeps 9 classes, so its size
-and load time are unchanged. Removing the long-running replay removes an
+and load time are unchanged. The history features add about 40 numeric
+columns and reuse a query the app already runs once per new fault. Removing the long-running replay removes an
 hourly scan of 180 days of incidents. No new runtime dependencies.
 
 ## Rollout
@@ -215,10 +267,14 @@ hourly scan of 180 days of incidents. No new runtime dependencies.
 
 Test-first, in the existing suites.
 
-- `ml/test_train.py`: the narrowed exclusion rule; tail table contents,
+- `ml/test_train.py`: history features are causal and match hand-worked
+  examples; the narrowed exclusion rule; tail table contents,
   overflow and per-category fallback; cross-validation scoring against
   uncapped offsets; both gates refusing an upload.
 - `tests/test_incidents.py`:
+  - history features: a fixed set of past faults gives the same values from
+    the app's code as from `train.py`'s (train/serve parity), and nothing
+    that ended after the new fault began is counted;
   - extended decode: bound inside the classifier range; bound in the tail;
     no bound within the horizon; category fallback below 30 faults; day
     rounding; a version 3 bundle behaving as before;
@@ -242,6 +298,8 @@ Test-first, in the existing suites.
 
 - **Dates get later.** A lift usually fixed within eight hours will often
   say "by end of Thursday". That is the accepted price of 96%.
+- **Training and the app must compute history identically.** A mismatch
+  would quietly degrade predictions. The parity test guards this.
 - **Live accuracy may differ from the backtest.** The training gates stop a
   weak model shipping, and the display rule hides predictions if the live
   record drops below 90%.
