@@ -42,3 +42,36 @@ jobs:
       - run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  retrain:
+    name: Retrain model if the training code changed
+    runs-on: ubuntu-latest
+    # Only after a successful deploy: the new model has to be uploaded to the
+    # app version that knows how to load it. Skipped whenever deploy is.
+    needs: deploy
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Start the Retrain model workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # The model is trained by ml/ and decoded with the shared module, so
+          # a change to either needs a fresh model. If the previous commit
+          # cannot be compared (for example after a force push), retrain.
+          if changed=$(git diff --name-only "$BEFORE" "$GITHUB_SHA" -- ml incidents/prediction_shared.py); then
+            if [ -z "$changed" ]; then
+              echo "Training code unchanged by this deploy; not retraining."
+              exit 0
+            fi
+            echo "Training code changed:"
+            echo "$changed"
+          else
+            echo "Could not compare with the previous commit; retraining to be safe."
+          fi
+          gh workflow run retrain.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
