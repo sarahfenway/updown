@@ -3075,7 +3075,7 @@ class AdminPerfTests(StationFactoryMixin, TestCase):
 
 
 class SecurityTests(StationFactoryMixin, TestCase):
-    def _model_bytes(self, feature_version=3, as_dict=True, with_model=True):
+    def _model_bytes(self, feature_version=3, as_dict=True, with_model=True, tail=None):
         import io
 
         import joblib
@@ -3093,6 +3093,8 @@ class SecurityTests(StationFactoryMixin, TestCase):
             "historical_baselines": None,
             "metadata": {"feature_version": feature_version},
         }
+        if tail is not None:
+            payload["tail_distribution"] = tail
         if not with_model:
             payload.pop("model")
         obj = payload if as_dict else clf
@@ -3139,6 +3141,22 @@ class SecurityTests(StationFactoryMixin, TestCase):
             response = self._upload(self._model_bytes())
         self.assertEqual(response.status_code, 200)
         self.assertEqual(MLModel.objects.count(), 1)
+
+    @override_settings(FUNCTIONS_SECRET_KEY="secret")
+    def test_upload_model_accepts_version_4_with_a_tail_table(self):
+        tail = {"by_category": {}, "all": {"total": 0, "counts": [0] * 113}}
+        with patch("incidents.views.predict_duration") as pred:
+            pred.cache_clear = MagicMock()
+            response = self._upload(self._model_bytes(feature_version=4, tail=tail))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(MLModel.objects.count(), 1)
+
+    @override_settings(FUNCTIONS_SECRET_KEY="secret")
+    def test_upload_model_rejects_version_4_without_a_tail_table(self):
+        response = self._upload(self._model_bytes(feature_version=4))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("tail_distribution", response.json()["error"])
+        self.assertEqual(MLModel.objects.count(), 0)
 
     def test_valid_functions_key_is_constant_time_and_rejects_blank(self):
         from incidents.views import _valid_functions_key

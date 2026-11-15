@@ -69,7 +69,7 @@ def _request_functions_key(request, params):
 
 # feature_version values ml.py knows how to serve. Reject anything else at
 # upload time rather than letting predictions silently break at runtime.
-SUPPORTED_FEATURE_VERSIONS = frozenset({1, 2, 3})
+SUPPORTED_FEATURE_VERSIONS = frozenset({1, 2, 3, 4})
 
 
 def _validate_model_payload(payload):
@@ -97,6 +97,10 @@ def _validate_model_payload(payload):
             f"{metadata.get('feature_version')!r} (supported: "
             f"{sorted(SUPPORTED_FEATURE_VERSIONS)})"
         )
+    if metadata["feature_version"] >= 4:
+        tail = payload.get("tail_distribution")
+        if not isinstance(tail, dict) or "all" not in tail or "by_category" not in tail:
+            return "Version 4 model payload is missing its tail_distribution"
 
     feature_names = getattr(model, "feature_names_in_", None)
     if feature_names is None:
