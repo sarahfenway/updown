@@ -32,9 +32,12 @@
                             {% for issue in station.list %}
                                 <p>
                                     {% if issue.text %}
-                                        {{ issue.text }}
+                                        {{ issue.main_text }}
                                     {% else %}
                                         There is no step free access at this station.
+                                    {% endif %}
+                                    {% if issue.additional_info %}
+                                        <br><span class="issue-advice">{{ issue.additional_info }}</span>
                                     {% endif %}
                                     <i>
                                         {% if issue.is_single_user_report %}

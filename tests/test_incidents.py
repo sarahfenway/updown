@@ -22,6 +22,7 @@ from django.db.models import Count
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
+from django.utils.html import escape
 
 from incidents import ml as incidents_ml
 from incidents.management.commands.archive_old_reports import (
@@ -37,6 +38,7 @@ from incidents.utils import (
     get_last_updated,
     parse_date,
     remove_tfl_specifics,
+    split_additional_info,
     strip_step_free_prefix,
     send_bluesky,
     send_bluesky_messages,
@@ -3591,3 +3593,65 @@ class AppStorePromoTests(TestCase):
         self.assertIn(badge, html)
         self.assertLess(html.index(link), html.index(badge))
         self.assertLess(html.index(badge), html.index("<h2>Current Issues</h2>"))
+
+
+class AdditionalInfoDisplayTests(StationFactoryMixin, TestCase):
+    """TfL's extra travel advice is stored at the end of the fault text as
+    ``<p><i>...</i></p>``. Only the Information section renders HTML, so a
+    planned closure that had started, and so was listed as a current issue,
+    showed the tags as text."""
+
+    MAIN = (
+        "From Monday 9 until Sunday 22 November, there will be no step-free "
+        "access to/from westbound Piccadilly or southbound Victoria lines."
+    )
+    ADVICE = "For a step-free exit, stay on the Tube until King's Cross St Pancras."
+    TEXT = f"{MAIN}<p><i>{ADVICE}</i></p>"
+
+    def test_split_additional_info(self):
+        self.assertEqual(split_additional_info(self.TEXT), (self.MAIN, self.ADVICE))
+        self.assertEqual(split_additional_info("Faulty lift"), ("Faulty lift", ""))
+        self.assertEqual(
+            split_additional_info("Faulty lift. <p><i> </i></p>"),
+            ("Faulty lift.", ""),
+        )
+        self.assertEqual(split_additional_info(""), ("", ""))
+
+    def _current_issue_page(self, url):
+        station = self.create_parent_station("Finsbury Park")
+        self.create_incident(
+            station, text=self.TEXT, resolved=False, information=False
+        )
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        return response
+
+    def _assert_advice_is_formatted(self, response):
+        self.assertNotContains(response, "&lt;p&gt;")
+        self.assertNotContains(response, "&lt;i&gt;")
+        self.assertContains(response, self.MAIN)
+        self.assertContains(
+            response,
+            f'<span class="issue-advice">{escape(self.ADVICE)}</span>',
+            html=True,
+        )
+
+    def test_home_formats_advice_on_a_current_issue(self):
+        self._assert_advice_is_formatted(self._current_issue_page("/"))
+
+    def test_beta_formats_advice_on_a_current_issue(self):
+        self._assert_advice_is_formatted(self._current_issue_page("/beta/"))
+
+    def test_current_issue_text_is_still_escaped(self):
+        station = self.create_parent_station("Bank")
+        self.create_incident(
+            station,
+            text="Lift <script>alert(1)</script><p><i><b>bold</b> advice</i></p>",
+            resolved=False,
+            information=False,
+        )
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            response = self.client.get("/")
+        self.assertNotContains(response, "<script>alert(1)</script>")
+        self.assertNotContains(response, "<b>bold</b>")
