@@ -13,8 +13,8 @@ from incidents.prediction_shared import (
     extended_cdf,
     fault_category,
     fault_key,
-    has_stated_end,
     history_features,
+    is_planned_work,
     round_up_to_service_day,
 )
 from incidents.text_features import normalise_incident_text
@@ -359,14 +359,8 @@ def _clear_model_cache():
     _cached_model_row_id = None
 
 
-def is_planned_work_text(text, information=False):
-    """Planned work states its own end date, so we never predict it."""
-    text = normalise_incident_text(text).lower()
-    return "planned" in text or "until " in text or bool(information)
-
-
 def _is_planned_work(incident):
-    return is_planned_work_text(incident.text, incident.information)
+    return is_planned_work(incident.text, incident.information)
 
 
 def _station_networks(station):
@@ -641,13 +635,7 @@ def _incident_offset_probs(incident):
     feature_version = metadata.get("feature_version", 1)
     use_v2_features = feature_version >= 2
 
-    # A version 4 model was trained on undated planned maintenance, so only
-    # faults that state their own end are skipped. Older models never saw
-    # planned work of any kind.
-    if feature_version >= 4:
-        if has_stated_end(incident.text, incident.information):
-            return None
-    elif _is_planned_work(incident):
+    if _is_planned_work(incident):
         return None
 
     from django.db.models import Q

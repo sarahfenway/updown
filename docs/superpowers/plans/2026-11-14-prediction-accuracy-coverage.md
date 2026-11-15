@@ -2108,7 +2108,7 @@ def test_history_features_are_the_shared_ones_and_only_use_the_past():
 
 
 def test_training_returns_a_tail_table_and_scores_the_real_decode():
-    df, feature_cols, _ = train.prepare_features(_raw_incidents(40))
+    df, feature_cols, _ = train.prepare_features(_raw_incidents(300))
 
     _, _, tail, cv = train.train_model(df, feature_cols)
 
@@ -2677,3 +2677,24 @@ Nothing here is automated by the tasks above. Merging to `master` deploys.
 4. **Backfill open faults.** On the Fly machine: `python updown/manage.py predict_durations`. It fills only faults with no prediction and skips any whose time has already passed.
 5. **Expect a gap of two to three days** with few predictions on the site, until 30 new predictions have resolved and the 90-100% confidence bucket has a record of its own.
 6. **Watch `/stats/`.** "Right first time" should settle near 96%. If it falls below 90% the site hides predictions by itself.
+
+## Amendments during execution (2026-11-15)
+
+The tasks above are as written before execution. What changed while doing them:
+
+1. **Planned maintenance is not predicted.** Running the rewritten
+   `ml/train.py` on the public export put undated planned maintenance at 88.5%
+   right first time, below the 90% bar, and the per-category gate refused the
+   model. `has_stated_end` became `is_planned_work` (information, "until ",
+   or "planned"), used for every model version by both the app and the
+   training script. The version-dependent rule in Task 4, its test, and Task
+   9's exclusion test were rewritten to match. With the exclusion restored the
+   gates pass: 96.3% overall, lifts 95.0%, staff 98.4%, other 96.3%.
+2. **Task 6** also had to update `test_prepare_incidents_hides_overdue_current_prediction`
+   (renamed `..._admits_overdue_current_prediction`): it asserted the old
+   silent hiding of a missed prediction.
+3. **Task 9's** tail-table test uses the 300-station fixture. Forty stations
+   left a class with a single example, which scikit-learn's early-stopping
+   split rejects.
+4. **Task 3:** `PREDICTION_COVERAGE_TARGET` is not re-exported from
+   `incidents.ml`; nothing imports it from there.

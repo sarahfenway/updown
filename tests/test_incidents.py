@@ -1213,7 +1213,7 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
         self.assertEqual(features["minute_of_day"], 10 * 60 + 30)
         self.assertEqual(features["network_started_24h"], 3)
 
-    def test_what_counts_as_planned_work_depends_on_the_model_version(self):
+    def test_planned_work_is_never_predicted(self):
         if np is None:
             self.skipTest("numpy not installed")
         parent = self.create_parent_station("Canada Water")
@@ -1232,13 +1232,15 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
                 return predict_duration(incident)[0] is not None
 
         maintenance = "Step free access is not available due to planned maintenance."
-        self.assertTrue(predicted(maintenance, 4))
-        self.assertFalse(predicted(maintenance, 3))
-        self.assertFalse(predicted("No step-free access until Sunday 22 November", 4))
-        self.assertFalse(predicted("Lift works", 4, information=True))
+        for version in (3, 4):
+            self.assertTrue(predicted("Faulty lift", version))
+            self.assertFalse(predicted(maintenance, version))
+            self.assertFalse(
+                predicted("No step-free access until Sunday 22 November", version)
+            )
+            self.assertFalse(predicted("Lift works", version, information=True))
 
 
-@override_settings(ROOT_URLCONF="updown.urls")
 class ViewAndCommandTests(StationFactoryMixin, TestCase):
     def test_predict_durations_command_can_resume_in_small_batches(self):
         parent = self.create_parent_station("Bank")

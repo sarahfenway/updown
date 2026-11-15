@@ -12,11 +12,12 @@ def fault(started_hours_ago, lasted_hours=None, offset=None,
     return (start, end, offset, category, key)
 
 
-def test_stated_end_rule():
-    assert shared.has_stated_end("No step-free access until Sunday 22 November")
-    assert shared.has_stated_end("Lift works", information=True)
-    assert not shared.has_stated_end("Not available due to planned maintenance.")
-    assert not shared.has_stated_end(None)
+def test_planned_work_rule():
+    assert shared.is_planned_work("No step-free access until Sunday 22 November")
+    assert shared.is_planned_work("Lift works", information=True)
+    assert shared.is_planned_work("Not available due to Planned Maintenance.")
+    assert not shared.is_planned_work("Not available due to a faulty lift.")
+    assert not shared.is_planned_work(None)
 
 
 def test_fault_key_ignores_phone_number_case_and_spacing():

@@ -1,7 +1,7 @@
 # Predictions: right first time, for nearly every fault
 
 Date: 2026-11-14
-Status: awaiting review
+Status: approved 2026-11-14; amended during implementation (see "Real pipeline check")
 
 ## Goal
 
@@ -10,8 +10,7 @@ Two things, in this order of priority:
 1. **Trust.** Any prediction shown to a user must be right first time more
    than 90% of the time. We aim for about 96% (roughly 1 miss in 25).
 2. **Coverage.** Nearly every new unplanned fault gets a "fixed by" date,
-   including the ones the model expects to last longer than two days and
-   planned maintenance that has no stated end date.
+   including the ones the model expects to last longer than two days.
 
 "Right first time" means the first date shown for a fault held: the fault was
 fixed at or before it, with the existing 30 minutes of grace. Nothing shown
@@ -38,6 +37,7 @@ Live, 14 Nov 2026 (`/stats/`, `/api/incidents/`):
 | How rare should a miss be | About 1 in 25 (aim 96%), accepting later dates |
 | After a miss | Admit it on the fault. No second date. |
 | Long-running faults | No "likely to be some time" (it cannot reach 90%) |
+| Planned maintenance | Not predicted (it cannot reach 90%; found during implementation) |
 | Model choice | Left to the implementer; must fit a 512 MB machine |
 
 ## Evidence
@@ -94,6 +94,35 @@ Not helped by more compute or more of the same data: a model eight times
 larger got worse (hit rate fell from 94% to 88%), and doubling the training
 history improved the error by about 1%.
 
+### Real pipeline check (added during implementation)
+
+Once `ml/train.py` was rewritten, its own cross-validation was run on the
+public export (three time-ordered folds, 20,371 faults, with the baseline
+blend and day rounding the backtest above lacked). It supersedes the
+backtest's figures where they differ:
+
+| | Right first time | Typical date, from fault start | 1 in 10 beyond |
+|---|---|---|---|
+| All predicted faults | 96.3%, 100% given a date | about 3.5 days | about 8 days |
+| Faulty lifts | 95.0% | about 4.75 days | about 8 days |
+| Staff shortages | 98.4% | about 2 days | about 3 days |
+| Other | 96.3% | about 4.25 days | about 9 days |
+
+Two consequences:
+
+- **Dates are about a day later than the backtest suggested** (it said a
+  typical 2.5 days). Day rounding and the smaller early folds account for
+  most of the gap.
+- **Undated planned maintenance is not predicted after all.** At the 95% aim
+  it was right first time only 88.5% of the time with a typical date 11 days
+  out; reaching 91% needed a 98% aim, which gave a date to only 73% of them,
+  about 19 days out. It fails the 90% bar, and under the per-category gate it
+  would have blocked every retrain. It stays excluded, as it is today.
+
+Staff shortages run ahead of the target (98.4%). A lower aim for that
+category alone (0.93) would hold 96% with dates about three-quarters of a day
+sooner. Not built; noted as a possible follow-up.
+
 Other findings that shaped the design:
 
 - TfL's own stated end dates held only 86% of the time (31 of 36 parseable
@@ -115,11 +144,12 @@ the bar.
 ### 1. Training (`ml/train.py`)
 
 - `PREDICTION_COVERAGE_TARGET` rises from 0.75 to 0.95.
-- **Exclusion rule narrows.** Drop a row only when it has a stated end:
-  `information` is true, or the text contains "until ". Undated planned
-  maintenance is kept and trained on like any other fault. `train.py`
-  computes this itself from `information` and `text`; the API's
-  `is_planned_work` field stays as it is but is no longer used.
+- **Exclusion rule is the app's.** Rows are dropped by
+  `prediction_shared.is_planned_work`: information notices, anything
+  containing "until ", and anything containing "planned". This is the rule
+  the app has always used, now one function for both sides. `train.py`
+  computes it from `information` and `text`; the API's `is_planned_work`
+  field stays as it is but is no longer used.
 - **History features.** Built only from faults that had already ended when
   the new fault began, for three groupings: the station family, the station
   and category, and the same fault (station plus normalised, lower-cased
@@ -170,9 +200,8 @@ the bar.
   last block of that service day (the overnight block ending 05:00). The
   label names the day, not a five-hour block: "by end of Tuesday", or
   "by end of Sat 21 Nov" beyond six days.
-- **Planned work.** With a version 4 bundle, only faults with a stated end
-  (`information`, or "until " in the text) are skipped. A version 3 bundle
-  keeps the old rule, because that model never saw planned maintenance.
+- **Planned work** is skipped for every model version, by
+  `prediction_shared.is_planned_work`.
 - **No tail table in the bundle** (version 3): decode behaves as today at
   the new target, so fewer faults get a date until the retrain lands.
 - **Upload validation** accepts version 4 and rejects a version 4 bundle
@@ -254,8 +283,10 @@ hourly scan of 180 days of incidents. No new runtime dependencies.
 1. Merge and deploy. Until a new model is uploaded the old one keeps
    working, at the stricter aim and with fewer dates.
 2. Run the retrain workflow with `dry_run` and read the cross-validation
-   figures. Expect about 96% overall. If lifts fall below 90%, raise the aim
-   in both files before going further.
+   figures. Expect about 96% overall and 95% for lifts. If a large category
+   falls below 90% the run refuses to upload; raise
+   `PREDICTION_COVERAGE_TARGET` in `incidents/prediction_shared.py` before
+   going further.
 3. Run the retrain for real.
 4. Run `predict_durations` (without `--overwrite`) so open faults that have
    no prediction get one.
@@ -268,7 +299,8 @@ hourly scan of 180 days of incidents. No new runtime dependencies.
 Test-first, in the existing suites.
 
 - `ml/test_train.py`: history features are causal and match hand-worked
-  examples; the narrowed exclusion rule; tail table contents,
+  examples; planned and dated work excluded from training but kept as
+  history; tail table contents,
   overflow and per-category fallback; cross-validation scoring against
   uncapped offsets; both gates refusing an upload.
 - `tests/test_incidents.py`:
@@ -278,7 +310,7 @@ Test-first, in the existing suites.
   - extended decode: bound inside the classifier range; bound in the tail;
     no bound within the horizon; category fallback below 30 faults; day
     rounding; a version 3 bundle behaving as before;
-  - planned-work rule per bundle version;
+  - planned work never predicted, whatever the bundle version;
   - display rule at 29 and 30 samples, and at 89% and 90%;
   - overdue state: shown only when the bucket is shown, never with a date;
   - a text edit does not replace an existing prediction;
@@ -289,6 +321,8 @@ Test-first, in the existing suites.
 ## Not in scope
 
 - Dated planned work (TfL's dates are below the bar and already in the text).
+- Undated planned maintenance (88.5% right first time; below the bar).
+- A separate, lower aim for staff shortages.
 - Clock-time precision instead of blocks and days.
 - Any estimate for a fault after its first prediction has been missed.
 - Dropping the `revised_*` columns.
@@ -296,8 +330,9 @@ Test-first, in the existing suites.
 
 ## Risks
 
-- **Dates get later.** A lift usually fixed within eight hours will often
-  say "by end of Thursday". That is the accepted price of 96%.
+- **Dates get later.** A lift fault's typical date is nearly five days out,
+  and a staff shortage's about two. That is the price of 96%, and it is
+  about a day more than the figures Sarah saw when choosing the 1-in-25 aim.
 - **Training and the app must compute history identically.** A mismatch
   would quietly degrade predictions. The parity test guards this.
 - **Live accuracy may differ from the backtest.** The training gates stop a

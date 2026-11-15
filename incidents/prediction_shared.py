@@ -52,9 +52,17 @@ HISTORY_FEATURE_NAMES = tuple(
 )
 
 
-def has_stated_end(text, information=False):
-    """True when a fault says when it will end, so it is never predicted."""
-    return bool(information) or "until " in (text or "").lower()
+def is_planned_work(text, information=False):
+    """True for work that is never predicted.
+
+    Information notices and anything that states its own end ("until ...")
+    need no prediction. Planned maintenance is left out because it cannot be
+    predicted well: in the 2026-11 retrain design it was right first time
+    only 88% of the time even with dates eleven days out, below the 90% bar
+    for anything shown.
+    """
+    text = (text or "").lower()
+    return bool(information) or "planned" in text or "until " in text
 
 
 def fault_category(text):
