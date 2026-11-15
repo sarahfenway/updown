@@ -12,6 +12,9 @@ from incidents.prediction_shared import (
     bound_offset,
     extended_cdf,
     fault_category,
+    fault_key,
+    has_stated_end,
+    history_features,
     round_up_to_service_day,
 )
 from incidents.text_features import normalise_incident_text
@@ -577,6 +580,50 @@ def _offset_to_duration(start_idx, pred_offset, start_time, confidence):
     return duration, round(confidence, 2)
 
 
+def _history_features(incident, station, feature_text, start_time_local):
+    """Version 4 history features for ``incident``.
+
+    One query loads the station family's earlier faults; the summary itself
+    is prediction_shared.history_features, the same code ml/train.py runs.
+    """
+    from incidents.models import Incident
+
+    earlier = Incident.objects.filter(
+        station_id__in=_station_family_ids(station.pk),
+        start_time__lt=incident.start_time,
+    )
+    recent = Incident.objects.filter(
+        start_time__gte=incident.start_time - timedelta(days=1),
+        start_time__lt=incident.start_time,
+    )
+    if incident.pk:
+        earlier = earlier.exclude(pk=incident.pk)
+        recent = recent.exclude(pk=incident.pk)
+
+    past = []
+    for start, end, resolved, text in earlier.values_list(
+        "start_time", "end_time", "resolved", "text"
+    ):
+        if resolved:
+            if end is None or end <= start:
+                continue  # bad data; the training export drops these too
+            offset = block_index(end) - block_index(start)
+        else:
+            # An open fault's end_time, if set, is TfL's stated end, not a fix.
+            end = offset = None
+        past.append((start, end, offset, fault_category(text), fault_key(text)))
+
+    features = history_features(
+        past,
+        incident.start_time,
+        fault_category(feature_text),
+        fault_key(feature_text),
+    )
+    features["minute_of_day"] = start_time_local.hour * 60 + start_time_local.minute
+    features["network_started_24h"] = recent.count()
+    return features
+
+
 def _incident_offset_probs(incident):
     """Build features for ``incident`` and return (model, probs, tail, category).
 
@@ -587,15 +634,21 @@ def _incident_offset_probs(incident):
     if data is None:
         return None
 
-    if _is_planned_work(incident):
-        return None
-
     model = data["model"]
     vectorizer = data.get("vectorizer")
     historical_baselines = data.get("historical_baselines")
     metadata = data.get("metadata") or {}
     feature_version = metadata.get("feature_version", 1)
     use_v2_features = feature_version >= 2
+
+    # A version 4 model was trained on undated planned maintenance, so only
+    # faults that state their own end are skipped. Older models never saw
+    # planned work of any kind.
+    if feature_version >= 4:
+        if has_stated_end(incident.text, incident.information):
+            return None
+    elif _is_planned_work(incident):
+        return None
 
     from django.db.models import Q
     from django.utils import timezone as tz_module
@@ -616,29 +669,28 @@ def _incident_offset_probs(incident):
     # prediction.
     station_filter = Q(station_id__in=_station_family_ids(station.pk))
 
-    # Per-station historical stats from resolved incidents. We pull the raw
-    # start/end times so we can compute both mean duration and mean block
-    # offset in a single query — the training pipeline uses the same two
-    # features, so they have to match.
-    past_qs = Incident.objects.filter(
-        station_filter,
-        resolved=True,
-        end_time__isnull=False,
-    )
-    if use_v2_features:
-        past_qs = past_qs.filter(end_time__lte=incident.start_time)
-    past = list(past_qs.values_list("start_time", "end_time"))
-    count = len(past)
-    if count:
-        mean_dur = sum((e - s).total_seconds() for s, e in past) / count / 60
-        offsets = [
-            max(0, min(MAX_OFFSET_CLASS, block_index(e) - block_index(s)))
-            for s, e in past
-        ]
-        mean_offset = sum(offsets) / count
-    else:
-        mean_dur = 0
-        mean_offset = 0
+    # Versions 1 to 3: three station averages. Version 4 replaces them with
+    # the richer history built in _history_features.
+    count = 0
+    mean_dur = 0
+    mean_offset = 0
+    if feature_version < 4:
+        past_qs = Incident.objects.filter(
+            station_filter,
+            resolved=True,
+            end_time__isnull=False,
+        )
+        if use_v2_features:
+            past_qs = past_qs.filter(end_time__lte=incident.start_time)
+        past = list(past_qs.values_list("start_time", "end_time"))
+        count = len(past)
+        if count:
+            mean_dur = sum((e - s).total_seconds() for s, e in past) / count / 60
+            offsets = [
+                max(0, min(MAX_OFFSET_CLASS, block_index(e) - block_index(s)))
+                for s, e in past
+            ]
+            mean_offset = sum(offsets) / count
 
     if hasattr(incident, "prefetched_reports"):
         num_reports = len(incident.prefetched_reports)
@@ -706,6 +758,10 @@ def _incident_offset_probs(incident):
         "station_incident_count": count,
         "station_mean_offset": mean_offset,
     }
+    if feature_version >= 4:
+        features.update(
+            _history_features(incident, station, feature_text, start_time_local)
+        )
 
     try:
         import numpy as np

@@ -1117,6 +1117,105 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
         self.assertEqual(duration, timedelta(hours=9, minutes=29, seconds=59))
         self.assertEqual(confidence, 0.95)
 
+    def _capturing_model(self, feature_names, captured):
+        class FakeModel:
+            classes_ = np.array([0])
+            feature_names_in_ = np.array(feature_names, dtype=object)
+
+            def predict_proba(self, x):
+                captured["features"] = dict(zip(self.feature_names_in_, x[0]))
+                return np.array([[1.0]])
+
+        return FakeModel()
+
+    def test_version_4_model_gets_history_from_previous_faults(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+
+        def utc(day, hour, month=7):
+            return datetime(2026, month, day, hour, 0, tzinfo=dt_timezone.utc)
+
+        lift_text = (
+            "Step free access is not available due to a faulty lift. "
+            "Call us on 0343 222 1234"
+        )
+        parent = self.create_parent_station("Canary Wharf")
+        other = self.create_parent_station("Elsewhere")
+        # Same fault, 28 Jun 08:00 local (morning) to 30 Jun 10:00 local
+        # (daytime): 2 days and one block, so 9 blocks.
+        self.create_incident(
+            parent, text=lift_text, resolved=True,
+            start_time=utc(28, 7, month=6), end_time=utc(30, 9, month=6),
+        )
+        self.create_incident(
+            parent, text="Unavailability of station staff", resolved=True,
+            start_time=utc(1, 6), end_time=utc(1, 7),
+        )
+        self.create_incident(
+            parent, text="Another fault", resolved=False, start_time=utc(1, 8),
+        )
+        self.create_incident(
+            other, text="Faulty lift", resolved=False, start_time=utc(1, 5),
+        )
+        incident = Incident(
+            station=parent,
+            text=lift_text.replace("0343 222 1234", "").upper(),
+            information=False,
+            start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
+            resolved=False,
+        )
+
+        captured = {}
+        model = self._capturing_model(
+            [
+                "st_count", "st_open_now", "st_started_7d", "sc_count",
+                "sf_count", "sf_last_off", "sf_days_since_last_end",
+                "minute_of_day", "network_started_24h",
+            ],
+            captured,
+        )
+        with patch(
+            "incidents.ml._load_model",
+            return_value={"model": model, "metadata": {"feature_version": 4}},
+        ):
+            duration, _ = predict_duration(incident)
+
+        features = captured["features"]
+        self.assertIsNotNone(duration)
+        self.assertEqual(features["st_count"], 2)
+        self.assertEqual(features["st_open_now"], 1)
+        self.assertEqual(features["st_started_7d"], 3)
+        self.assertEqual(features["sc_count"], 1)
+        self.assertEqual(features["sf_count"], 1)
+        self.assertEqual(features["sf_last_off"], 9.0)
+        self.assertAlmostEqual(features["sf_days_since_last_end"], 24.5 / 24)
+        self.assertEqual(features["minute_of_day"], 10 * 60 + 30)
+        self.assertEqual(features["network_started_24h"], 3)
+
+    def test_what_counts_as_planned_work_depends_on_the_model_version(self):
+        if np is None:
+            self.skipTest("numpy not installed")
+        parent = self.create_parent_station("Canada Water")
+
+        def predicted(text, version, information=False):
+            incident = Incident(
+                station=parent, text=text, information=information,
+                start_time=datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc),
+                resolved=False,
+            )
+            model = self._capturing_model(["station_id"], {})
+            with patch(
+                "incidents.ml._load_model",
+                return_value={"model": model, "metadata": {"feature_version": version}},
+            ):
+                return predict_duration(incident)[0] is not None
+
+        maintenance = "Step free access is not available due to planned maintenance."
+        self.assertTrue(predicted(maintenance, 4))
+        self.assertFalse(predicted(maintenance, 3))
+        self.assertFalse(predicted("No step-free access until Sunday 22 November", 4))
+        self.assertFalse(predicted("Lift works", 4, information=True))
+
 
 @override_settings(ROOT_URLCONF="updown.urls")
 class ViewAndCommandTests(StationFactoryMixin, TestCase):
