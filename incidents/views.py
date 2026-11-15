@@ -32,6 +32,7 @@ from incidents.ml import (
     PREDICTION_BOUNDARY_GRACE,
     block_index,
     format_block_slot,
+    format_bound_label,
     is_planned_work_text,
     predict_duration,
     prediction_is_close_enough,
@@ -120,7 +121,6 @@ PREDICTION_STATION_OVERRIDE_BUCKET = 40
 PREDICTION_STATION_OVERRIDE_WINDOW_DAYS = 180
 PREDICTION_STATION_OVERRIDE_MIN_SAMPLES = 20
 PREDICTION_STATION_OVERRIDE_MIN_ACCURACY = 0.65
-BETA_LONG_RANGE_DAYS = 7
 # "Likely to be some time". The model's classes stop at ~2 days, so once an
 # incident outlives the same block the next day there is usually no honest
 # "fixed by" bound left to show. Elapsed time alone is the useful signal then:
@@ -204,8 +204,6 @@ def _beta_current_status_text(label, expected_end_time, expected_block, now):
         return None
     if expected_end_time <= now:
         return None
-    if expected_end_time > now + timedelta(days=BETA_LONG_RANGE_DAYS):
-        return "More than a week"
     if not label:
         return None
     return f"{label.capitalize()} by {expected_block}"
@@ -849,8 +847,8 @@ def _prepare_incidents(
 
         if incident.start_time and display_duration:
             incident.expected_end_time = incident.start_time + display_duration
-            incident.expected_block = format_block_slot(
-                time_block_slot(incident.expected_end_time), now
+            incident.expected_block = format_bound_label(
+                incident.start_time, incident.expected_end_time, now
             )
         else:
             incident.expected_end_time = None

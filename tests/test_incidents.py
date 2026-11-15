@@ -1109,7 +1109,7 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
         ):
             duration, confidence = predict_duration(incident)
 
-        # Blended probs are [0.578, 0.422] over offsets [0, 1]. The 75%
+        # Blended probs are [0.578, 0.422] over offsets [0, 1]. The 95%
         # cumulative bound falls on offset 1, so the prediction is "fixed
         # by" the end of the next (evening) block: 20:00 BST minus a second,
         # from a 10:30 BST start. Confidence is the cumulative mass (~1.0,
@@ -1532,7 +1532,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertFalse(incidents[0].show_prediction)
         self.assertIsNone(incidents[0].beta_current_status)
 
-    def test_prepare_incidents_uses_more_than_a_week_for_long_range_prediction(self):
+    def test_prepare_incidents_names_the_day_for_long_range_prediction(self):
         parent = self.create_parent_station("Bank")
         # Relative to now so the history stays inside the prediction policy's
         # lookback windows (30/90/180 days) whenever the suite runs.
@@ -1566,7 +1566,10 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         )
 
         self.assertTrue(incidents[0].show_prediction)
-        self.assertEqual(incidents[0].beta_current_status, "More than a week")
+        self.assertTrue(
+            incidents[0].beta_current_status.startswith("Very likely by the end of "),
+            incidents[0].beta_current_status,
+        )
 
     def test_prepare_incidents_marks_resolved_miss_as_wrong(self):
         parent = self.create_parent_station("Bank")
@@ -3048,87 +3051,91 @@ class SecurityTests(StationFactoryMixin, TestCase):
             self.assertFalse(_valid_functions_key(None))
 
 
-class RevisedPredictionTests(StationFactoryMixin, TestCase):
-    def _fake_model(self, classes):
-        class _M:
-            classes_ = np.array(classes)
+class ExtendedDecodeTests(StationFactoryMixin, TestCase):
+    # 1 July 2026 is BST. 09:00 UTC is 10:00 local: the daytime block.
+    START = datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
 
-        return _M()
+    def _decode(self, probs_by_offset, tail=None, category="faulty_lift"):
+        class _Model:
+            classes_ = np.array(sorted(probs_by_offset))
 
-    def _unsaved_incident_at(self, start):
-        parent = self.create_parent_station("RevTest")
-        return Incident(
-            station=parent,
+        incident = Incident(
+            station=self.create_parent_station("Decode"),
             text="Faulty lift",
             information=False,
-            start_time=start,
+            start_time=self.START,
             resolved=False,
         )
-
-    def test_decode_conditions_on_elapsed_and_returns_later_bound(self):
-        if np is None:
-            self.skipTest("numpy not installed")
-        model = self._fake_model([0, 1, 2, 3, 4, 5, 6, 7, 8])
-        probs = np.zeros(9)
-        probs[0] = 0.8
-        probs[5] = 0.2
-        inc = self._unsaved_incident_at(
-            datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
+        probs = np.array([probs_by_offset[k] for k in sorted(probs_by_offset)])
+        return incidents_ml._decode_offset_bound(
+            _Model(), probs, incident, tail, category
         )
 
-        dur0, conf0 = incidents_ml._decode_offset_bound(model, probs, inc, 0)
-        dur1, conf1 = incidents_ml._decode_offset_bound(model, probs, inc, 1)
+    def _tail(self, offsets):
+        from incidents.prediction_shared import build_tail_distribution
 
-        # Original: 0.8 mass on offset 0 meets the 0.75 target -> early bound.
-        # Conditioned on being open past offset 0: only offset 5 remains ->
-        # a strictly later "fixed by" bound.
-        self.assertIsNotNone(dur0)
-        self.assertIsNotNone(dur1)
-        self.assertGreater(dur1, dur0)
+        return build_tail_distribution({"faulty_lift": offsets})
 
-    def test_decode_returns_none_when_only_open_ended_tail_survives(self):
-        if np is None:
-            self.skipTest("numpy not installed")
-        model = self._fake_model([0, 1, 2, 3, 4, 5, 6, 7, 8])
-        probs = np.zeros(9)
-        probs[0] = 0.8
-        probs[8] = 0.2
-        inc = self._unsaved_incident_at(
-            datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
-        )
-        # Conditioning past offset 0 leaves only the open-ended MAX class:
-        # no honest finite bound.
+    def test_bound_inside_the_classifier_range(self):
+        duration, confidence = self._decode({0: 0.96, 5: 0.04})
+        # End of the start block: 15:00 local, one second inside.
+        self.assertEqual(duration, timedelta(hours=4, minutes=59, seconds=59))
+        self.assertEqual(confidence, 0.95)
+
+    def test_aim_is_ninety_five_percent(self):
+        duration, _ = self._decode({0: 0.80, 1: 0.14, 2: 0.06})
+        # 0.94 at offset 1 is not enough; offset 2 is the overnight block,
+        # ending 05:00 local on 2 July.
+        self.assertEqual(duration, timedelta(hours=18, minutes=59, seconds=59))
+
+    def test_open_ended_class_without_a_tail_table_gives_no_prediction(self):
+        self.assertEqual(self._decode({8: 1.0}), (None, None))
+
+    def test_tail_table_turns_the_open_ended_class_into_a_day(self):
+        duration, confidence = self._decode({8: 1.0}, self._tail([10] * 40))
+        # Offset 10 from 1 July daytime is the overnight block of 3 July,
+        # which ends 05:00 local on 4 July.
         self.assertEqual(
-            incidents_ml._decode_offset_bound(model, probs, inc, 1), (None, None)
+            duration, timedelta(days=2, hours=18, minutes=59, seconds=59)
         )
+        self.assertEqual(confidence, 0.95)
 
-    def test_decode_original_prediction_on_tail_class_is_not_shown(self):
-        if np is None:
-            self.skipTest("numpy not installed")
-        model = self._fake_model([0, 1, 2, 3, 4, 5, 6, 7, 8])
-        probs = np.zeros(9)
-        probs[8] = 1.0
-        inc = self._unsaved_incident_at(
-            datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
-        )
-        # The 0.75 target is only reached at the open-ended tail -> (None, None),
-        # instead of a dishonest concrete "fixed by ~2 days".
+    def test_day_level_bound_is_rounded_up_to_the_end_of_that_day(self):
+        duration, _ = self._decode({8: 1.0}, self._tail([9] * 40))
+        # Offset 9 is 3 July evening; the promise is the end of 3 July.
         self.assertEqual(
-            incidents_ml._decode_offset_bound(model, probs, inc, 0), (None, None)
+            duration, timedelta(days=2, hours=18, minutes=59, seconds=59)
         )
 
-    def test_decode_returns_none_when_nothing_survives_the_floor(self):
-        if np is None:
-            self.skipTest("numpy not installed")
-        model = self._fake_model([0, 1, 2])
-        probs = np.array([0.5, 0.3, 0.2])
-        inc = self._unsaved_incident_at(
-            datetime(2026, 7, 1, 9, 0, tzinfo=dt_timezone.utc)
-        )
-        self.assertEqual(
-            incidents_ml._decode_offset_bound(model, probs, inc, 5), (None, None)
-        )
+    def test_no_prediction_when_the_aim_is_beyond_the_horizon(self):
+        self.assertEqual(self._decode({8: 1.0}, self._tail([500] * 40)), (None, None))
 
+
+class BoundLabelTests(SimpleTestCase):
+    def test_short_bounds_keep_block_wording_and_long_ones_name_the_day(self):
+        from zoneinfo import ZoneInfo
+
+        from incidents.ml import format_bound_label
+
+        london = ZoneInfo("Europe/London")
+        start = datetime(2026, 11, 10, 12, 0, tzinfo=london)       # Tuesday
+        short = datetime(2026, 11, 11, 9, 59, 59, tzinfo=london)   # +3 blocks
+        by_thursday = datetime(2026, 11, 13, 4, 59, 59, tzinfo=london)
+        far = datetime(2026, 11, 21, 4, 59, 59, tzinfo=london)
+
+        def label(end, day, hour=13):
+            now = datetime(2026, 11, day, hour, 0, tzinfo=london)
+            return format_bound_label(start, end, now)
+
+        self.assertEqual(label(short, 10), "tomorrow morning")
+        self.assertEqual(label(by_thursday, 10), "the end of Thursday")
+        self.assertEqual(label(by_thursday, 11), "the end of tomorrow")
+        self.assertEqual(label(by_thursday, 12), "the end of today")
+        self.assertEqual(label(far, 10), "the end of Fri 20 Nov")
+        self.assertEqual(label(by_thursday, 14), "the end of Thu 12 Nov")
+
+
+class OverdueStatsTests(StationFactoryMixin, TestCase):
     def test_stats_reports_overdue_predictions_as_worst_case(self):
         parent = self.create_parent_station("GreenParkRev", naptan_id="GPK")
         now = timezone.now()

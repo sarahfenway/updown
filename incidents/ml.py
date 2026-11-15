@@ -7,6 +7,13 @@ from functools import lru_cache
 
 from django.conf import settings
 
+from incidents.prediction_shared import (
+    MAX_OFFSET_CLASS,
+    bound_offset,
+    extended_cdf,
+    fault_category,
+    round_up_to_service_day,
+)
 from incidents.text_features import normalise_incident_text
 
 
@@ -45,20 +52,10 @@ BLOCKS_PER_DAY = 4
 BLOCK_NAMES = ["morning", "daytime", "evening", "overnight"]
 PREDICTION_BOUNDARY_GRACE = timedelta(minutes=30)
 
-# Everything at or beyond this many blocks from the start is lumped into one
-# "long tail" class during training. Kept small (8 → ~2 days): offsets
-# beyond this are individually too sparse (<2% each) to predict precisely,
-# and every extra class adds a full set of trees to the model — which is
-# what drives its size and load time. MUST stay in sync with ml/train.py.
-MAX_OFFSET_CLASS = 8
-
-# Predictions are framed as a one-sided "fixed by <time>" bound rather than
-# "fixed at <block>". We pick the earliest block by which the model's
-# cumulative probability of resolution reaches this target. The model is
-# only ~57% accurate at the exact block but ~72% within ±1 block, so a
-# cumulative bound is honest about the real uncertainty while still being
-# actionable ("won't be fixed before this evening").
-PREDICTION_COVERAGE_TARGET = 0.75
+# MAX_OFFSET_CLASS and PREDICTION_COVERAGE_TARGET live in
+# incidents/prediction_shared.py so the app and ml/train.py cannot disagree.
+# Everything at or beyond MAX_OFFSET_CLASS blocks is one open-ended class;
+# the model bundle's tail table says how long such faults went on to last.
 
 NETWORK_FIELDS = ("tube", "dlr", "national_rail", "crossrail", "overground")
 BASELINE_CATEGORY_OTHER = "other"
@@ -157,6 +154,25 @@ def format_block_slot(slot, now):
     if -7 < delta < -1:
         return f"last {date.strftime('%A')} {block}"
     return f"{date.strftime('%-d %b')} {block}"
+
+
+def format_bound_label(start_time, expected_end_time, now):
+    """Human label for a "fixed by" bound, read after the word "by".
+
+    A bound two or more days after the fault began is only day-level, so it
+    names the day ("the end of Tuesday") instead of a five-hour block.
+    """
+    if block_index(expected_end_time) - block_index(start_time) < MAX_OFFSET_CLASS:
+        return format_block_slot(time_block_slot(expected_end_time), now)
+    day, _ = time_block_slot(expected_end_time)
+    delta = (day - _to_local(now).date()).days
+    if delta == 0:
+        return "the end of today"
+    if delta == 1:
+        return "the end of tomorrow"
+    if 1 < delta < 7:
+        return f"the end of {day.strftime('%A')}"
+    return f"the end of {day.strftime('%a %-d %b')}"
 
 
 def _aware_block_bounds(index):
@@ -350,17 +366,6 @@ def _is_planned_work(incident):
     return is_planned_work_text(incident.text, incident.information)
 
 
-def _prediction_category_from_text(text):
-    text = (text or "").lower()
-    if "faulty lift" in text:
-        return "faulty_lift"
-    if "planned maintenance" in text:
-        return "planned_maintenance"
-    if "staff" in text:
-        return "staff_issue"
-    return BASELINE_CATEGORY_OTHER
-
-
 def _station_networks(station):
     return [network for network in NETWORK_FIELDS if getattr(station, network, False)]
 
@@ -394,7 +399,7 @@ def _historical_baseline_probs(historical_baselines, station, text, classes):
         * config["global_weight"]
     )
     evidence = 0.0
-    category = _prediction_category_from_text(text)
+    category = fault_category(text)
 
     evidence += _apply_baseline_component(
         combined_counts,
@@ -505,66 +510,43 @@ def _station_family_ids(station_id):
 def _predict_duration(incident):
     """Returns (timedelta, confidence) or (None, None).
 
-    The model is a classifier over "block offset" — how many coarse time
-    blocks after the incident's start block it resolves in. We don't decode
-    the single most-likely block; instead we walk the cumulative
-    distribution and return the earliest block by which there's a
-    ``PREDICTION_COVERAGE_TARGET`` chance it's resolved. The duration
-    therefore represents a one-sided "fixed by" bound, and ``confidence``
-    is the cumulative probability mass under that bound.
+    The model is a classifier over "block offset": how many coarse time
+    blocks after the incident's start block it resolves in. The prediction
+    is the earliest block by which there is a PREDICTION_COVERAGE_TARGET
+    chance it is resolved, so the duration is a one-sided "fixed by" bound
+    and ``confidence`` is the cumulative probability under that bound.
     """
     result = _incident_offset_probs(incident)
     if result is None:
         return None, None
-    model, probs = result
-    return _decode_offset_bound(model, probs, incident, floor_offset=0)
+    model, probs, tail, category = result
+    return _decode_offset_bound(model, probs, incident, tail, category)
 
 
-def _decode_offset_bound(model, probs, incident, floor_offset=0):
+def _decode_offset_bound(model, probs, incident, tail=None, category=None):
     """Turn a block-offset probability vector into a (duration, confidence).
 
-    ``floor_offset`` zeroes the probability mass for offsets the incident
-    has already lived past (used for conditional re-prediction); 0 means the
-    ordinary at-creation prediction. Returns (None, None) when no honest
-    finite bound survives — either nothing is left, or the coverage target
-    is only reached at the open-ended ``MAX_OFFSET_CLASS`` tail (which means
-    "at least this long, unbounded" and must not be shown as a concrete
-    "fixed by" time).
+    Returns (None, None) when there is no honest bound: the target is only
+    reached in the open-ended class and there is no tail table to say how
+    long such faults last, or it is not reached within the table's horizon.
+    ml/train.py's decode_bound mirrors this for cross-validation.
     """
-    import numpy as np
+    class_probs = [0.0] * (MAX_OFFSET_CLASS + 1)
+    for cls, probability in zip(model.classes_, probs):
+        cls = int(cls)
+        if 0 <= cls <= MAX_OFFSET_CLASS:
+            class_probs[cls] = float(probability)
 
-    order = np.argsort(model.classes_)
-    sorted_offsets = np.asarray(model.classes_)[order]
-    sorted_probs = np.asarray(probs)[order]
-
-    if floor_offset > 0:
-        keep = sorted_offsets >= floor_offset
-        sorted_offsets = sorted_offsets[keep]
-        sorted_probs = sorted_probs[keep]
-        if sorted_offsets.size == 0:
-            return None, None
-        total = sorted_probs.sum()
-        if total <= 0:
-            return None, None
-        sorted_probs = sorted_probs / total
-
-    cumulative = np.cumsum(sorted_probs)
-    target_pos = int(np.searchsorted(cumulative, PREDICTION_COVERAGE_TARGET))
-    if target_pos >= len(sorted_offsets):
-        target_pos = len(sorted_offsets) - 1
-    pred_offset = int(sorted_offsets[target_pos])
-    confidence = float(cumulative[target_pos])
-    confidence = max(0.05, min(0.95, confidence))
-
-    # The top class is open-ended ("resolves >= MAX_OFFSET_CLASS blocks
-    # out"), so decoding it to the end of that one block would promise a
-    # concrete "fixed by ~2 days" that the data doesn't support. When the
-    # coverage target only lands there, we have no honest bound.
-    if pred_offset >= MAX_OFFSET_CLASS:
+    cdf = extended_cdf(class_probs, tail, category)
+    offset = bound_offset(cdf)
+    if offset is None:
         return None, None
 
     start_idx = block_index(incident.start_time)
-    return _offset_to_duration(start_idx, pred_offset, incident.start_time, confidence)
+    offset = round_up_to_service_day(start_idx, offset)
+    confidence = cdf[min(offset, len(cdf) - 1)]
+    confidence = max(0.05, min(0.95, confidence))
+    return _offset_to_duration(start_idx, offset, incident.start_time, confidence)
 
 
 def _offset_to_duration(start_idx, pred_offset, start_time, confidence):
@@ -596,7 +578,7 @@ def _offset_to_duration(start_idx, pred_offset, start_time, confidence):
 
 
 def _incident_offset_probs(incident):
-    """Build features for ``incident`` and return (model, blended probs).
+    """Build features for ``incident`` and return (model, probs, tail, category).
 
     Returns None when there is no model or the incident is planned work
     (whose duration is stated in the text, so we don't predict it).
@@ -728,7 +710,7 @@ def _incident_offset_probs(incident):
     try:
         import numpy as np
     except ImportError:
-        return None, None
+        return None
 
     # Build a single-row feature matrix in the exact column order the model
     # was trained with. We deliberately avoid pandas here — it was being
@@ -761,12 +743,9 @@ def _incident_offset_probs(incident):
         baseline_evidence,
         historical_baselines.get("config") if historical_baselines else None,
     )
-    # The blended probability vector over block-offset classes. classes_ is
-    # sorted ascending, so a cumulative sum is P(resolved by the end of that
-    # block). Decoding into a one-sided "fixed by" bound is done by the
-    # caller (_decode_offset_bound), which can also condition on elapsed time
-    # for the overdue re-prediction path.
-    return model, probs
+    # The blended probability vector over block-offset classes, plus what
+    # the decode needs to extend it past the open-ended class.
+    return model, probs, data.get("tail_distribution"), fault_category(feature_text)
 
 
 # Allow cache clearing when a new model is uploaded
