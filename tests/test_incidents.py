@@ -1251,7 +1251,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
             return_value=object(),
         ), patch(
             "incidents.management.commands.predict_durations.predict_duration",
-            return_value=(timedelta(minutes=30), 0.7),
+            return_value=(timedelta(hours=5), 0.7),
         ):
             call_command(
                 "predict_durations",
@@ -1268,9 +1268,32 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         first.refresh_from_db()
         second.refresh_from_db()
         self.assertIsNone(first.estimated_duration)
-        self.assertEqual(second.estimated_duration, timedelta(minutes=30))
+        self.assertEqual(second.estimated_duration, timedelta(hours=5))
         self.assertEqual(second.prediction_confidence, 0.7)
         self.assertIn(f"Last processed incident id: {second.id}", stdout.getvalue())
+
+    def test_predict_durations_never_stores_a_time_that_has_already_passed(self):
+        parent = self.create_parent_station("Bank")
+        old = self.create_incident(
+            parent, text="Old outage", start_time=timezone.now() - timedelta(days=3)
+        )
+        fresh = self.create_incident(parent, text="Fresh outage")
+        stdout = StringIO()
+
+        with patch(
+            "incidents.management.commands.predict_durations._load_model",
+            return_value=object(),
+        ), patch(
+            "incidents.management.commands.predict_durations.predict_duration",
+            return_value=(timedelta(hours=5), 0.95),
+        ):
+            call_command("predict_durations", stdout=stdout)
+
+        old.refresh_from_db()
+        fresh.refresh_from_db()
+        self.assertIsNone(old.estimated_duration)
+        self.assertEqual(fresh.estimated_duration, timedelta(hours=5))
+        self.assertIn("1 skipped as already past", stdout.getvalue())
 
     def test_archive_old_reports_exports_and_deletes_after_backfill(self):
         parent = self.create_parent_station("Bank")
