@@ -2,7 +2,6 @@ import os
 import threading
 from datetime import datetime
 from datetime import timedelta
-from math import sqrt
 
 from django.conf import settings
 from django.core.cache import cache
@@ -115,13 +114,12 @@ def _validate_model_payload(payload):
 
 PREDICTION_POLICY_WINDOW_DAYS = 30
 PREDICTION_POLICY_FALLBACK_WINDOW_DAYS = (90, 180)
-PREDICTION_BUCKET_MIN_SAMPLES = 15
-PREDICTION_BUCKET_MIN_LOWER_BOUND = 0.55
+PREDICTION_BUCKET_MIN_SAMPLES = 30
+# Shown only while at least this share of recent predictions in the bucket
+# were right first time. The model aims higher (about 96%); this is the floor
+# below which we stop showing predictions at all.
+PREDICTION_MIN_ACCURACY = 0.90
 PREDICTION_STATION_DIAGNOSTIC_MIN_SAMPLES = 3
-PREDICTION_STATION_OVERRIDE_BUCKET = 40
-PREDICTION_STATION_OVERRIDE_WINDOW_DAYS = 180
-PREDICTION_STATION_OVERRIDE_MIN_SAMPLES = 20
-PREDICTION_STATION_OVERRIDE_MIN_ACCURACY = 0.65
 PREDICTION_REVIEW_LIMIT = 50
 PREDICTION_NETWORK_LABELS = (
     ("tube", "Tube"),
@@ -410,109 +408,6 @@ def _hidden_low_accuracy_diagnostics(current_issues, resolved_incidents):
     }
 
 
-def _prediction_station_overrides(current_issues, prediction_policy, now=None):
-    if now is None:
-        now = timezone.now()
-
-    candidate_station_ids = set()
-
-    for issue in current_issues:
-        bucket = _prediction_confidence_bucket(issue.prediction_confidence)
-        if bucket != PREDICTION_STATION_OVERRIDE_BUCKET:
-            continue
-
-        bucket_policy = prediction_policy.get(bucket, {})
-        if bucket_policy.get("show_prediction"):
-            continue
-
-        expected_end_time = None
-        expected_block = None
-        if issue.start_time and issue.estimated_duration:
-            expected_end_time = issue.start_time + issue.estimated_duration
-            expected_block = format_block_slot(time_block_slot(expected_end_time), now)
-
-        hidden_reason = _prediction_hidden_reason(
-            expected_end_time,
-            expected_block,
-            bucket_policy,
-            now,
-        )
-        if hidden_reason != "bucket_accuracy_too_low":
-            continue
-
-        candidate_station_ids.add(_effective_station(issue.station).id)
-
-    if not candidate_station_ids:
-        return {}
-
-    since = now - timedelta(days=PREDICTION_STATION_OVERRIDE_WINDOW_DAYS)
-    station_history = {}
-    history_incidents = (
-        Incident.objects.filter(
-            resolved=True,
-            end_time__gt=since,
-            estimated_duration__isnull=False,
-            start_time__isnull=False,
-            end_time__isnull=False,
-        )
-        .filter(
-            Q(station_id__in=candidate_station_ids)
-            | Q(station__parent_station_id__in=candidate_station_ids)
-        )
-        .select_related("station", "station__parent_station")
-        .only(
-            "station_id",
-            "station__parent_station_id",
-            "start_time",
-            "end_time",
-            "estimated_duration",
-        )
-    )
-
-    for incident in history_incidents:
-        station_id = _effective_station(incident.station).id
-        history = station_history.setdefault(
-            station_id,
-            {"prediction_count": 0, "correct_count": 0},
-        )
-        history["prediction_count"] += 1
-        predicted_end = incident.start_time + incident.estimated_duration
-        if prediction_is_close_enough(predicted_end, incident.end_time):
-            history["correct_count"] += 1
-
-    overrides = {}
-    for station_id, history in station_history.items():
-        prediction_count = history["prediction_count"]
-        if prediction_count < PREDICTION_STATION_OVERRIDE_MIN_SAMPLES:
-            continue
-
-        accuracy = history["correct_count"] / prediction_count
-        if accuracy < PREDICTION_STATION_OVERRIDE_MIN_ACCURACY:
-            continue
-
-        overrides[station_id] = {
-            "show_prediction": True,
-            "label": "maybe",
-            "accuracy": accuracy,
-            "accuracy_pct": round(accuracy * 100),
-            "station_override": True,
-            "station_prediction_count": prediction_count,
-        }
-
-    return overrides
-
-
-def _wilson_lower_bound(successes, total, z=1.96):
-    if total == 0:
-        return 0.0
-
-    phat = successes / total
-    denom = 1 + z * z / total
-    centre = phat + z * z / (2 * total)
-    margin = z * sqrt((phat * (1 - phat) + z * z / (4 * total)) / total)
-    return max(0.0, (centre - margin) / denom)
-
-
 def _prediction_bucket_metrics(since):
     now = timezone.now()
     return _prediction_window_metrics(now, (max(1, (now - since).days),)).get(
@@ -556,16 +451,10 @@ def _prediction_window_metrics_from_incidents(incidents, now, windows):
         buckets = metrics["buckets"]
         for bucket in range(0, 100, 10):
             entry = buckets.setdefault(bucket, {"count": 0, "correct": 0})
-            if entry["count"] > 0:
-                accuracy = entry["correct"] / entry["count"]
-                lower_bound = _wilson_lower_bound(entry["correct"], entry["count"])
-            else:
-                accuracy = None
-                lower_bound = 0.0
-
+            accuracy = entry["correct"] / entry["count"] if entry["count"] else None
             show_prediction = (
                 entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES
-                and lower_bound >= PREDICTION_BUCKET_MIN_LOWER_BOUND
+                and accuracy >= PREDICTION_MIN_ACCURACY
             )
             entry.update(
                 {
@@ -574,8 +463,6 @@ def _prediction_window_metrics_from_incidents(incidents, now, windows):
                     "accuracy_pct": (
                         round(accuracy * 100) if accuracy is not None else None
                     ),
-                    "lower_bound": lower_bound,
-                    "lower_bound_pct": round(lower_bound * 100),
                     "show_prediction": show_prediction,
                     "label": (
                         _prediction_confidence_label(accuracy)
@@ -668,7 +555,7 @@ def _prediction_display_policy_from_window_metrics(metrics_by_window):
 
         show_prediction = (
             selected_entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES
-            and selected_entry["lower_bound"] >= PREDICTION_BUCKET_MIN_LOWER_BOUND
+            and selected_entry["accuracy"] >= PREDICTION_MIN_ACCURACY
         )
         policy[bucket] = {
             **selected_entry,
@@ -698,7 +585,6 @@ def _prediction_display_policy(now=None):
 def _prepare_incidents(
     queryset,
     prediction_policy=None,
-    station_prediction_overrides=None,
     now=None,
 ):
     incidents = list(queryset)
@@ -735,17 +621,6 @@ def _prepare_incidents(
             incident.confidence_pct = None
         bucket = _prediction_confidence_bucket(display_confidence)
         bucket_policy = prediction_policy.get(bucket, {}) if bucket is not None else {}
-        incident.used_station_prediction_override = False
-        if (
-            station_prediction_overrides
-            and bucket == PREDICTION_STATION_OVERRIDE_BUCKET
-        ):
-            station_override = station_prediction_overrides.get(
-                _effective_station(incident.station).id
-            )
-            if station_override:
-                bucket_policy = {**bucket_policy, **station_override}
-                incident.used_station_prediction_override = True
         incident.prediction_label = bucket_policy.get("label")
         incident.prediction_accuracy_pct = bucket_policy.get("accuracy_pct")
         incident.prediction_bucket_shown = bool(bucket_policy.get("show_prediction"))
@@ -881,16 +756,9 @@ def _status_page_context():
         .filter(resolved=False, information=False)
         .order_by("-start_time", "station__parent_station")
     )
-    raw_issues = list(issue_queryset)
-    station_prediction_overrides = _prediction_station_overrides(
-        raw_issues,
-        prediction_policy,
-        now,
-    )
     issues = _prepare_incidents(
-        raw_issues,
+        issue_queryset,
         prediction_policy=prediction_policy,
-        station_prediction_overrides=station_prediction_overrides,
         now=now,
     )
     resolved = _prepare_incidents(
@@ -1026,13 +894,9 @@ def api_incidents(request):
         )
     )
 
-    raw_issues = list(base_qs.filter(resolved=False, information=False))
     issues = _prepare_incidents(
-        raw_issues,
+        base_qs.filter(resolved=False, information=False),
         prediction_policy=prediction_policy,
-        station_prediction_overrides=_prediction_station_overrides(
-            raw_issues, prediction_policy, now
-        ),
         now=now,
     )
     resolved = _prepare_incidents(
@@ -1258,16 +1122,9 @@ def _prediction_stats(since):
         )
         .order_by("-start_time", "-id")
     )
-    raw_current_issues = list(current_issue_queryset)
-    station_prediction_overrides = _prediction_station_overrides(
-        raw_current_issues,
-        display_policy,
-        now,
-    )
     current_issues = _prepare_incidents(
-        raw_current_issues,
+        current_issue_queryset,
         prediction_policy=display_policy,
-        station_prediction_overrides=station_prediction_overrides,
         now=now,
     )
     current_prediction_visible_count = sum(
@@ -1374,24 +1231,10 @@ def _prediction_stats(since):
             PREDICTION_BOUNDARY_GRACE.total_seconds() / 60
         ),
         "prediction_display_min_samples": PREDICTION_BUCKET_MIN_SAMPLES,
-        "prediction_display_min_accuracy_pct": round(
-            PREDICTION_BUCKET_MIN_LOWER_BOUND * 100
-        ),
+        "prediction_display_min_accuracy_pct": round(PREDICTION_MIN_ACCURACY * 100),
         "prediction_display_primary_window_days": PREDICTION_POLICY_WINDOW_DAYS,
         "prediction_display_fallback_window_days": ", ".join(
             str(days) for days in PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
-        ),
-        "prediction_station_override_bucket_label": _prediction_confidence_bucket_label(
-            PREDICTION_STATION_OVERRIDE_BUCKET
-        ),
-        "prediction_station_override_window_days": (
-            PREDICTION_STATION_OVERRIDE_WINDOW_DAYS
-        ),
-        "prediction_station_override_min_samples": (
-            PREDICTION_STATION_OVERRIDE_MIN_SAMPLES
-        ),
-        "prediction_station_override_min_accuracy_pct": round(
-            PREDICTION_STATION_OVERRIDE_MIN_ACCURACY * 100
         ),
         "prediction_station_diagnostic_min_samples": (
             PREDICTION_STATION_DIAGNOSTIC_MIN_SAMPLES

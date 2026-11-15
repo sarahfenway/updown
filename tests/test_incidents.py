@@ -8,6 +8,7 @@ import tempfile
 
 from datetime import datetime, timedelta, timezone as dt_timezone
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 try:
@@ -46,7 +47,7 @@ from incidents.views import (
     _prediction_bucket_metrics,
     _prediction_confidence_label,
     _prediction_display_policy,
-    _prediction_station_overrides,
+    _prediction_window_metrics_from_incidents,
     _prepare_incidents,
 )
 from stations.models import Station
@@ -122,6 +123,26 @@ class StationFactoryMixin:
         for report in reports or []:
             incident.reports.add(report)
         return incident
+
+    def create_track_record(self, station, right=30, wrong=0, confidence=0.95):
+        """Resolved predictions from the last fortnight.
+
+        ``right`` of them were fixed inside the predicted time and ``wrong``
+        overran it. Six hours apart, so 60 of them still fit in 30 days.
+        """
+        now = timezone.now()
+        for i in range(right + wrong):
+            start = now - timedelta(days=1, hours=6 * i)
+            held = i < right
+            self.create_incident(
+                station,
+                text=f"Track record {confidence} {i}",
+                resolved=True,
+                start_time=start,
+                end_time=start + timedelta(hours=1 if held else 12),
+                estimated_duration=timedelta(hours=2),
+                prediction_confidence=confidence,
+            )
 
 
 class UtilityTests(SimpleTestCase):
@@ -1383,166 +1404,79 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(command._with_lock_retry("test operation", operation), "ok")
         sleep_mock.assert_called_once_with(0.1)
 
-    def test_prepare_incidents_only_shows_predictions_from_stronger_buckets(self):
+    def test_prepare_incidents_only_shows_buckets_right_nine_times_in_ten(self):
         parent = self.create_parent_station("Waterloo")
-        # Relative to now so the history stays inside the prediction policy's
-        # lookback windows (30/90/180 days) whenever the suite runs.
-        base = timezone.now() - timedelta(days=25)
-
-        # One-sided scoring: a prediction is correct when the incident was
-        # resolved at or before the predicted "fixed by" time. "Wrong"
-        # therefore means it resolved *later* than we promised.
-        #
-        # Bucket 60 (conf 0.65): 20 predictions, 16 correct → 80% accuracy,
-        # which clears the display gate and lands in the "likely" band.
-        for i in range(16):
-            self.create_incident(
-                parent,
-                text=f"Resolved good {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i),
-                end_time=base + timedelta(days=i, hours=1),
-                estimated_duration=timedelta(hours=2),
-                prediction_confidence=0.65,
-            )
-        for i in range(4):
-            self.create_incident(
-                parent,
-                text=f"Resolved good late {i}",
-                resolved=True,
-                start_time=base + timedelta(days=20 + i),
-                end_time=base + timedelta(days=20 + i, hours=12),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
-        # Bucket 40 (conf 0.45): 15 predictions, 7 correct → ~47% accuracy,
-        # well below the gate, so it stays hidden.
-        for i in range(7):
-            self.create_incident(
-                parent,
-                text=f"Resolved low ok {i}",
-                resolved=True,
-                start_time=base + timedelta(days=40 + i),
-                end_time=base + timedelta(days=40 + i, hours=1),
-                estimated_duration=timedelta(hours=2),
-                prediction_confidence=0.45,
-            )
-        for i in range(8):
-            self.create_incident(
-                parent,
-                text=f"Resolved low late {i}",
-                resolved=True,
-                start_time=base + timedelta(days=60 + i),
-                end_time=base + timedelta(days=60 + i, hours=12),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.45,
-            )
-
-        low = self.create_incident(
+        self.create_track_record(parent, right=28, wrong=2, confidence=0.95)  # 93%
+        self.create_track_record(parent, right=26, wrong=4, confidence=0.85)  # 87%
+        weak = self.create_incident(
             parent,
-            text="Low confidence outage",
+            text="Weak bucket outage",
             estimated_duration=timedelta(hours=2),
-            prediction_confidence=0.45,
+            prediction_confidence=0.85,
         )
-        high = self.create_incident(
+        strong = self.create_incident(
             parent,
-            text="High confidence outage",
+            text="Strong bucket outage",
             estimated_duration=timedelta(hours=2),
-            prediction_confidence=0.65,
+            prediction_confidence=0.95,
         )
         policy = _prediction_bucket_metrics(
             timezone.now() - timedelta(days=365)
         )["buckets"]
 
         incidents = _prepare_incidents(
-            Incident.objects.filter(id__in=[low.id, high.id]).order_by("id"),
+            Incident.objects.filter(id__in=[weak.id, strong.id]).order_by("id"),
             prediction_policy=policy,
         )
 
         self.assertFalse(incidents[0].show_prediction)
         self.assertIsNone(incidents[0].prediction_label)
         self.assertTrue(incidents[1].show_prediction)
-        self.assertEqual(incidents[1].prediction_label, "likely")
-        self.assertEqual(incidents[1].prediction_accuracy_pct, 80)
+        self.assertEqual(incidents[1].prediction_label, "very likely")
+        self.assertEqual(incidents[1].prediction_accuracy_pct, 93)
 
-    def test_prepare_incidents_allows_40_bucket_for_station_with_strong_history(self):
-        weak_station = self.create_parent_station("Camden Road", overground=True)
-        strong_station = self.create_parent_station("Roding Valley")
+    def _bucket(self, right, wrong):
         now = timezone.now()
-
-        for i in range(15):
-            start_time = now - timedelta(days=30 + i, hours=2)
-            self.create_incident(
-                weak_station,
-                text=f"Weak bucket miss {i}",
-                resolved=True,
-                start_time=start_time,
-                end_time=start_time + timedelta(days=1, hours=1),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.45,
+        start = now - timedelta(days=2)
+        rows = [
+            SimpleNamespace(
+                start_time=start,
+                end_time=start + timedelta(hours=1 if i < right else 12),
+                estimated_duration=timedelta(hours=2),
+                prediction_confidence=0.95,
             )
+            for i in range(right + wrong)
+        ]
+        return _prediction_window_metrics_from_incidents(rows, now, (30,))[30][
+            "buckets"
+        ][90]
 
-        for i in range(20):
-            start_time = now - timedelta(days=60 + i, hours=2)
-            self.create_incident(
-                strong_station,
-                text=f"Strong history good {i}",
-                resolved=True,
-                start_time=start_time,
-                end_time=start_time + timedelta(hours=1),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
+    def test_display_rule_needs_thirty_predictions_and_ninety_percent_right(self):
+        self.assertFalse(self._bucket(right=29, wrong=0)["show_prediction"])
+        self.assertTrue(self._bucket(right=30, wrong=0)["show_prediction"])
+        self.assertTrue(self._bucket(right=27, wrong=3)["show_prediction"])
+        self.assertFalse(self._bucket(right=26, wrong=4)["show_prediction"])
+        self.assertEqual(self._bucket(right=27, wrong=3)["label"], "very likely")
+        self.assertNotIn("lower_bound", self._bucket(right=27, wrong=3))
 
-        current = self.create_incident(
-            strong_station,
-            text="Current moderate confidence outage",
-            resolved=False,
-            start_time=now - timedelta(hours=1),
-            estimated_duration=timedelta(hours=2),
-            prediction_confidence=0.45,
-        )
+    def test_stats_explains_the_right_first_time_rule(self):
+        parent = self.create_parent_station("Green Park")
+        self.create_track_record(parent, right=29, wrong=1)
 
-        policy = _prediction_display_policy(now)
-        overrides = _prediction_station_overrides(
-            Incident.objects.filter(id=current.id).select_related(
-                "station", "station__parent_station"
-            ),
-            policy,
-            now,
-        )
+        with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
+            response = self.client.get("/stats/")
 
-        incidents = _prepare_incidents(
-            Incident.objects.filter(id=current.id).select_related(
-                "station", "station__parent_station"
-            ),
-            prediction_policy=policy,
-            station_prediction_overrides=overrides,
-            now=now,
-        )
-
-        self.assertFalse(policy[40]["show_prediction"])
-        self.assertTrue(incidents[0].show_prediction)
-        self.assertTrue(incidents[0].used_station_prediction_override)
-        self.assertEqual(incidents[0].prediction_label, "maybe")
-        self.assertEqual(incidents[0].prediction_accuracy_pct, 100)
+        self.assertContains(response, "Right first time: 29 / 30 (97%)")
+        self.assertContains(response, "at least 30 recent predictions")
+        self.assertContains(response, "at least 90% of them")
+        self.assertNotContains(response, "narrow exception")
 
     def test_prediction_display_policy_falls_back_when_recent_bucket_is_sparse(self):
         parent = self.create_parent_station("Waterloo")
         now = timezone.now()
 
+        self.create_track_record(parent, right=20, confidence=0.65)
         for i in range(10):
-            start_time = now - timedelta(days=10 + i, hours=2)
-            self.create_incident(
-                parent,
-                text=f"Recent good {i}",
-                resolved=True,
-                start_time=start_time,
-                end_time=start_time + timedelta(hours=1),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
-        for i in range(5):
             start_time = now - timedelta(days=40 + i, hours=2)
             self.create_incident(
                 parent,
@@ -1564,20 +1498,8 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         parent = self.create_parent_station("Waterloo")
         now = timezone.now()
 
-        for i in range(15):
-            start_time = now - timedelta(days=10 + i, hours=2)
-            # One-sided miss: we said "fixed by" an hour but it actually
-            # took twelve, so the promise broke.
-            self.create_incident(
-                parent,
-                text=f"Recent miss {i}",
-                resolved=True,
-                start_time=start_time,
-                end_time=start_time + timedelta(hours=12),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
-        for i in range(20):
+        self.create_track_record(parent, right=0, wrong=30, confidence=0.65)
+        for i in range(40):
             start_time = now - timedelta(days=60 + i, hours=2)
             self.create_incident(
                 parent,
@@ -1597,19 +1519,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_prepare_incidents_admits_overdue_current_prediction(self):
         parent = self.create_parent_station("Bank")
-        # Relative to now so the history stays inside the prediction policy's
-        # lookback windows (30/90/180 days) whenever the suite runs.
-        base = timezone.now() - timedelta(days=25)
-        for i in range(15):
-            self.create_incident(
-                parent,
-                text=f"Resolved good {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i),
-                end_time=base + timedelta(days=i, hours=1),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
+        self.create_track_record(parent, confidence=0.65)
 
         overdue = self.create_incident(
             parent,
@@ -1637,19 +1547,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_prepare_incidents_names_the_day_for_long_range_prediction(self):
         parent = self.create_parent_station("Bank")
-        # Relative to now so the history stays inside the prediction policy's
-        # lookback windows (30/90/180 days) whenever the suite runs.
-        base = timezone.now() - timedelta(days=25)
-        for i in range(15):
-            self.create_incident(
-                parent,
-                text=f"Resolved good {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i),
-                end_time=base + timedelta(days=i, hours=1),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
+        self.create_track_record(parent, confidence=0.65)
 
         long_range = self.create_incident(
             parent,
@@ -1676,19 +1574,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_prepare_incidents_marks_resolved_miss_as_wrong(self):
         parent = self.create_parent_station("Bank")
-        # Relative to now so the history stays inside the prediction policy's
-        # lookback windows (30/90/180 days) whenever the suite runs.
-        base = timezone.now() - timedelta(days=25)
-        for i in range(15):
-            self.create_incident(
-                parent,
-                text=f"Resolved good {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i),
-                end_time=base + timedelta(days=i, hours=1),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
+        self.create_track_record(parent, confidence=0.65)
 
         missed = self.create_incident(
             parent,
@@ -1739,19 +1625,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_beta_renders_inline_status_next_to_event_time(self):
         parent = self.create_parent_station("Bank")
-        # Relative to now so the history stays inside the prediction policy's
-        # lookback windows (30/90/180 days) whenever the suite runs.
-        base = timezone.now() - timedelta(days=25)
-        for i in range(15):
-            self.create_incident(
-                parent,
-                text=f"Resolved good {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i),
-                end_time=base + timedelta(days=i, hours=1),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
+        self.create_track_record(parent, confidence=0.65)
 
         active = self.create_incident(
             parent,
@@ -2377,27 +2251,8 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
     def test_stats_includes_current_prediction_visibility_breakdown(self):
         parent = self.create_parent_station("Green Park")
-        base = timezone.now() - timedelta(days=10)
-
-        for i in range(15):
-            self.create_incident(
-                parent,
-                text=f"Resolved good {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i),
-                end_time=base + timedelta(days=i, hours=1),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.65,
-            )
-            self.create_incident(
-                parent,
-                text=f"Resolved weak {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i, hours=3),
-                end_time=base + timedelta(days=i, hours=12),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.25,
-            )
+        self.create_track_record(parent, confidence=0.65)
+        self.create_track_record(parent, right=0, wrong=30, confidence=0.25)
 
         self.create_incident(
             parent,
@@ -2467,27 +2322,8 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
             crossrail=False,
             overground=False,
         )
-        base = timezone.now() - timedelta(days=20)
-
-        for i in range(15):
-            self.create_incident(
-                tube_station,
-                text=f"Resolved weak tube {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i),
-                end_time=base + timedelta(days=i + 1, hours=4),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.25,
-            )
-            self.create_incident(
-                dlr_station,
-                text=f"Resolved weak dlr {i}",
-                resolved=True,
-                start_time=base + timedelta(days=i, hours=1),
-                end_time=base + timedelta(days=i + 1, hours=5),
-                estimated_duration=timedelta(hours=1),
-                prediction_confidence=0.35,
-            )
+        self.create_track_record(tube_station, right=0, wrong=30, confidence=0.25)
+        self.create_track_record(dlr_station, right=0, wrong=30, confidence=0.35)
 
         self.create_incident(
             tube_station,
@@ -2550,11 +2386,11 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
             for row in response.context["current_hidden_low_accuracy_station_rows"]
         }
         self.assertEqual(station_rows["Green Park"]["current_hidden_count"], 1)
-        self.assertEqual(station_rows["Green Park"]["recent_prediction_count"], 15)
+        self.assertEqual(station_rows["Green Park"]["recent_prediction_count"], 30)
         self.assertEqual(station_rows["Green Park"]["recent_accuracy_pct"], 0)
         self.assertTrue(station_rows["Green Park"]["has_enough_history"])
         self.assertEqual(station_rows["West India Quay"]["current_hidden_count"], 2)
-        self.assertEqual(station_rows["West India Quay"]["recent_prediction_count"], 15)
+        self.assertEqual(station_rows["West India Quay"]["recent_prediction_count"], 30)
         self.assertEqual(station_rows["West India Quay"]["recent_accuracy_pct"], 0)
         self.assertTrue(station_rows["West India Quay"]["has_enough_history"])
 
