@@ -2,7 +2,6 @@ import os
 import threading
 from datetime import datetime
 from datetime import timedelta
-from math import sqrt
 
 from django.conf import settings
 from django.core.cache import cache
@@ -28,11 +27,9 @@ from django.views.decorators.csrf import csrf_exempt
 from incidents.models import Incident, Report
 from incidents.utils import get_last_updated
 from incidents.ml import (
-    BLOCKS_PER_DAY,
     PREDICTION_BOUNDARY_GRACE,
-    block_index,
     format_block_slot,
-    is_planned_work_text,
+    format_bound_label,
     predict_duration,
     prediction_is_close_enough,
     prediction_outcome,
@@ -68,7 +65,7 @@ def _request_functions_key(request, params):
 
 # feature_version values ml.py knows how to serve. Reject anything else at
 # upload time rather than letting predictions silently break at runtime.
-SUPPORTED_FEATURE_VERSIONS = frozenset({1, 2, 3})
+SUPPORTED_FEATURE_VERSIONS = frozenset({1, 2, 3, 4})
 
 
 def _validate_model_payload(payload):
@@ -96,6 +93,10 @@ def _validate_model_payload(payload):
             f"{metadata.get('feature_version')!r} (supported: "
             f"{sorted(SUPPORTED_FEATURE_VERSIONS)})"
         )
+    if metadata["feature_version"] >= 4:
+        tail = payload.get("tail_distribution")
+        if not isinstance(tail, dict) or "all" not in tail or "by_category" not in tail:
+            return "Version 4 model payload is missing its tail_distribution"
 
     feature_names = getattr(model, "feature_names_in_", None)
     if feature_names is None:
@@ -113,26 +114,12 @@ def _validate_model_payload(payload):
 
 PREDICTION_POLICY_WINDOW_DAYS = 30
 PREDICTION_POLICY_FALLBACK_WINDOW_DAYS = (90, 180)
-PREDICTION_BUCKET_MIN_SAMPLES = 15
-PREDICTION_BUCKET_MIN_LOWER_BOUND = 0.55
+PREDICTION_BUCKET_MIN_SAMPLES = 30
+# Shown only while at least this share of recent predictions in the bucket
+# were right first time. The model aims higher (about 96%); this is the floor
+# below which we stop showing predictions at all.
+PREDICTION_MIN_ACCURACY = 0.90
 PREDICTION_STATION_DIAGNOSTIC_MIN_SAMPLES = 3
-PREDICTION_STATION_OVERRIDE_BUCKET = 40
-PREDICTION_STATION_OVERRIDE_WINDOW_DAYS = 180
-PREDICTION_STATION_OVERRIDE_MIN_SAMPLES = 20
-PREDICTION_STATION_OVERRIDE_MIN_ACCURACY = 0.65
-BETA_LONG_RANGE_DAYS = 7
-# "Likely to be some time". The model's classes stop at ~2 days, so once an
-# incident outlives the same block the next day there is usually no honest
-# "fixed by" bound left to show. Elapsed time alone is the useful signal then:
-# offline, faults still open after 5 blocks were still open a day later ~60%
-# of the time, rising to 70-80% from 3 days. The claim shown is "probably not
-# fixed within the next day" (still open LONG_RUNNING_HORIZON_BLOCKS later),
-# scored per age band against recent outcomes and gated by the same Wilson
-# rule as ordinary predictions. Each band is scored at its youngest age, the
-# least likely to stay open, so ages inside it are never overstated.
-LONG_RUNNING_AGE_BANDS = (5, 8, 12, 28)
-LONG_RUNNING_HORIZON_BLOCKS = 4
-LONG_RUNNING_WINDOW_DAYS = 180
 PREDICTION_REVIEW_LIMIT = 50
 PREDICTION_NETWORK_LABELS = (
     ("tube", "Tube"),
@@ -204,8 +191,6 @@ def _beta_current_status_text(label, expected_end_time, expected_block, now):
         return None
     if expected_end_time <= now:
         return None
-    if expected_end_time > now + timedelta(days=BETA_LONG_RANGE_DAYS):
-        return "More than a week"
     if not label:
         return None
     return f"{label.capitalize()} by {expected_block}"
@@ -249,6 +234,19 @@ def _beta_resolved_status_title(issue):
         f"AI prediction: wrong. We said it would be fixed by {issue.expected_block}, "
         f"but it was not fixed until {issue.actual_block}. {_beta_meter_help_text()}"
     )
+
+
+OVERDUE_STATUS_TEXT = "Taking longer than we predicted"
+
+
+def _overdue_status_title(incident):
+    title = f"We predicted this would be fixed by {incident.expected_block}."
+    if incident.prediction_accuracy_pct is not None:
+        title += (
+            f" Recently {incident.prediction_accuracy_pct}% of our predictions "
+            "were right first time."
+        )
+    return title
 
 
 def _prediction_hidden_reason(expected_end_time, expected_block, bucket_policy, now):
@@ -410,109 +408,6 @@ def _hidden_low_accuracy_diagnostics(current_issues, resolved_incidents):
     }
 
 
-def _prediction_station_overrides(current_issues, prediction_policy, now=None):
-    if now is None:
-        now = timezone.now()
-
-    candidate_station_ids = set()
-
-    for issue in current_issues:
-        bucket = _prediction_confidence_bucket(issue.prediction_confidence)
-        if bucket != PREDICTION_STATION_OVERRIDE_BUCKET:
-            continue
-
-        bucket_policy = prediction_policy.get(bucket, {})
-        if bucket_policy.get("show_prediction"):
-            continue
-
-        expected_end_time = None
-        expected_block = None
-        if issue.start_time and issue.estimated_duration:
-            expected_end_time = issue.start_time + issue.estimated_duration
-            expected_block = format_block_slot(time_block_slot(expected_end_time), now)
-
-        hidden_reason = _prediction_hidden_reason(
-            expected_end_time,
-            expected_block,
-            bucket_policy,
-            now,
-        )
-        if hidden_reason != "bucket_accuracy_too_low":
-            continue
-
-        candidate_station_ids.add(_effective_station(issue.station).id)
-
-    if not candidate_station_ids:
-        return {}
-
-    since = now - timedelta(days=PREDICTION_STATION_OVERRIDE_WINDOW_DAYS)
-    station_history = {}
-    history_incidents = (
-        Incident.objects.filter(
-            resolved=True,
-            end_time__gt=since,
-            estimated_duration__isnull=False,
-            start_time__isnull=False,
-            end_time__isnull=False,
-        )
-        .filter(
-            Q(station_id__in=candidate_station_ids)
-            | Q(station__parent_station_id__in=candidate_station_ids)
-        )
-        .select_related("station", "station__parent_station")
-        .only(
-            "station_id",
-            "station__parent_station_id",
-            "start_time",
-            "end_time",
-            "estimated_duration",
-        )
-    )
-
-    for incident in history_incidents:
-        station_id = _effective_station(incident.station).id
-        history = station_history.setdefault(
-            station_id,
-            {"prediction_count": 0, "correct_count": 0},
-        )
-        history["prediction_count"] += 1
-        predicted_end = incident.start_time + incident.estimated_duration
-        if prediction_is_close_enough(predicted_end, incident.end_time):
-            history["correct_count"] += 1
-
-    overrides = {}
-    for station_id, history in station_history.items():
-        prediction_count = history["prediction_count"]
-        if prediction_count < PREDICTION_STATION_OVERRIDE_MIN_SAMPLES:
-            continue
-
-        accuracy = history["correct_count"] / prediction_count
-        if accuracy < PREDICTION_STATION_OVERRIDE_MIN_ACCURACY:
-            continue
-
-        overrides[station_id] = {
-            "show_prediction": True,
-            "label": "maybe",
-            "accuracy": accuracy,
-            "accuracy_pct": round(accuracy * 100),
-            "station_override": True,
-            "station_prediction_count": prediction_count,
-        }
-
-    return overrides
-
-
-def _wilson_lower_bound(successes, total, z=1.96):
-    if total == 0:
-        return 0.0
-
-    phat = successes / total
-    denom = 1 + z * z / total
-    centre = phat + z * z / (2 * total)
-    margin = z * sqrt((phat * (1 - phat) + z * z / (4 * total)) / total)
-    return max(0.0, (centre - margin) / denom)
-
-
 def _prediction_bucket_metrics(since):
     now = timezone.now()
     return _prediction_window_metrics(now, (max(1, (now - since).days),)).get(
@@ -556,16 +451,10 @@ def _prediction_window_metrics_from_incidents(incidents, now, windows):
         buckets = metrics["buckets"]
         for bucket in range(0, 100, 10):
             entry = buckets.setdefault(bucket, {"count": 0, "correct": 0})
-            if entry["count"] > 0:
-                accuracy = entry["correct"] / entry["count"]
-                lower_bound = _wilson_lower_bound(entry["correct"], entry["count"])
-            else:
-                accuracy = None
-                lower_bound = 0.0
-
+            accuracy = entry["correct"] / entry["count"] if entry["count"] else None
             show_prediction = (
                 entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES
-                and lower_bound >= PREDICTION_BUCKET_MIN_LOWER_BOUND
+                and accuracy >= PREDICTION_MIN_ACCURACY
             )
             entry.update(
                 {
@@ -574,8 +463,6 @@ def _prediction_window_metrics_from_incidents(incidents, now, windows):
                     "accuracy_pct": (
                         round(accuracy * 100) if accuracy is not None else None
                     ),
-                    "lower_bound": lower_bound,
-                    "lower_bound_pct": round(lower_bound * 100),
                     "show_prediction": show_prediction,
                     "label": (
                         _prediction_confidence_label(accuracy)
@@ -668,7 +555,7 @@ def _prediction_display_policy_from_window_metrics(metrics_by_window):
 
         show_prediction = (
             selected_entry["count"] >= PREDICTION_BUCKET_MIN_SAMPLES
-            and selected_entry["lower_bound"] >= PREDICTION_BUCKET_MIN_LOWER_BOUND
+            and selected_entry["accuracy"] >= PREDICTION_MIN_ACCURACY
         )
         policy[bucket] = {
             **selected_entry,
@@ -695,138 +582,10 @@ def _prediction_display_policy(now=None):
     return _prediction_display_policy_from_window_metrics(metrics_by_window)
 
 
-def _long_running_band(age_blocks):
-    band = None
-    for start in LONG_RUNNING_AGE_BANDS:
-        if age_blocks >= start:
-            band = start
-    return band
-
-
-def _long_running_policy_from_rows(rows, now):
-    """Score "still open a day later" per age band.
-
-    ``rows`` are ``(start_time, end_time, resolved, text, information)``.
-    An incident counts towards a band once it has reached the band's age;
-    it is a success if it was still open LONG_RUNNING_HORIZON_BLOCKS later.
-    Still-open incidents only count once that outcome is already known.
-    """
-    now_idx = block_index(now)
-    tallies = {band: [0, 0] for band in LONG_RUNNING_AGE_BANDS}
-    for start_time, end_time, resolved, text, information in rows:
-        if start_time is None or is_planned_work_text(text, information):
-            continue
-        start_idx = block_index(start_time)
-        if resolved:
-            if end_time is None:
-                continue
-            lived = block_index(end_time) - start_idx
-        age_now = now_idx - start_idx
-        for band in LONG_RUNNING_AGE_BANDS:
-            horizon = band + LONG_RUNNING_HORIZON_BLOCKS
-            if resolved:
-                if lived < band:
-                    continue
-                still_open = lived >= horizon
-            else:
-                if age_now < horizon:
-                    continue
-                still_open = True
-            tallies[band][0] += 1
-            tallies[band][1] += int(still_open)
-
-    policy = {}
-    for band, (count, still_open) in tallies.items():
-        accuracy = still_open / count if count else None
-        show = (
-            count >= PREDICTION_BUCKET_MIN_SAMPLES
-            and _wilson_lower_bound(still_open, count)
-            >= PREDICTION_BUCKET_MIN_LOWER_BOUND
-        )
-        policy[band] = {
-            "count": count,
-            "accuracy": accuracy,
-            "accuracy_pct": round(accuracy * 100) if accuracy is not None else None,
-            "show": show,
-            "label": _prediction_confidence_label(accuracy) if show else None,
-        }
-    return policy
-
-
-def _long_running_policy(now=None):
-    if now is None:
-        now = timezone.now()
-    # Outcomes move on the scale of blocks, so an hourly key is plenty.
-    cache_key = f"long_running_policy:{now.strftime('%Y%m%d%H')}"
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    rows = Incident.objects.filter(
-        information=False,
-        start_time__gte=now - timedelta(days=LONG_RUNNING_WINDOW_DAYS),
-    ).values_list("start_time", "end_time", "resolved", "text", "information")
-    policy = _long_running_policy_from_rows(rows.iterator(chunk_size=1000), now)
-    cache.set(cache_key, policy, timeout=3600)
-    return policy
-
-
-def _long_running_age_label(band):
-    """Human label for an age band, e.g. "1¼ to 2 days"."""
-    bounds = list(LONG_RUNNING_AGE_BANDS)
-    position = bounds.index(band)
-
-    def days(blocks):
-        whole, quarter = divmod(blocks, BLOCKS_PER_DAY)
-        fraction = {0: "", 1: "¼", 2: "½", 3: "¾"}[quarter]
-        return f"{whole}{fraction}" if whole else fraction
-
-    if position + 1 < len(bounds):
-        return f"{days(band)} to {days(bounds[position + 1])} days"
-    return f"{days(band)}+ days"
-
-
-def _long_running_status_text(label):
-    if label == "maybe":
-        return "May be some time"
-    return f"{label.capitalize()} to be some time"
-
-
-def _long_running_status_title(status_text, accuracy_pct):
-    # Not "AI prediction": this comes from recent outcomes, not the model.
-    return (
-        f"Beta estimate: {status_text}. Recently, {accuracy_pct}% of faults "
-        "open this long were still open a day later."
-    )
-
-
-def _long_running_status(incident, policy, now):
-    if (
-        not policy
-        or incident.resolved
-        or incident.information
-        or incident.show_prediction
-        or not incident.start_time
-        or is_planned_work_text(incident.text, incident.information)
-    ):
-        return None
-    band = _long_running_band(block_index(now) - block_index(incident.start_time))
-    entry = policy.get(band) if band is not None else None
-    if not entry or not entry.get("show"):
-        return None
-    return {
-        "label": entry["label"],
-        "accuracy_pct": entry["accuracy_pct"],
-        "count": entry["count"],
-    }
-
-
 def _prepare_incidents(
     queryset,
     prediction_policy=None,
-    station_prediction_overrides=None,
     now=None,
-    long_running_policy=None,
 ):
     incidents = list(queryset)
     if now is None:
@@ -844,31 +603,13 @@ def _prepare_incidents(
             reports[0].end_time if incident.is_single_user_report else None
         )
 
-        # For an unresolved incident that has overrun its original bound, a
-        # conditional re-prediction (revised_*) may exist. Prefer it for
-        # display so the incident shows a fresh "now expected by X" instead
-        # of a past-due time — but the original estimated_duration is what
-        # every accuracy metric scores, so it is left untouched.
-        # A revision is only meaningful while there is an original
-        # prediction to revise: if that was since cleared (planned work,
-        # tail class, model failure) any leftover revised_* value is stale.
-        incident.prediction_is_revised = bool(
-            not incident.resolved
-            and incident.estimated_duration is not None
-            and incident.revised_estimated_duration is not None
-            and incident.start_time
-        )
-        if incident.prediction_is_revised:
-            display_duration = incident.revised_estimated_duration
-            display_confidence = incident.revised_prediction_confidence
-        else:
-            display_duration = incident.estimated_duration
-            display_confidence = incident.prediction_confidence
+        display_duration = incident.estimated_duration
+        display_confidence = incident.prediction_confidence
 
         if incident.start_time and display_duration:
             incident.expected_end_time = incident.start_time + display_duration
-            incident.expected_block = format_block_slot(
-                time_block_slot(incident.expected_end_time), now
+            incident.expected_block = format_bound_label(
+                incident.start_time, incident.expected_end_time, now
             )
         else:
             incident.expected_end_time = None
@@ -880,17 +621,6 @@ def _prepare_incidents(
             incident.confidence_pct = None
         bucket = _prediction_confidence_bucket(display_confidence)
         bucket_policy = prediction_policy.get(bucket, {}) if bucket is not None else {}
-        incident.used_station_prediction_override = False
-        if (
-            station_prediction_overrides
-            and bucket == PREDICTION_STATION_OVERRIDE_BUCKET
-        ):
-            station_override = station_prediction_overrides.get(
-                _effective_station(incident.station).id
-            )
-            if station_override:
-                bucket_policy = {**bucket_policy, **station_override}
-                incident.used_station_prediction_override = True
         incident.prediction_label = bucket_policy.get("label")
         incident.prediction_accuracy_pct = bucket_policy.get("accuracy_pct")
         incident.prediction_bucket_shown = bool(bucket_policy.get("show_prediction"))
@@ -917,17 +647,19 @@ def _prepare_incidents(
             incident.beta_current_status
         )
         incident.beta_meter_pct = incident.prediction_accuracy_pct
-        incident.long_running = _long_running_status(
-            incident, long_running_policy, now
+        # A missed prediction is admitted, never replaced: once the promised
+        # time (plus the scoring grace) has passed on a prediction we were
+        # showing, say so and offer no second date.
+        incident.prediction_overdue = bool(
+            not incident.resolved
+            and not incident.information
+            and incident.expected_end_time is not None
+            and incident.prediction_bucket_shown
+            and incident.expected_end_time + PREDICTION_BOUNDARY_GRACE < now
         )
-        if incident.long_running:
-            incident.beta_current_status = _long_running_status_text(
-                incident.long_running["label"]
-            )
-            incident.beta_current_status_title = _long_running_status_title(
-                incident.beta_current_status, incident.long_running["accuracy_pct"]
-            )
-            incident.beta_meter_pct = incident.long_running["accuracy_pct"]
+        if incident.prediction_overdue:
+            incident.beta_current_status = OVERDUE_STATUS_TEXT
+            incident.beta_current_status_title = _overdue_status_title(incident)
         incident.beta_meter_help_text = _beta_meter_help_text()
 
         if (
@@ -1024,18 +756,10 @@ def _status_page_context():
         .filter(resolved=False, information=False)
         .order_by("-start_time", "station__parent_station")
     )
-    raw_issues = list(issue_queryset)
-    station_prediction_overrides = _prediction_station_overrides(
-        raw_issues,
-        prediction_policy,
-        now,
-    )
     issues = _prepare_incidents(
-        raw_issues,
+        issue_queryset,
         prediction_policy=prediction_policy,
-        station_prediction_overrides=station_prediction_overrides,
         now=now,
-        long_running_policy=_long_running_policy(now),
     )
     resolved = _prepare_incidents(
         _incident_queryset()
@@ -1090,32 +814,18 @@ def _api_prediction(incident, include_less_reliable=False, now=None):
     """The beta prediction exactly as the site shows it, or None.
 
     Mirrors the homepage: information notices never carry one, and a
-    prediction the display policy hides (sparse or inaccurate bucket, bound
-    already passed with no revision, no usable prediction) is omitted rather
-    than exposed, so API clients can't show what the site deliberately hides.
+    prediction the display policy hides (sparse or inaccurate bucket, time
+    already passed, no usable prediction) is omitted rather than exposed, so
+    API clients can't show what the site deliberately hides.
 
     ``include_less_reliable`` (``?predictions=all``) is the exception: current
     predictions hidden only by a sparse or inaccurate bucket are included with
     ``reliable: false`` and likelihood "maybe". Past-due and missing
-    predictions are never exposed.
-
-    ``kind`` is "fixed_by" for an ordinary bound, or "some_time" for a
-    long-running fault that is probably not fixed within the next day (no
-    time is promised, so the time fields are null).
+    predictions are never exposed; a past-due one is reported by the row's
+    ``prediction_overdue`` flag instead.
     """
     if incident.information:
         return None
-    if getattr(incident, "long_running", None):
-        return {
-            "kind": "some_time",
-            "fixed_by": None,
-            "fixed_by_label": None,
-            "likelihood": incident.long_running["label"],
-            "confidence_pct": None,
-            "recent_accuracy_pct": incident.long_running["accuracy_pct"],
-            "revised": False,
-            "reliable": True,
-        }
     if incident.expected_end_time is None:
         return None
     if now is None:
@@ -1139,7 +849,9 @@ def _api_prediction(incident, include_less_reliable=False, now=None):
         "likelihood": likelihood,
         "confidence_pct": incident.confidence_pct,
         "recent_accuracy_pct": incident.prediction_accuracy_pct,
-        "revised": incident.prediction_is_revised,
+        # Always False: a first prediction is final. Kept so existing API
+        # clients that read the field keep working.
+        "revised": False,
         "reliable": reliable,
     }
     if incident.resolved:
@@ -1152,6 +864,7 @@ def _api_incident_rows(incidents, include_less_reliable=False, now=None):
         {
             **{field: getattr(incident, field) for field in API_INCIDENT_FIELDS},
             "prediction": _api_prediction(incident, include_less_reliable, now),
+            "prediction_overdue": incident.prediction_overdue,
         }
         for incident in incidents
     ]
@@ -1181,15 +894,10 @@ def api_incidents(request):
         )
     )
 
-    raw_issues = list(base_qs.filter(resolved=False, information=False))
     issues = _prepare_incidents(
-        raw_issues,
+        base_qs.filter(resolved=False, information=False),
         prediction_policy=prediction_policy,
-        station_prediction_overrides=_prediction_station_overrides(
-            raw_issues, prediction_policy, now
-        ),
         now=now,
-        long_running_policy=_long_running_policy(now),
     )
     resolved = _prepare_incidents(
         base_qs.filter(resolved=True, end_time__gte=now - timedelta(hours=12)),
@@ -1410,57 +1118,25 @@ def _prediction_stats(since):
             "start_time",
             "estimated_duration",
             "prediction_confidence",
-            # _prepare_incidents reads these for every open incident; leaving
-            # them deferred costs one or two queries per row.
-            "revised_estimated_duration",
-            "revised_prediction_confidence",
             "resolved",
         )
         .order_by("-start_time", "-id")
     )
-    raw_current_issues = list(current_issue_queryset)
-    station_prediction_overrides = _prediction_station_overrides(
-        raw_current_issues,
-        display_policy,
-        now,
-    )
-    long_running_policy = _long_running_policy(now)
     current_issues = _prepare_incidents(
-        raw_current_issues,
+        current_issue_queryset,
         prediction_policy=display_policy,
-        station_prediction_overrides=station_prediction_overrides,
         now=now,
-        long_running_policy=long_running_policy,
     )
     current_prediction_visible_count = sum(
         1 for issue in current_issues if issue.show_prediction
     )
-    current_prediction_long_running_count = sum(
-        1 for issue in current_issues if issue.long_running
-    )
-    # An issue showing "some time" is shown, not hidden, whatever happened
-    # to its original "fixed by" bound.
-    hidden_reasons = [
-        issue.prediction_hidden_reason
-        for issue in current_issues
-        if not issue.long_running
-    ]
+    hidden_reasons = [issue.prediction_hidden_reason for issue in current_issues]
     current_prediction_hidden_sparse_count = hidden_reasons.count("bucket_too_sparse")
     current_prediction_hidden_low_accuracy_count = hidden_reasons.count(
         "bucket_accuracy_too_low"
     )
     current_prediction_hidden_past_due_count = hidden_reasons.count("past_due")
     current_prediction_hidden_missing_count = hidden_reasons.count("missing_prediction")
-    long_running_rows = [
-        {
-            "age_label": _long_running_age_label(band),
-            "count": entry["count"],
-            "accuracy_pct": entry["accuracy_pct"],
-            "label": entry["label"],
-            "show": entry["show"],
-        }
-        for band, entry in sorted(long_running_policy.items())
-    ]
     # Honesty: the headline hit-rate only scores *resolved* incidents, so
     # incidents still open past their ORIGINAL predicted bound (guaranteed to
     # have already broken the "fixed by" promise) are invisible to it until
@@ -1555,24 +1231,10 @@ def _prediction_stats(since):
             PREDICTION_BOUNDARY_GRACE.total_seconds() / 60
         ),
         "prediction_display_min_samples": PREDICTION_BUCKET_MIN_SAMPLES,
-        "prediction_display_min_accuracy_pct": round(
-            PREDICTION_BUCKET_MIN_LOWER_BOUND * 100
-        ),
+        "prediction_display_min_accuracy_pct": round(PREDICTION_MIN_ACCURACY * 100),
         "prediction_display_primary_window_days": PREDICTION_POLICY_WINDOW_DAYS,
         "prediction_display_fallback_window_days": ", ".join(
             str(days) for days in PREDICTION_POLICY_FALLBACK_WINDOW_DAYS
-        ),
-        "prediction_station_override_bucket_label": _prediction_confidence_bucket_label(
-            PREDICTION_STATION_OVERRIDE_BUCKET
-        ),
-        "prediction_station_override_window_days": (
-            PREDICTION_STATION_OVERRIDE_WINDOW_DAYS
-        ),
-        "prediction_station_override_min_samples": (
-            PREDICTION_STATION_OVERRIDE_MIN_SAMPLES
-        ),
-        "prediction_station_override_min_accuracy_pct": round(
-            PREDICTION_STATION_OVERRIDE_MIN_ACCURACY * 100
         ),
         "prediction_station_diagnostic_min_samples": (
             PREDICTION_STATION_DIAGNOSTIC_MIN_SAMPLES
@@ -1590,9 +1252,6 @@ def _prediction_stats(since):
             current_prediction_hidden_past_due_count
         ),
         "current_prediction_hidden_missing_count": current_prediction_hidden_missing_count,
-        "current_prediction_long_running_count": current_prediction_long_running_count,
-        "long_running_rows": long_running_rows,
-        "long_running_window_days": LONG_RUNNING_WINDOW_DAYS,
         "current_prediction_overdue_count": current_prediction_overdue_count,
         "prediction_accuracy_worst_case_pct": prediction_accuracy_worst_case_pct,
         "recent_prediction_rows": recent_prediction_rows,

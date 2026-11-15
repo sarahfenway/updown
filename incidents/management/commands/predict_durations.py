@@ -123,6 +123,7 @@ class Command(BaseCommand):
         self.stdout.flush()
 
         skipped_planned = 0
+        skipped_past = 0
         updated = 0
         last_processed_id = None
         for i, incident in enumerate(
@@ -137,20 +138,26 @@ class Command(BaseCommand):
                 self.stderr.flush()
                 continue
 
-            if duration is not None:
+            if duration is None:
+                skipped_planned += 1
+            elif incident.start_time + duration <= timezone.now():
+                # A prediction is a promise shown to users. One whose time
+                # has already passed was never shown, so storing it would
+                # have the site admit to (or take credit for) a prediction
+                # it never made.
+                skipped_past += 1
+            else:
                 incident.estimated_duration = duration
                 incident.prediction_confidence = confidence
                 incident.save(update_fields=["estimated_duration", "prediction_confidence"])
                 updated += 1
-            else:
-                skipped_planned += 1
 
             # Flush progress every 20 rows so we can see where we are if
             # the process gets killed mid-run (OOM, dyno shutdown, etc.).
             if i % 20 == 0:
                 self.stdout.write(
                     f"  [{i}/{total}] last_id={last_processed_id} "
-                    f"updated={updated} skipped={skipped_planned}"
+                    f"updated={updated} skipped={skipped_planned + skipped_past}"
                 )
                 self.stdout.flush()
 
@@ -159,5 +166,6 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS(
             f"Updated {updated} / {total} incident(s) "
-            f"({skipped_planned} skipped as planned work)"
+            f"({skipped_planned} skipped with no prediction, "
+            f"{skipped_past} skipped as already past)"
         ))
