@@ -8,10 +8,19 @@ name: Retrain model
 # If any gate fails, train.py exits non-zero and uploads nothing, so a
 # regressed model can never auto-ship — the run just goes red.
 #
+# Pull requests that touch the training code get a dry run: the same training
+# and the same gates against live training data, but never an upload. That
+# proves a change still trains and passes before it is merged.
+#
 # Requires a repo secret FUNCTIONS_SECRET_KEY matching the app's env var
 # (the same key ml/train.py uses to read training data and upload the model).
 
 on:
+  pull_request:
+    paths:
+      - "ml/**"
+      - "incidents/prediction_shared.py"
+      - ".github/workflows/retrain.yml"
   schedule:
     # 04:00 UTC on the 1st of each month — quiet time for the single machine.
     - cron: "0 4 1 * *"
@@ -36,13 +45,19 @@ on:
         default: false
 
 concurrency:
-  group: retrain-model
-  cancel-in-progress: false
+  # Real retrains queue one at a time. Dry runs get a group per pull request,
+  # so a new push replaces the previous dry run and never displaces a real
+  # retrain.
+  group: ${{ github.event_name == 'pull_request' && format('retrain-pr-{0}', github.event.pull_request.number) || 'retrain-model' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   retrain:
     name: Retrain and gate
     runs-on: ubuntu-latest
+    # Pull requests from forks have no access to the secret, so skip them
+    # rather than fail on a missing key.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -67,4 +82,4 @@ jobs:
             --min-boundary-accuracy "${{ github.event.inputs.min_boundary_accuracy || '0.93' }}" \
             --min-category-accuracy "${{ github.event.inputs.min_category_accuracy || '0.90' }}" \
             --max-regression "${{ github.event.inputs.max_regression || '0.05' }}" \
-            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+            ${{ (github.event_name == 'pull_request' || github.event.inputs.dry_run == 'true') && '--dry-run' || '' }}
