@@ -147,6 +147,21 @@ def fix_additional_info_grammar(text):
     return text
 
 
+# TfL's additional information is stored at the end of a report's text as
+# "<p><i>...</i></p>" (see incidents/sources/tflapiv1.py). The text identifies
+# the report, so it stays stored that way and is split apart for display.
+ADDITIONAL_INFO_RE = re.compile(r"\s*<p><i>(.*)</i></p>\s*$", re.DOTALL)
+
+
+def split_additional_info(text):
+    """Return (main text, additional information) for a report's text."""
+    text = text or ""
+    match = ADDITIONAL_INFO_RE.search(text)
+    if not match:
+        return text, ""
+    return text[: match.start()], match.group(1).strip()
+
+
 TWEET_TIMEOUT_SECONDS = 15
 
 

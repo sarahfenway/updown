@@ -1,6 +1,8 @@
 from django.db import models
 from django.utils import timezone
 
+from incidents.utils import split_additional_info
+
 
 class MLModel(models.Model):
     """Trained ML model bytes, stored in the database.
@@ -55,6 +57,16 @@ class Incident(models.Model):
         blank=True,
         help_text="Confidence (0-1) of the revised prediction",
     )
+
+    @property
+    def main_text(self):
+        """The text without TfL's additional information."""
+        return split_additional_info(self.text)[0]
+
+    @property
+    def additional_info(self):
+        """TfL's additional information (travel advice), as plain text."""
+        return split_additional_info(self.text)[1]
 
     def __str__(self):
         if hasattr(self, "reports_count"):
