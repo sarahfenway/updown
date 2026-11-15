@@ -489,35 +489,6 @@ def predict_duration(incident):
         return None, None
 
 
-def predict_remaining_duration(incident, now):
-    """Conditional re-prediction for an incident still open past its bound.
-
-    Same model, but we condition on the fact that the incident is *still
-    open* at ``now``: every block offset the incident has already lived
-    through is impossible, so we zero that probability mass, renormalise,
-    and re-walk the cumulative distribution to the coverage target. The
-    result is P(resolved by X | not resolved after the elapsed time) — a
-    fresh, later "fixed by" bound — or ``(None, None)`` when the surviving
-    mass is entirely in the open-ended tail class (no honest bound left).
-    Display-only: the stored ``estimated_duration`` is never touched, so the
-    accuracy metric keeps scoring the original promise.
-    """
-    try:
-        result = _incident_offset_probs(incident)
-        if result is None:
-            return None, None
-        model, probs = result
-        start_idx = block_index(incident.start_time)
-        floor_offset = max(0, block_index(now) - start_idx)
-        return _decode_offset_bound(model, probs, incident, floor_offset)
-    except Exception:
-        logger.exception(
-            "predict_remaining_duration failed for incident %s",
-            getattr(incident, "pk", None),
-        )
-        return None, None
-
-
 @lru_cache(maxsize=512)
 def _station_family_ids(station_id):
     from django.db.models import Q

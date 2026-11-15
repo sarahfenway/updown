@@ -844,26 +844,8 @@ def _prepare_incidents(
             reports[0].end_time if incident.is_single_user_report else None
         )
 
-        # For an unresolved incident that has overrun its original bound, a
-        # conditional re-prediction (revised_*) may exist. Prefer it for
-        # display so the incident shows a fresh "now expected by X" instead
-        # of a past-due time — but the original estimated_duration is what
-        # every accuracy metric scores, so it is left untouched.
-        # A revision is only meaningful while there is an original
-        # prediction to revise: if that was since cleared (planned work,
-        # tail class, model failure) any leftover revised_* value is stale.
-        incident.prediction_is_revised = bool(
-            not incident.resolved
-            and incident.estimated_duration is not None
-            and incident.revised_estimated_duration is not None
-            and incident.start_time
-        )
-        if incident.prediction_is_revised:
-            display_duration = incident.revised_estimated_duration
-            display_confidence = incident.revised_prediction_confidence
-        else:
-            display_duration = incident.estimated_duration
-            display_confidence = incident.prediction_confidence
+        display_duration = incident.estimated_duration
+        display_confidence = incident.prediction_confidence
 
         if incident.start_time and display_duration:
             incident.expected_end_time = incident.start_time + display_duration
@@ -1139,7 +1121,9 @@ def _api_prediction(incident, include_less_reliable=False, now=None):
         "likelihood": likelihood,
         "confidence_pct": incident.confidence_pct,
         "recent_accuracy_pct": incident.prediction_accuracy_pct,
-        "revised": incident.prediction_is_revised,
+        # Always False: a first prediction is final. Kept so existing API
+        # clients that read the field keep working.
+        "revised": False,
         "reliable": reliable,
     }
     if incident.resolved:
@@ -1410,10 +1394,6 @@ def _prediction_stats(since):
             "start_time",
             "estimated_duration",
             "prediction_confidence",
-            # _prepare_incidents reads these for every open incident; leaving
-            # them deferred costs one or two queries per row.
-            "revised_estimated_duration",
-            "revised_prediction_confidence",
             "resolved",
         )
         .order_by("-start_time", "-id")

@@ -733,7 +733,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         self.assertIsNotNone(incident.end_time)
         self.assertEqual(posts, ["Step free access has been restored at Victoria"])
 
-    def test_consolidate_refreshes_prediction_after_attaching_report(self):
+    def _incident_with_reworded_report(self, **incident_overrides):
         parent = self.create_parent_station("Green Park")
         first_report = self.create_report(
             parent,
@@ -745,8 +745,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
             reports=[first_report],
             text=first_report.text,
             start_time=first_report.start_time,
-            estimated_duration=timedelta(minutes=30),
-            prediction_confidence=0.1,
+            **incident_overrides,
         )
         self.create_report(
             parent,
@@ -754,12 +753,36 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
             source=Report.SOURCE_TFLAPI_V2,
             start_time=timezone.now() - timedelta(hours=1),
         )
+        return incident
 
+    def test_consolidate_keeps_first_prediction_when_text_changes(self):
+        incident = self._incident_with_reworded_report(
+            estimated_duration=timedelta(hours=9),
+            prediction_confidence=0.95,
+        )
+
+        with patch(
+            "incidents.management.commands.update_incidents.predict_duration",
+            return_value=(timedelta(hours=30), 0.95),
+        ) as predict_mock, patch(
+            "incidents.management.commands.update_incidents.send_tweet"
+        ), patch(
+            "incidents.management.commands.update_incidents.send_bluesky_messages"
+        ):
+            consolidate_incidents()
+
+        incident.refresh_from_db()
+        predict_mock.assert_not_called()
+        self.assertEqual(incident.estimated_duration, timedelta(hours=9))
+        self.assertEqual(incident.reports.count(), 2)
+
+    def test_consolidate_predicts_on_text_change_when_there_is_no_prediction(self):
+        incident = self._incident_with_reworded_report()
         observed = {}
 
         def fake_predict(updated_incident):
             observed["reports_count"] = updated_incident.reports.count()
-            return timedelta(hours=4), 0.8
+            return timedelta(hours=4), 0.95
 
         with patch(
             "incidents.management.commands.update_incidents.predict_duration",
@@ -774,7 +797,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
         incident.refresh_from_db()
         self.assertEqual(observed["reports_count"], 2)
         self.assertEqual(incident.estimated_duration, timedelta(hours=4))
-        self.assertEqual(incident.prediction_confidence, 0.8)
+        self.assertEqual(incident.prediction_confidence, 0.95)
         send_tweet_mock.assert_not_called()
         send_bluesky_messages_mock.assert_not_called()
 
@@ -1812,26 +1835,23 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
         self.assertIsNone(issue["prediction"])
 
-    def test_api_incidents_flags_revised_prediction(self):
+    def test_api_incidents_ignores_stale_revised_columns(self):
         parent = self.create_parent_station("Holborn", naptan_id="HOL")
-        incident = self.create_incident(
+        self.create_incident(
             parent,
             text="Faulty lift",
-            start_time=timezone.now() - timedelta(hours=4),
-            estimated_duration=timedelta(hours=1),
+            start_time=timezone.now() - timedelta(hours=1),
+            estimated_duration=timedelta(hours=5),
             prediction_confidence=0.8,
-            revised_estimated_duration=timedelta(hours=6),
+            revised_estimated_duration=timedelta(hours=9),
             revised_prediction_confidence=0.7,
         )
 
         [issue] = self._api_payload_with_open_policy()["issues"]
 
         prediction = issue["prediction"]
-        self.assertTrue(prediction["revised"])
-        self.assertEqual(prediction["confidence_pct"], 70)
-        self._assert_close_to(
-            prediction["fixed_by"], incident.start_time + timedelta(hours=6)
-        )
+        self.assertIs(prediction["revised"], False)
+        self.assertEqual(prediction["confidence_pct"], 80)
 
     def test_api_incidents_includes_outcome_for_recently_resolved(self):
         parent = self.create_parent_station("Pimlico", naptan_id="PIM")
@@ -3109,69 +3129,6 @@ class RevisedPredictionTests(StationFactoryMixin, TestCase):
             incidents_ml._decode_offset_bound(model, probs, inc, 5), (None, None)
         )
 
-    def test_refresh_revised_predictions_sets_overdue_and_clears_stale(self):
-        from incidents.management.commands.update_incidents import (
-            refresh_revised_predictions,
-        )
-
-        parent = self.create_parent_station("BankRev")
-        now = timezone.now()
-        overdue = self.create_incident(
-            parent,
-            text="Faulty lift",
-            start_time=now - timedelta(hours=4),
-            estimated_duration=timedelta(hours=1),  # bound 3h ago -> overdue
-        )
-        not_overdue = self.create_incident(
-            parent,
-            text="Faulty lift",
-            start_time=now - timedelta(minutes=10),
-            estimated_duration=timedelta(hours=5),  # bound in the future
-            revised_estimated_duration=timedelta(hours=9),  # stale, must clear
-            revised_prediction_confidence=0.5,
-        )
-
-        with patch(
-            "incidents.management.commands.update_incidents.predict_remaining_duration",
-            return_value=(timedelta(hours=6), 0.72),
-        ) as remaining_mock:
-            refresh_revised_predictions(now)
-
-        overdue.refresh_from_db()
-        not_overdue.refresh_from_db()
-        self.assertEqual(overdue.revised_estimated_duration, timedelta(hours=6))
-        self.assertEqual(overdue.revised_prediction_confidence, 0.72)
-        self.assertIsNone(not_overdue.revised_estimated_duration)
-        self.assertIsNone(not_overdue.revised_prediction_confidence)
-        remaining_mock.assert_called_once()
-
-    def test_prepare_incidents_displays_revised_bound_instead_of_hiding(self):
-        parent = self.create_parent_station("HolbornRev")
-        now = timezone.now()
-        incident = self.create_incident(
-            parent,
-            text="Faulty lift",
-            information=False,
-            start_time=now - timedelta(hours=4),
-            estimated_duration=timedelta(hours=1),  # original bound overdue
-            prediction_confidence=0.8,
-            revised_estimated_duration=timedelta(hours=6),  # future revised bound
-            revised_prediction_confidence=0.8,
-        )
-        policy = {
-            b: {"show_prediction": True, "count": 999, "label": "likely", "accuracy_pct": 90}
-            for b in range(0, 100, 10)
-        }
-
-        [prepared] = _prepare_incidents([incident], prediction_policy=policy, now=now)
-
-        self.assertTrue(prepared.prediction_is_revised)
-        self.assertIsNone(prepared.prediction_hidden_reason)
-        self.assertTrue(prepared.show_prediction)
-        self.assertEqual(
-            prepared.expected_end_time, incident.start_time + timedelta(hours=6)
-        )
-
     def test_stats_reports_overdue_predictions_as_worst_case(self):
         parent = self.create_parent_station("GreenParkRev", naptan_id="GPK")
         now = timezone.now()
@@ -3330,44 +3287,6 @@ class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
-    def test_refresh_prediction_clears_a_stale_revision(self):
-        from incidents.management.commands.update_incidents import refresh_prediction
-
-        parent = self.create_parent_station("Bank")
-        incident = self.create_incident(
-            parent,
-            start_time=timezone.now() - timedelta(hours=8),
-            estimated_duration=timedelta(hours=1),
-            prediction_confidence=0.8,
-            revised_estimated_duration=timedelta(hours=10),
-            revised_prediction_confidence=0.8,
-        )
-
-        with patch(
-            "incidents.management.commands.update_incidents.predict_duration",
-            return_value=(None, None),
-        ):
-            refresh_prediction(incident)
-
-        incident.refresh_from_db()
-        self.assertIsNone(incident.estimated_duration)
-        self.assertIsNone(incident.revised_estimated_duration)
-        self.assertIsNone(incident.revised_prediction_confidence)
-
-    def test_revision_without_original_prediction_is_not_shown(self):
-        parent = self.create_parent_station("Bank")
-        incident = self.create_incident(
-            parent,
-            start_time=timezone.now() - timedelta(hours=8),
-            estimated_duration=None,
-            revised_estimated_duration=timedelta(hours=10),
-            revised_prediction_confidence=0.8,
-        )
-
-        prepared = _prepare_incidents(Incident.objects.filter(id=incident.id))
-
-        self.assertFalse(prepared[0].prediction_is_revised)
-
     def test_training_data_num_reports_survives_archived_reports(self):
         parent = self.create_parent_station("Farringdon", naptan_id="ZFD2")
         start = timezone.now() - timedelta(days=200)
@@ -3389,7 +3308,7 @@ class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["incidents"][0]["num_reports"], 1)
 
-    def test_stats_query_count_does_not_grow_with_revised_open_incidents(self):
+    def test_stats_query_count_does_not_grow_with_overdue_open_incidents(self):
         def stats_queries(open_incidents):
             parent = self.create_parent_station(f"Station {open_incidents}")
             for i in range(open_incidents):
@@ -3399,8 +3318,6 @@ class ReviewFixRegressionTests(StationFactoryMixin, TestCase):
                     start_time=timezone.now() - timedelta(hours=6),
                     estimated_duration=timedelta(hours=1),
                     prediction_confidence=0.8,
-                    revised_estimated_duration=timedelta(hours=9),
-                    revised_prediction_confidence=0.8,
                 )
             with patch("incidents.views.get_last_updated", return_value="09:15 26 Mar"):
                 with CaptureQueriesContext(connection) as queries:
@@ -3700,24 +3617,6 @@ class LongRunningDisplayTests(StationFactoryMixin, TestCase):
         )
 
         self.assertIsNone(self._prepare(incident, now).long_running)
-
-    def test_shown_revised_bound_wins_over_some_time_status(self):
-        parent = self.create_parent_station("Southall")
-        now = timezone.now()
-        incident = self.create_incident(
-            parent,
-            text="Faulty lift",
-            start_time=now - timedelta(days=2),
-            estimated_duration=timedelta(hours=3),
-            prediction_confidence=0.8,
-            revised_estimated_duration=timedelta(days=3),
-            revised_prediction_confidence=0.8,
-        )
-
-        prepared = self._prepare(incident, now)
-
-        self.assertTrue(prepared.show_prediction)
-        self.assertIsNone(prepared.long_running)
 
     def test_planned_work_never_gets_some_time_status(self):
         parent = self.create_parent_station("Canada Water")
