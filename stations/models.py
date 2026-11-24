@@ -63,6 +63,18 @@ class Station(models.Model):
         "stations.Station", on_delete=models.DO_NOTHING, null=True, blank=True
     )
 
+    # Step-free route data from TfL's station data file, stored on the
+    # station's main record by the weekly ``import_station_routes`` command.
+    step_free_routes = models.JSONField(null=True, blank=True)
+    step_free_routes_published = models.DateField(null=True, blank=True)
+    tfl_station_id = models.CharField(
+        max_length=32, null=True, blank=True, db_index=True,
+        verbose_name="TfL station id",
+    )
+    # Live lift status, refreshed by every update_incidents run.
+    broken_lift_ids = models.JSONField(null=True, blank=True)
+    broken_lifts_checked_at = models.DateTimeField(null=True, blank=True)
+
     def __str__(self):
         return self.name
 
