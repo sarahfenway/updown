@@ -8,6 +8,7 @@ walkways, ramps and lifts). This module is pure: bytes in, plain dicts out.
 import copy
 import csv
 import io
+import re
 import zipfile
 import zlib
 from dataclasses import dataclass, field
@@ -26,6 +27,9 @@ REQUIRED_FILES = (
     "Platforms.csv",
     "PlatformServices.csv",
 )
+
+# Read when present; the pages just show less without them.
+OPTIONAL_FILES = ("Toilets.csv",)
 
 # Mode tokens that appear at the end of a platform's UniqueId, e.g.
 # "HUBTCR-Plat02-EB-central" or "...-london-overground|national-rail".
@@ -87,10 +91,11 @@ def read_zip(data):
         raise FeedError(f"missing {', '.join(missing)}")
     # The real file unpacks to about 1.3 MB; refuse anything absurd before
     # reading it into memory.
-    if sum(archive.getinfo(name).file_size for name in REQUIRED_FILES) > MAX_UNPACKED_BYTES:
+    wanted = REQUIRED_FILES + tuple(n for n in OPTIONAL_FILES if n in names)
+    if sum(archive.getinfo(name).file_size for name in wanted) > MAX_UNPACKED_BYTES:
         raise FeedError("station data files are unexpectedly large")
-    tables = {}
-    for name in REQUIRED_FILES:
+    tables = {name: [] for name in OPTIONAL_FILES}
+    for name in REQUIRED_FILES + tuple(n for n in OPTIONAL_FILES if n in names):
         try:
             text = archive.read(name).decode("utf-8-sig")
         except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError,
@@ -117,6 +122,11 @@ def load_feed(data):
 
 def _true(value):
     return (value or "").strip().upper() == "TRUE"
+
+
+def _true_or_none(value):
+    value = (value or "").strip().upper()
+    return True if value == "TRUE" else False if value == "FALSE" else None
 
 
 def _platform_modes(platform_id):
@@ -199,12 +209,17 @@ def _build_feed(tables):
         if not lines:
             lines = [LINE_NAMES[m] for m in sorted(_platform_modes(pid) & COVERED_MODES)]
         name = row["FriendlyName"].strip()
-        step = gap = None
+        step = gap = boarding = None
         manual_ramp = False
+        notes = []
         for service in rows:
             step = step or _range(service.get("MinStep"), service.get("MaxStep"))
             gap = gap or _range(service.get("MinGap"), service.get("MaxGap"))
             manual_ramp = manual_ramp or _true(service.get("LevelAccessByManualRamp"))
+            boarding = boarding or (service.get("LocationOfLevelAccess") or "").strip() or None
+            note = (service.get("AdditionalAccessibilityInformation") or "").strip()
+            if note and note not in notes:
+                notes.append(note)
         platforms.setdefault(sid, {})[pid] = {
             "name": name,
             "label": f"{' / '.join(lines)} – {name}",
@@ -212,6 +227,10 @@ def _build_feed(tables):
             "step": step,
             "gap": gap,
             "manual_ramp": manual_ramp,
+            # Where on the train level access is ("2 centre doors on car 5").
+            "boarding": boarding,
+            # TfL's written notes for the platform.
+            "notes": notes,
             "entrance": (row.get("AccessibleEntranceName") or "").strip() or None,
             # False where TfL hasn't surveyed the platform: "no route" then
             # means "no information", not "not step-free".
@@ -233,7 +252,8 @@ def _build_feed(tables):
         if key not in links[sid]:
             link = {"a": a, "b": b, "kind": kind}
             if lift:
-                link.update(lift_id=lift["id"], lift_name=lift["name"], small=lift["small"])
+                link.update(lift_id=lift["id"], lift_name=lift["name"], small=lift["small"],
+                            notes=lift["notes"])
             links[sid][key] = link
 
     for row in tables["SameLevelPaths.csv"]:
@@ -246,6 +266,7 @@ def _build_feed(tables):
             "id": (row["LiftUniqueId"] or "").strip() or f"{row['StationUniqueId'].strip()}-lift-row{number}",
             "name": (row.get("FriendlyName") or "").strip() or (row.get("LiftName") or "").strip() or "Lift",
             "small": _true(row.get("LimitedCapacityLift")),
+            "notes": (row.get("LiftNotes") or "").strip() or None,
         }
         chain = [row["FromAreas"], row["IntermediateAreas"], row["IntermediateAreas2"], row["ToAreas"]]
         chain = [[a for a in group.split("|") if a.strip()] for group in chain if (group or "").strip()]
@@ -253,6 +274,20 @@ def _build_feed(tables):
             for a in group_from:
                 for b in group_to:
                     add(a, b, "lift", lift)
+
+    toilets = {}
+    for row in tables["Toilets.csv"]:
+        if not _true(row.get("IsAccessible")):
+            continue
+        toilets.setdefault((row.get("StationUniqueId") or "").strip(), []).append({
+            "location": (row.get("Location") or "").strip(),
+            # None when TfL leaves it blank: unknown, not "outside".
+            "inside_gates": _true_or_none(row.get("IsInsideGateLine")),
+            "radar_key": _true(row.get("RadarKey")),
+            "fee": _true(row.get("IsFeeCharged")),
+            "baby_changing": _true(row.get("HasBabyChanging")),
+            "hours": (row.get("OpeningHours") or "").strip(),
+        })
 
     stations = {}
     for sid, station_places in places.items():
@@ -309,6 +344,7 @@ def _build_feed(tables):
             if counts[station_places[pid]["name"]] > 1:
                 station_places[pid]["name"] = f"{platform['name']} ({', '.join(platform['lines'])})"
         _number_repeats(station_places)
+        merged = _merge_platform_areas(station_places, station_links, platforms[sid])
         stations[sid] = {
             "tfl_id": sid,
             "tfl_ids": [sid],
@@ -317,7 +353,10 @@ def _build_feed(tables):
             "links": station_links,
             "platforms": platforms[sid],
             "starts": starts,
-            "layout": compute_layout(station_places),
+            # platform-area place id -> the platform it is drawn and named as
+            "merged": merged,
+            "facilities": _facilities(station_rows[sid], toilets.get(sid, [])),
+            "layout": compute_layout(station_places, hidden=merged),
         }
 
     return Feed(published=published, stations=stations,
@@ -350,7 +389,8 @@ def merge_routes(routes_list):
         for name in {link["lift_name"] for link in routes["links"] if link["kind"] == "lift"}:
             lift_names[name] = lift_names.get(name, 0) + 1
 
-    places, links, platforms, starts = {}, [], {}, []
+    places, links, platforms, starts, merged = {}, [], {}, [], {}
+    facilities = {"blue_badge_spaces": None, "taxi_rank": False, "toilets": []}
     for routes in parts:
         label = part_label(routes)
         for place in routes["places"].values():
@@ -363,6 +403,12 @@ def merge_routes(routes_list):
         links.extend(routes["links"])
         platforms.update(routes["platforms"])
         starts.extend(routes["starts"])
+        merged.update(routes.get("merged", {}))
+        part = routes.get("facilities") or {}
+        if part.get("blue_badge_spaces") is not None:
+            facilities["blue_badge_spaces"] = (facilities["blue_badge_spaces"] or 0) + part["blue_badge_spaces"]
+        facilities["taxi_rank"] = facilities["taxi_rank"] or part.get("taxi_rank", False)
+        facilities["toilets"] += part.get("toilets", [])
     return {
         "tfl_id": parts[0]["tfl_id"],
         "tfl_ids": [routes["tfl_id"] for routes in parts],
@@ -371,7 +417,9 @@ def merge_routes(routes_list):
         "links": links,
         "platforms": platforms,
         "starts": starts,
-        "layout": compute_layout(places),
+        "merged": merged,
+        "facilities": facilities,
+        "layout": compute_layout(places, hidden=merged),
     }
 
 
@@ -402,6 +450,87 @@ def _name_places(station_places):
                 place["name"] = f"Entrance ({place['code']} {place['area_id']})"
             else:
                 place["name"] = f"{place['code']} {place['area_id']}"
+
+
+def _facilities(row, toilets):
+    spaces = (row.get("BlueBadgeCarParkSpaces") or "").strip()
+    has_parking = _true(row.get("BlueBadgeCarParking"))
+    return {
+        # None: no Blue Badge parking; 0: parking, number of spaces not given.
+        "blue_badge_spaces": (int(spaces) if spaces.isdigit() else 0) if has_parking else None,
+        "taxi_rank": _true(row.get("TaxiRanksOutsideStation")),
+        "toilets": toilets,
+    }
+
+
+def _merge_platform_areas(station_places, station_links, station_platforms):
+    """{area id: platform id} for platform areas that serve one platform.
+
+    TfL lists most platforms twice: a platform-area point ("NorSB", the
+    Northern line southbound platform) joined by a walkway to the platform
+    itself ("Southbound Platform 8"). Where the area serves only that
+    platform and the platform opens only onto that area, they are the same
+    place: draw and name them once, as the platform. An area that serves
+    several platforms (an island, a shared concourse) stays a place.
+    """
+    walkways, stepped = {}, set()
+    for link in station_links:
+        if link["kind"] == "walkway":
+            walkways.setdefault(link["a"], set()).add(link["b"])
+            walkways.setdefault(link["b"], set()).add(link["a"])
+        else:
+            # A lift or ramp between an area and a platform is a step worth
+            # showing; merging the two would hide it.
+            stepped.add(frozenset((link["a"], link["b"])))
+    merged = {}
+    for pid in station_platforms:
+        areas = [n for n in walkways.get(pid, ()) if station_places[n]["kind"] == "place"]
+        if len(areas) != 1 or frozenset((areas[0], pid)) in stepped:
+            continue
+        served = [n for n in walkways.get(areas[0], ()) if station_places[n]["kind"] == "platform"]
+        if served == [pid]:
+            merged[areas[0]] = pid
+
+    # Some stations link each area to both platforms and to each other (King's
+    # Cross's NorNB and NorSB both reach platforms 7 and 8). There the area's
+    # code names its platform: line and direction, as in the platform's id.
+    claimed = set(merged.values())
+    for area, place in station_places.items():
+        if place["kind"] != "place" or area in merged:
+            continue
+        match = _AREA_LINE_DIRECTION.match(place["code"].strip().lower())
+        if not match:
+            continue
+        line, direction = _AREA_LINE_SLUGS[match[1].replace(" ", "")], match[2].upper()
+        candidates = [
+            n for n in walkways.get(area, ())
+            if n in station_platforms and n not in claimed
+            and _platform_direction(n) == direction and line in _platform_modes(n)
+            and frozenset((area, n)) not in stepped
+        ]
+        if len(candidates) == 1:
+            merged[area] = candidates[0]
+            claimed.add(candidates[0])
+
+    for pid in merged.values():
+        # The platform name alone ("Southbound Platform 8") doesn't say
+        # which line at a big interchange; the label does.
+        station_places[pid]["name"] = station_platforms[pid]["label"]
+    return merged
+
+
+_AREA_LINE_DIRECTION = re.compile(r"^(bak|cen|cir|dis|ham|jub|met|nor|pic|vic|wat|el ?)(eb|wb|nb|sb)$")
+_AREA_LINE_SLUGS = {
+    "bak": "bakerloo", "cen": "central", "cir": "circle", "dis": "district",
+    "ham": "hammersmith-city", "jub": "jubilee", "met": "metropolitan", "nor": "northern",
+    "pic": "piccadilly", "vic": "victoria", "wat": "waterloo-city", "el": "elizabeth",
+}
+
+
+def _platform_direction(platform_id):
+    """"NB" from "HUBKGX-Plat07-NB-northern"."""
+    parts = platform_id.split("-", 3)
+    return parts[2].upper() if len(parts) == 4 else ""
 
 
 def _number_repeats(station_places):

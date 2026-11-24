@@ -1,6 +1,11 @@
+{% comment %}
+Every box and lift label is a link to its details panel (#place-N, #lift-N),
+which the station page shows with CSS :target. With links inside, the
+drawing is a group rather than one image, so screen readers reach each link.
+{% endcomment %}
 <svg class="step-free-diagram" viewBox="0 0 {{ diagram.width }} {{ diagram.height }}"
      width="{{ diagram.width }}" height="{{ diagram.height }}"
-     role="img" aria-labelledby="diagram-title">
+     role="group" aria-labelledby="diagram-title">
     <title id="diagram-title">Step-free routes at {{ station.name }}</title>
     {% for band in diagram.bands %}
         <line class="band" x1="0" x2="{{ diagram.width }}" y1="{{ band.y }}" y2="{{ band.y }}"/>
@@ -8,10 +13,13 @@
     {% endfor %}
     {% for line in diagram.lines %}
         <polyline class="link {{ line.cls }}" points="{{ line.points }}"/>
-        {% if line.label %}<text class="{{ line.label_cls }}" x="{{ line.label_x }}" y="{{ line.label_y }}">{{ line.label }}</text>{% endif %}
+        {% if line.label %}<a href="#{{ line.panel }}" class="lift-link" aria-label="Details: {{ line.label }}"><text class="{{ line.label_cls }}" x="{{ line.label_x }}" y="{{ line.label_y }}">{{ line.label }} ⓘ</text></a>{% endif %}
     {% endfor %}
     {% for box in diagram.boxes %}
-        <rect class="{{ box.cls }}" x="{{ box.x }}" y="{{ box.y }}" width="{{ box.w }}" height="{{ box.h }}" rx="6"/>
-        <text class="box-label" text-anchor="middle" x="{{ box.cx }}" y="{{ box.ty }}">{% for text in box.lines %}<tspan x="{{ box.cx }}" dy="{% if forloop.first %}0{% else %}13{% endif %}">{{ text }}</tspan>{% endfor %}</text>
+        <a href="#{{ box.panel }}" class="box-link" aria-label="Details: {{ box.label }}">
+            <rect class="{{ box.cls }}" x="{{ box.x }}" y="{{ box.y }}" width="{{ box.w }}" height="{{ box.h }}" rx="6"/>
+            <text class="box-label" text-anchor="middle" x="{{ box.cx }}" y="{{ box.ty }}">{% for text in box.lines %}<tspan x="{{ box.cx }}" dy="{% if forloop.first %}0{% else %}13{% endif %}">{{ text }}</tspan>{% endfor %}</text>
+            <g class="info-icon" aria-hidden="true"><circle cx="{{ box.icon_x }}" cy="{{ box.icon_y }}" r="6"/><text x="{{ box.icon_x }}" y="{{ box.icon_ty }}" text-anchor="middle">i</text></g>
+        </a>
     {% endfor %}
 </svg>

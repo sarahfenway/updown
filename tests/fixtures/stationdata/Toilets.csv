@@ -1,0 +1,3 @@
+Station,StationUniqueId,Id,Type,IsAccessible,HasBabyChanging,IsInsideGateLine,Location,IsFeeCharged,RadarKey,OpeningHours
+Example Cross,HUBEXC,1,Unisex,TRUE,TRUE,TRUE,Ticket hall,FALSE,TRUE,Daily until 23:00
+Example Cross,HUBEXC,2,Male,FALSE,FALSE,TRUE,Ticket hall,FALSE,FALSE,

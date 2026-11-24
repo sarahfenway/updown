@@ -16,6 +16,7 @@ from incidents.models import Incident
 from incidents.views import _request_functions_key, _valid_functions_key
 from stations.models import Station, StationRoutes
 from stations.step_free.broken_lifts import lift_status_checked_at
+from stations.step_free.details import build_panels, facility_lines, station_summary
 from stations.step_free.diagram import build_diagram
 from stations.step_free.importer import covered_main_records
 from stations.step_free.routing import BLOCKED, NO_INFO, NO_ROUTE, OK, find_route
@@ -121,7 +122,13 @@ def step_free_station(request, slug):
             chosen_label=routes["platforms"][platform_id]["label"] if route else None,
             route=route,
             OK=OK, BLOCKED=BLOCKED, NO_ROUTE=NO_ROUTE, NO_INFO=NO_INFO,
-            diagram=build_diagram(routes, broken, route if route and route.status == OK else None),
+        )
+        diagram = build_diagram(routes, broken, route if route and route.status == OK else None)
+        context.update(
+            diagram=diagram,
+            panels=build_panels(routes, diagram, broken, known),
+            summary=station_summary(routes),
+            facilities=facility_lines(routes.get("facilities")),
         )
     return render(request, "step_free_station.html", context)
 
