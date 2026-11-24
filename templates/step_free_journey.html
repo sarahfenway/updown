@@ -1,0 +1,34 @@
+{% comment %}
+The chosen route, level by level (see stations/step_free/journey.py). Each
+place and lift links to its details panel (#place-…, #lift-…), shown with
+CSS :target.
+{% endcomment %}<ol class="sf-journey">
+    {% for level in journey.levels %}
+        <li class="sf-level">
+            <div class="sf-level-name">{{ level.name }}</div>
+            <ol class="sf-stops">
+                {% for item in level.items %}
+                    {% if item.stop %}
+                        <li class="sf-stop {{ item.kind }}"{% if item.colour %} style="--dot: {{ item.colour }}"{% endif %}>
+                            {% if item.panel %}<a href="#{{ item.panel }}">{{ item.name }}<span class="sf-i" aria-hidden="true">i</span><span class="sr-only-text"> (details)</span></a>{% else %}{{ item.name }}{% endif %}
+                            {% for note in item.notes %}<div class="sf-stop-note">{{ note }}</div>{% endfor %}
+                        </li>
+                    {% else %}
+                        <li class="sf-move {{ item.kind }}">{{ item.text }}{% if item.detail %} {{ item.detail }}{% endif %}</li>
+                    {% endif %}
+                {% endfor %}
+            </ol>
+        </li>
+        {% if level.then %}
+            <li class="sf-change {{ level.then.kind }}">
+                <span class="sf-change-icon">{% include "step_free_icon.svg.html" with kind=level.then.kind %}</span>
+                <span class="sf-change-text">
+                    {% if level.then.panel %}<a href="#{{ level.then.panel }}">{{ level.then.text }}<span class="sf-i" aria-hidden="true">i</span><span class="sr-only-text"> (details)</span></a>{% else %}{{ level.then.text }}{% endif %}
+                    <span class="sf-change-detail">{{ level.then.detail }}</span>
+                    {% if level.then.status %}<span class="sf-pill ok">{{ level.then.status }}</span>{% endif %}
+                </span>
+            </li>
+        {% endif %}
+    {% endfor %}
+</ol>
+<p class="sf-journey-hint">Tap a place or lift for details.</p>

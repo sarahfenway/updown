@@ -4,7 +4,7 @@ Built per request from the stored route data and live lift status; the
 page shows it as plain HTML (no JSON, no TfL ids).
 """
 
-from .diagram import level_name
+from .journey import level_name
 from .routing import BLOCKED, NO_INFO, OK, find_route
 from .style import line_colour
 
@@ -60,8 +60,8 @@ def facility_lines(facilities):
     return lines
 
 
-def build_panels(routes, diagram, broken_lift_ids=(), lift_status_known=True):
-    """[{"id", "title", "items": [str]}] for every box and lift label."""
+def build_panels(routes, journey, broken_lift_ids=(), lift_status_known=True):
+    """[{"id", "title", "items": [str]}] for every place and lift on the journey."""
     broken = set(broken_lift_ids)
     places = routes["places"]
     merged = routes.get("merged", {})
@@ -113,7 +113,7 @@ def build_panels(routes, diagram, broken_lift_ids=(), lift_status_known=True):
         return lines
 
     panels = []
-    for pid, panel_id in diagram["place_panels"].items():
+    for pid, panel_id in journey["place_panels"].items():
         place = places[pid]
         if place["kind"] == "platform":
             items = _platform_items(routes, pid, broken if lift_status_known else ())
@@ -132,7 +132,7 @@ def build_panels(routes, diagram, broken_lift_ids=(), lift_status_known=True):
             title = place["name"]
         panels.append({"id": panel_id, "title": title, "items": items})
 
-    for lift_id, panel_id in diagram["lift_panels"].items():
+    for lift_id, panel_id in journey["lift_panels"].items():
         links = lifts_by_id.get(lift_id, [])
         if not links:
             continue
@@ -216,16 +216,3 @@ def platform_groups(routes, broken_lift_ids=(), lift_status_known=True):
          "platforms": sorted(members, key=lambda p: p["name"])}
         for key, members in sorted(groups.items())
     ]
-
-
-_STEP_KINDS = (("Enter at", "enter"), ("Start at", "start"), ("Take ", "lift"),
-               ("Use the ramp", "ramp"), ("Go to", "walk"))
-
-
-def route_steps(route):
-    """The route's directions with a kind for each step's icon."""
-    steps = []
-    for text in route.steps:
-        kind = next((k for prefix, k in _STEP_KINDS if text.startswith(prefix)), "board")
-        steps.append({"kind": kind, "text": text})
-    return steps
