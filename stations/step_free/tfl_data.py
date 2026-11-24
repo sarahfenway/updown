@@ -8,6 +8,7 @@ walkways, ramps and lifts). This module is pure: bytes in, plain dicts out.
 import copy
 import csv
 import io
+import math
 import re
 import zipfile
 import zlib
@@ -64,6 +65,11 @@ LINE_NAMES = {
 
 
 MAX_UNPACKED_BYTES = 50 * 1024 * 1024
+
+# Bump when the stored route data changes shape or meaning, so the import
+# re-runs even if TfL's file hasn't changed (stored data without it, or
+# with an older number, is out of date).
+DATA_FORMAT = 3
 
 
 class FeedError(Exception):
@@ -171,9 +177,10 @@ def _build_feed(tables):
             continue
         pid = row["UniqueId"].strip()
         lon = (row.get("Lon") or "").strip()
+        lat = (row.get("Lat") or "").strip()
         places[sid][pid] = {
             "name": None, "level": int((row["Level"] or "").strip() or 0), "kind": "place",
-            "lon": float(lon) if lon else None, "code": code,
+            "lon": float(lon) if lon else None, "lat": float(lat) if lat else None, "code": code,
             "area_id": (row.get("AreaId") or "").strip(),
         }
         node_station[pid] = sid
@@ -346,6 +353,7 @@ def _build_feed(tables):
         _number_repeats(station_places)
         merged = _merge_platform_areas(station_places, station_links, platforms[sid])
         stations[sid] = {
+            "format": DATA_FORMAT,
             "tfl_id": sid,
             "tfl_ids": [sid],
             "name": station_rows[sid]["Name"].strip(),
@@ -410,6 +418,7 @@ def merge_routes(routes_list):
         facilities["taxi_rank"] = facilities["taxi_rank"] or part.get("taxi_rank", False)
         facilities["toilets"] += part.get("toilets", [])
     return {
+        "format": DATA_FORMAT,
         "tfl_id": parts[0]["tfl_id"],
         "tfl_ids": [routes["tfl_id"] for routes in parts],
         "name": parts[0]["name"],
@@ -423,33 +432,62 @@ def merge_routes(routes_list):
     }
 
 
+# TfL gives places codes, not names ("NPN", "SPW"). Places of the same kind
+# are told apart by where they are in the station, as a compass direction
+# from its middle; anything still ambiguous is numbered west to east.
+_COMPASS = ("North", "North-east", "East", "South-east", "South", "South-west", "West", "North-west")
+# Closer than this (degrees, about 15 m) to the middle has no direction.
+_CENTRE_RADIUS = 0.00013
+
+
+def _compass(place, centre):
+    if centre is None or place.get("lat") is None or place.get("lon") is None:
+        return None
+    lat0, lon0 = centre
+    dx = (place["lon"] - lon0) * math.cos(math.radians(lat0))
+    dy = place["lat"] - lat0
+    if math.hypot(dx, dy) < _CENTRE_RADIUS:
+        return None
+    bearing = (math.degrees(math.atan2(dx, dy)) + 360) % 360
+    return _COMPASS[int((bearing + 22.5) // 45) % 8]
+
+
+def _with_direction(direction, label):
+    # "North-west ticket hall", but "East Central line platform" keeps the
+    # line's capital.
+    first = label.split()[0]
+    proper = first in ("Central", "Elizabeth", "Northern", "Bakerloo", "Circle", "District",
+                       "Hammersmith", "Jubilee", "Metropolitan", "Piccadilly", "Victoria", "Waterloo")
+    return f"{direction} {label if proper else label[0].lower() + label[1:]}"
+
+
 def _name_places(station_places):
     """Give every non-platform place a readable, unique name."""
+    located = [p for p in station_places.values()
+               if p["kind"] != "street" and p.get("lat") is not None and p.get("lon") is not None]
+    centre = ((sum(p["lat"] for p in located) / len(located),
+               sum(p["lon"] for p in located) / len(located)) if located else None)
     groups = {}
     for pid, place in station_places.items():
         if place["kind"] in ("street", "platform"):
             continue
         label = place_label(place["code"])
         if label is None:
-            base = f"Entrance ({place['code']})" if place["kind"] == "entrance" else place["code"]
-        else:
-            base = label
-        place["name"] = base
-        groups.setdefault(base, []).append((pid, label))
-    for base, members in groups.items():
-        if len(members) < 2:
+            # No rule for the code: say what it is, never show the code.
+            label = "Entrance" if place["kind"] == "entrance" else "Passageway"
+        place["name"] = label
+        groups.setdefault(label, []).append(pid)
+    for label, ids in groups.items():
+        if len(ids) < 2:
             continue
-        codes = [station_places[pid]["code"] for pid, _ in members]
-        for pid, label in members:
-            place = station_places[pid]
-            unique_code = codes.count(place["code"]) == 1
-            detail = place["code"] if unique_code else f"{place['code']} {place['area_id']}"
-            if label is not None:
-                place["name"] = f"{label} ({detail})"
-            elif place["kind"] == "entrance":
-                place["name"] = f"Entrance ({place['code']} {place['area_id']})"
-            else:
-                place["name"] = f"{place['code']} {place['area_id']}"
+        by_direction = {}
+        for pid in ids:
+            by_direction.setdefault(_compass(station_places[pid], centre), []).append(pid)
+        for direction, members in by_direction.items():
+            members.sort(key=lambda pid: (station_places[pid].get("lon") or 0.0, pid))
+            base = _with_direction(direction, label) if direction else label
+            for number, pid in enumerate(members, 1):
+                station_places[pid]["name"] = f"{base} {number}" if len(members) > 1 else base
 
 
 def _facilities(row, toilets):

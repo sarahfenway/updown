@@ -5,121 +5,210 @@
 {% block head_extra %}
 <meta name="robots" content="noindex">
 <style>
-    /* Drawn at full size; the wrapper scrolls sideways when it doesn't fit,
-       so the labels stay readable on a phone instead of shrinking. */
-    .step-free-diagram { display: block; font-family: Montserrat, sans-serif; }
-    .step-free-diagram .band { stroke: #ddd; }
-    .step-free-diagram .band-label { font-size: 11px; fill: #666; }
-    .step-free-diagram .place { fill: #fff; stroke: #888; }
-    .step-free-diagram .entrance { stroke: #1c3f94; stroke-width: 2; }
-    .step-free-diagram .platform { fill: #eef3fb; stroke: #1c3f94; }
-    .step-free-diagram .box-label { font-size: 10px; fill: #222; }
-    .step-free-diagram .link { fill: none; stroke: #999; stroke-width: 2; }
-    .step-free-diagram .ramp { stroke-dasharray: 6 4; }
-    .step-free-diagram .lift { stroke: #1c3f94; }
-    .step-free-diagram .link-label { font-size: 10px; fill: #1c3f94; }
-    .step-free-diagram .broken { stroke: #c0392b; fill: none; }
-    .step-free-diagram .link-label.broken { fill: #c0392b; stroke: none; font-weight: bold; }
-    .step-free-diagram rect.on-route { fill: #fff6d6; stroke: #e0a800; stroke-width: 3; }
-    .step-free-diagram .link.on-route { stroke: #e0a800; stroke-width: 4; }
+    .sf { --sf-ink: #1d2433; --sf-muted: #5d6676; --sf-line: #e3e7ee; --sf-blue: #1c3f94;
+          --sf-ok: #0f7a3d; --sf-ok-bg: #e6f4ec; --sf-warn: #9a5b00; --sf-warn-bg: #fff3dc;
+          --sf-bad: #b3261e; --sf-bad-bg: #fdeceb; --sf-grey: #5d6676; --sf-grey-bg: #eef0f4;
+          color: var(--sf-ink); font-size: 16px; }
+    /* This row sits inside the base template's row; without this the two
+       rows' negative margins push the page against the screen edge. */
+    .row.sf { margin-left: 0; margin-right: 0; }
+    .sf h2 { font-weight: 700; margin-bottom: 6px; }
+    .sf-badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 14px;
+                font-weight: 700; vertical-align: middle; }
+    .sf-badge.ok { background: var(--sf-ok-bg); color: var(--sf-ok); }
+    .sf-badge.partial { background: var(--sf-warn-bg); color: var(--sf-warn); }
+    .sf-badge.none, .sf-badge.unknown { background: var(--sf-grey-bg); color: var(--sf-grey); }
+    .sf-lead { color: var(--sf-muted); margin: 10px 0 18px; }
+    .sf-card { background: #fff; border: 1px solid var(--sf-line); border-radius: 14px;
+               padding: 18px 20px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(16, 24, 40, .05); }
+    .sf-card h3 { margin: 0 0 12px; font-size: 18px; font-weight: 700; }
+    .sf-alert { border-radius: 12px; padding: 12px 16px; margin-bottom: 18px; font-weight: 600; }
+    .sf-alert.bad { background: var(--sf-bad-bg); color: var(--sf-bad); }
+    .sf-alert.grey { background: var(--sf-grey-bg); color: var(--sf-grey); }
+    .sf-issue + .sf-issue { margin-top: 8px; }
+    .sf-group + .sf-group { margin-top: 14px; }
+    .sf-group-name { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+                     font-weight: 700; margin-bottom: 6px; }
+    .sf-swatch { display: inline-block; width: 22px; height: 8px; border-radius: 4px;
+                 box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .12); }
+    .sf-platforms { list-style: none; padding: 0; margin: 0; }
+    .sf-platform { display: flex; justify-content: space-between; align-items: center; gap: 10px;
+                   padding: 11px 14px; border: 1px solid var(--sf-line); border-radius: 10px;
+                   margin-bottom: 8px; color: var(--sf-ink); text-decoration: none; }
+    .sf-platform:hover, .sf-platform:focus { border-color: var(--sf-blue); text-decoration: none;
+                                            color: var(--sf-ink); background: #f7f9fd; }
+    .sf-platform.chosen { border: 2px solid var(--sf-blue); background: #f2f6fd; }
+    .sf-pill { flex: none; font-size: 13px; font-weight: 700; padding: 3px 10px; border-radius: 999px; }
+    .sf-pill.ok { background: var(--sf-ok-bg); color: var(--sf-ok); }
+    .sf-pill.partial { background: var(--sf-warn-bg); color: var(--sf-warn); }
+    .sf-pill.blocked { background: var(--sf-bad-bg); color: var(--sf-bad); }
+    .sf-pill.none, .sf-pill.unknown { background: var(--sf-grey-bg); color: var(--sf-grey); }
+    .sf-steps { list-style: none; padding: 0; margin: 0; }
+    .sf-step { position: relative; display: flex; align-items: flex-start; gap: 14px; padding-bottom: 18px; }
+    .sf-step:not(:last-child)::before { content: ""; position: absolute; left: 19px; top: 40px; bottom: 0;
+                                        width: 3px; background: #c9d4ea; border-radius: 2px; }
+    .sf-step-icon { flex: none; width: 41px; height: 41px; border-radius: 50%; display: flex;
+                    align-items: center; justify-content: center; background: #eaf0fb; color: var(--sf-blue); }
+    .sf-step.board .sf-step-icon { background: var(--sf-blue); color: #fff; }
+    .sf-step-text { padding-top: 9px; }
+    .sf-note { background: var(--sf-warn-bg); color: var(--sf-warn); border-radius: 10px; padding: 10px 14px;
+               margin-bottom: 14px; }
+    .sf-facts { list-style: none; padding: 0; margin: 0; }
+    .sf-facts li { display: flex; align-items: center; gap: 12px; padding: 6px 0; }
+    .sf-facts .sf-icon-svg { color: var(--sf-blue); flex: none; }
+    details.sf-map summary { cursor: pointer; font-size: 18px; font-weight: 700; list-style: none; }
+    details.sf-map summary::-webkit-details-marker { display: none; }
+    details.sf-map summary::after { content: "Show"; float: right; font-size: 14px; color: var(--sf-blue); font-weight: 600; }
+    details.sf-map[open] summary::after { content: "Hide"; }
+    details.sf-map .sf-map-hint { color: var(--sf-muted); margin: 10px 0; }
+    /* The map: drawn at full size; the wrapper scrolls sideways when it
+       doesn't fit, so the labels stay readable on a phone. */
     .diagram-scroll { overflow-x: auto; }
+    .step-free-diagram { display: block; font-family: Montserrat, sans-serif; }
+    .step-free-diagram .band-bg { fill: #f6f8fb; }
+    .step-free-diagram .band { stroke: var(--sf-line); }
+    .step-free-diagram .band-label { font-size: 11px; font-weight: 600; fill: #7b8495; }
+    .step-free-diagram .place { fill: #fff; stroke: #cfd6e2; stroke-width: 1.2; }
+    .step-free-diagram .entrance { stroke: var(--sf-blue); stroke-width: 2; }
+    .step-free-diagram .platform { fill: #f2f6fd; stroke: #9fb3d9; }
+    .step-free-diagram .box-label { font-size: 10.5px; fill: var(--sf-ink); }
+    .step-free-diagram .link { fill: none; stroke: #b7c0cf; stroke-width: 2.5; stroke-linecap: round; }
+    .step-free-diagram .ramp { stroke-dasharray: 6 5; }
+    .step-free-diagram .lift { stroke: var(--sf-blue); }
+    .step-free-diagram .link-label { font-size: 10px; font-weight: 600; fill: var(--sf-blue); }
+    .step-free-diagram .broken { stroke: var(--sf-bad); }
+    .step-free-diagram .link-label.broken { fill: var(--sf-bad); }
+    .step-free-diagram rect.on-route { fill: #fff4d6; stroke: #e0a800; stroke-width: 3; }
+    .step-free-diagram .link.on-route { stroke: #e0a800; stroke-width: 4.5; }
     .step-free-diagram .box-link, .step-free-diagram .lift-link { cursor: pointer; }
     /* The site's link styles (bold, underlined) would apply to every name. */
     .step-free-diagram a, .step-free-diagram a:hover, .step-free-diagram a:focus {
         text-decoration: none; font-weight: normal;
     }
-    .step-free-diagram .box-link:hover rect, .step-free-diagram .box-link:focus rect { stroke-width: 3; }
-    .step-free-diagram .info-icon circle { fill: #fff; stroke: #1c3f94; stroke-width: 1.2; }
-    .step-free-diagram .info-icon text { font-size: 9px; font-weight: bold; font-style: italic; fill: #1c3f94; }
-    .station-summary { margin: 12px 0 18px; }
-    .station-summary ul { padding-left: 20px; }
+    .step-free-diagram .box-link:hover rect.place, .step-free-diagram .box-link:focus rect.place { stroke: var(--sf-blue); stroke-width: 2.5; }
+    .step-free-diagram .info-icon circle { fill: #fff; stroke: var(--sf-blue); stroke-width: 1.2; }
+    .step-free-diagram .info-icon text { font-size: 9px; font-weight: bold; font-style: italic; fill: var(--sf-blue); }
     /* Details panels: hidden until a box's link targets one, then shown as a
        sheet along the bottom of the screen. No JavaScript involved. */
     .detail-panel { display: none; }
     .detail-panel:target {
         display: block; position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
-        max-height: 60vh; overflow-y: auto; background: #fff; padding: 16px 20px 20px;
-        border-top: 3px solid #1c3f94; box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.2);
+        max-height: 60vh; overflow-y: auto; background: #fff; padding: 18px 22px 22px;
+        border-radius: 16px 16px 0 0; box-shadow: 0 -8px 30px rgba(16, 24, 40, .25);
     }
-    .detail-panel h3 { margin-top: 0; padding-right: 40px; }
+    .detail-panel h3 { margin-top: 0; padding-right: 40px; font-weight: 700; }
     .detail-panel ul { padding-left: 20px; margin-bottom: 0; }
-    .detail-close {
-        position: absolute; top: 10px; right: 16px; font-size: 22px; line-height: 1;
-        text-decoration: none; color: #333;
-    }
+    .detail-close { position: absolute; top: 12px; right: 18px; font-size: 22px; line-height: 1;
+                    text-decoration: none; color: #333; }
+    .sr-only-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 </style>
 {% endblock %}
 
 {% block content %}
-    <div class="row">
+    <div class="row sf">
         <div class="col-md-8 col-md-offset-2">
-            <h2>{{ station.name }}</h2>
+            <h2>{{ station.name }}{% if routes %} <span class="sf-badge {{ status.0 }}">{{ status.1 }}</span>{% endif %}</h2>
+
+            {% if routes %}
+                <p class="sf-lead">
+                    {% if summary.step_free %}
+                        Step-free from the street to: {{ summary.step_free|length }} of {{ platform_count }} platform{{ platform_count|pluralize }}.
+                    {% elif summary.step_free_unlinked %}
+                        Possibly step-free, through an entrance TfL's data doesn't link to the street (it may have steps).
+                    {% elif summary.not_step_free %}
+                        No step-free access at this station in TfL's data.
+                    {% else %}
+                        TfL hasn't published step-free information for this station.
+                    {% endif %}
+                </p>
+            {% endif %}
+
+            {% if routes and not lift_status_known %}
+                <div class="sf-alert grey">Live lift status is unavailable, so routes assume every lift is working.</div>
+            {% elif broken_names %}
+                <div class="sf-alert bad">Out of service now: {{ broken_names|join:", " }}.</div>
+            {% endif %}
 
             {% if issues %}
-                <h3>Current issues</h3>
-                {% for issue in issues %}
-                    <p>
-                        {% if issue.text %}{{ issue.main_text }}{% else %}There is no step free access at this station.{% endif %}
-                        {% if issue.additional_info %}<br><span class="issue-advice">{{ issue.additional_info }}</span>{% endif %}
-                    </p>
-                {% endfor %}
+                <div class="sf-card">
+                    <h3>Current issues</h3>
+                    {% for issue in issues %}
+                        <p class="sf-issue">
+                            {% if issue.text %}{{ issue.main_text }}{% else %}There is no step free access at this station.{% endif %}
+                            {% if issue.additional_info %}<br><span class="issue-advice">{{ issue.additional_info }}</span>{% endif %}
+                        </p>
+                    {% endfor %}
+                </div>
             {% endif %}
 
             {% if not routes %}
                 <p>TfL has not published step-free route data for this station.</p>
             {% else %}
-                <div class="station-summary">
-                    {% if summary.step_free %}
-                        <p><strong>Step-free from the street to:</strong> {{ summary.step_free|join:", " }}</p>
-                    {% endif %}
-                    {% if summary.step_free_unlinked %}
-                        <p><strong>Possibly step-free</strong>, through an entrance TfL's data doesn't link to the street (it may have steps): {{ summary.step_free_unlinked|join:", " }}</p>
-                    {% endif %}
-                    {% if summary.step_free or summary.step_free_unlinked %}
-                        {% if summary.not_step_free %}<p><strong>Not step-free:</strong> {{ summary.not_step_free|join:", " }}</p>{% endif %}
-                        {% if summary.no_information %}<p>TfL hasn't surveyed: {{ summary.no_information|join:", " }}</p>{% endif %}
-                    {% elif summary.not_step_free %}
-                        <p><strong>No step-free access at this station</strong> in TfL's data.</p>
-                        {% if summary.no_information %}<p>TfL hasn't surveyed: {{ summary.no_information|join:", " }}</p>{% endif %}
-                    {% else %}
-                        <p>TfL hasn't published step-free information for this station.</p>
-                    {% endif %}
-                    {% if facilities %}<ul>{% for line in facilities %}<li>{{ line }}</li>{% endfor %}</ul>{% endif %}
-                </div>
-                {% if not lift_status_known %}
-                    <p><strong>Live lift status is unavailable</strong>, so routes assume every lift is working.</p>
-                {% elif broken_names %}
-                    <p>Out of service now: {{ broken_names|join:", " }}.</p>
-                {% endif %}
-
-                <form method="get">
-                    <label for="platform">Route from the street to</label>
-                    <select id="platform" name="platform" class="form-control">
-                        {% for pid, label in platform_options %}
-                            <option value="{{ pid }}"{% if pid == chosen %} selected{% endif %}>{{ label }}</option>
-                        {% endfor %}
-                    </select>
-                    <button type="submit" class="btn btn-default">Show route</button>
-                </form>
-
                 {% if route %}
-                    <h3>{{ chosen_label }}</h3>
-                    {% if route.status == OK %}
-                        {% if route.unlinked_entrance %}
-                            <p>TfL's data has no step-free route from the street to this platform except through this entrance, and doesn't show a step-free way into the entrance itself. Check before you travel.</p>
+                    <div class="sf-card" id="route">
+                        <h3>{{ chosen_label }}</h3>
+                        {% if route.status == OK %}
+                            {% if route.unlinked_entrance %}
+                                <p class="sf-note">TfL's data has no step-free route from the street to this platform except through this entrance, and doesn't show a step-free way into the entrance itself. Check before you travel.</p>
+                            {% endif %}
+                            <ol class="sf-steps">
+                                {% for step in steps %}
+                                    <li class="sf-step {{ step.kind }}">
+                                        <span class="sf-step-icon">{% include "step_free_icon.svg.html" with kind=step.kind %}</span>
+                                        <span class="sf-step-text">{{ step.text }}</span>
+                                    </li>
+                                {% endfor %}
+                            </ol>
+                        {% elif route.status == BLOCKED %}
+                            <p class="sf-alert bad">No step-free route to this platform right now. Out of service: {{ route.blocking_lifts|join:", " }}.</p>
+                        {% elif route.status == NO_INFO %}
+                            <p>TfL hasn't published step-free route information for this platform.</p>
+                        {% else %}
+                            <p>TfL's data shows no step-free route to this platform.</p>
                         {% endif %}
-                        <ol>{% for step in route.steps %}<li>{{ step }}</li>{% endfor %}</ol>
-                    {% elif route.status == BLOCKED %}
-                        <p>No step-free route to this platform right now. Out of service: {{ route.blocking_lifts|join:", " }}.</p>
-                    {% elif route.status == NO_INFO %}
-                        <p>TfL hasn't published step-free route information for this platform.</p>
-                    {% else %}
-                        <p>TfL's data shows no step-free route to this platform.</p>
-                    {% endif %}
+                    </div>
                 {% endif %}
 
-                <p class="text-muted">Tap a box or lift for details.</p>
-                <div class="diagram-scroll" id="station-diagram">{% include "step_free_diagram.svg.html" %}</div>
+                <div class="sf-card">
+                    <h3>{% if route %}Other platforms{% else %}Choose a platform{% endif %}</h3>
+                    {% for group in groups %}
+                        <div class="sf-group">
+                            <div class="sf-group-name">
+                                {% for line in group.lines %}<span><span class="sf-swatch" style="background: {{ line.colour }}"></span> {{ line.name }}</span>{% endfor %}
+                            </div>
+                            <ul class="sf-platforms">
+                                {% for platform in group.platforms %}
+                                    <li>
+                                        <a class="sf-platform{% if platform.id == chosen %} chosen{% endif %}" href="?platform={{ platform.id|urlencode }}#route">
+                                            <span>{{ platform.name }}<span class="sr-only-text"> – {% for line in group.lines %}{{ line.name }}{% if not forloop.last %} / {% endif %}{% endfor %} – {{ platform.name }}</span></span>
+                                            <span class="sf-pill {{ platform.status }}">{{ platform.words }}</span>
+                                        </a>
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                    {% endfor %}
+                </div>
+
+                {% if facilities %}
+                    <div class="sf-card">
+                        <h3>At this station</h3>
+                        <ul class="sf-facts">
+                            {% for line in facilities %}
+                                <li>
+                                    {% if "Blue Badge" in line %}{% include "step_free_icon.svg.html" with kind="parking" %}{% elif "Taxi" in line %}{% include "step_free_icon.svg.html" with kind="taxi" %}{% else %}{% include "step_free_icon.svg.html" with kind="toilet" %}{% endif %}
+                                    <span>{{ line }}</span>
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                {% endif %}
+
+                <details class="sf-card sf-map" id="station-diagram"{% if not route %} open{% endif %}>
+                    <summary>Station map</summary>
+                    <p class="sf-map-hint">Every step-free way through the station. Tap a box or lift for details.</p>
+                    <div class="diagram-scroll">{% include "step_free_diagram.svg.html" %}</div>
+                </details>
                 {% for panel in panels %}
                     <section class="detail-panel" id="{{ panel.id }}" tabindex="-1" aria-labelledby="{{ panel.id }}-title">
                         <a class="detail-close" href="#station-diagram" aria-label="Close details">✕</a>

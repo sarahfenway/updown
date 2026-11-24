@@ -34,6 +34,9 @@ _RULES = [
      lambda m: f"{LINE_PREFIXES[m[1]]} line {DIRECTIONS[m[2]]} platform"),
     (re.compile(rf"^({_LINES})pl$"), lambda m: f"{LINE_PREFIXES[m[1]]} line platforms"),
     (re.compile(r"^(book|th$|.*bh$)"), lambda m: "Ticket hall"),
+    # TTH, NTH, WTH, ELTH: ticket halls by a short prefix. Not NORTH or SOUTH.
+    (re.compile(r"^(?!north$|south$)[a-z]{1,3}th$"), lambda m: "Ticket hall"),
+    (re.compile(r"^mezz"), lambda m: "Mezzanine"),
     # "ent" anywhere: CEntr, MEntr, ELEnt, EntrW are entrances.
     (re.compile(r"^(i?ent|[a-z][-+]|.*entr|.*ent$)"), lambda m: "Entrance"),
     (re.compile(r"^(upcon|up)$"), lambda m: "Upper concourse"),

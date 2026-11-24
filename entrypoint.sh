@@ -75,6 +75,15 @@ fi
 if [ "${DB_ENGINE:-postgres}" = "sqlite" ]; then
     echo "[entrypoint] Applying migrations"
     run_as_app python -m django migrate --noinput --settings=updown.settings
+    # Refresh step-free route data if this deploy changed its format (or TfL
+    # published a new file). Before gunicorn starts, so it can't compete for
+    # memory; time-limited, and a failure never stops the boot. Skipped in
+    # the maintenance freeze, which promises no database writes.
+    if [ -z "${MAINTENANCE_SNAPSHOT:-}" ]; then
+        echo "[entrypoint] Checking step-free route data"
+        run_as_app timeout 45 python -m django import_station_routes --settings=updown.settings \
+            || echo "[entrypoint] Step-free route import skipped or failed; continuing"
+    fi
     echo "[entrypoint] Launching Litestream + gunicorn"
     if [ "$(id -u)" = "0" ]; then
         exec gosu app litestream replicate -config /app/litestream.yml \

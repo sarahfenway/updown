@@ -8,6 +8,7 @@ from stations.step_free.importer import (
     download_zip,
     import_feed,
     last_published,
+    stored_format_is_current,
 )
 from stations.step_free.tfl_data import FeedError, build_feed, read_published, read_zip
 
@@ -37,7 +38,10 @@ class Command(BaseCommand):
                            type(exc).__name__)
             raise CommandError(f"Could not read station data ({type(exc).__name__})")
 
-        if not options.get("force") and published == last_published():
+        # Re-import an unchanged file too when the stored data is in an older
+        # format, so a deploy that changes the format refreshes it.
+        if (not options.get("force") and published == last_published()
+                and stored_format_is_current()):
             self.stdout.write(f"Station data unchanged (published {published:%Y-%m-%d %H:%M})")
             return
 

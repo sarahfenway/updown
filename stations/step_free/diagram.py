@@ -6,6 +6,8 @@ arithmetic and string formatting, so it is cheap per request.
 
 import hashlib
 
+from .style import line_colour
+
 COLUMN_WIDTH = 150
 ROW_HEIGHT = 110
 BOX_WIDTH = 128
@@ -93,7 +95,8 @@ def build_diagram(routes, broken_lift_ids=(), route=None):
     bands = []
     for row, level in enumerate(layout["levels"]):
         y = TOP + row * ROW_HEIGHT
-        bands.append({"y": y - 14, "label_y": y + BOX_HEIGHT / 2 + 4, "label": level_name(level)})
+        bands.append({"y": y - 14, "label_y": y + BOX_HEIGHT / 2 + 4, "label": level_name(level),
+                      "height": ROW_HEIGHT, "shade": row % 2 == 1})
 
     places = routes["places"]
     lift_panels = {}  # lift id -> id of its details panel
@@ -186,6 +189,10 @@ def build_diagram(routes, broken_lift_ids=(), route=None):
             # of the name inside.
             "icon_x": f"{x + BOX_WIDTH - 2:.0f}", "icon_y": f"{y + 2:.0f}",
             "icon_ty": f"{y + 5:.0f}",
+            # A platform's box has its line's colour down the left edge.
+            "stripe": (line_colour(routes["platforms"][pid]["lines"][0])
+                       if place["kind"] == "platform" and routes["platforms"].get(pid, {}).get("lines")
+                       else None),
         })
 
     width = LEFT + max(layout["columns"], 1) * COLUMN_WIDTH + RIGHT
