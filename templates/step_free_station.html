@@ -13,6 +13,9 @@
        rows' negative margins push the page against the screen edge. */
     .row.sf { margin-left: 0; margin-right: 0; }
     .sf h2 { font-weight: 700; margin-bottom: 6px; }
+    .sf-back { display: inline-block; margin-top: 12px; padding: 6px 14px 6px 10px; border: 1px solid var(--sf-line);
+               border-radius: 999px; font-size: 14px; font-weight: 600; color: var(--sf-blue); text-decoration: none; }
+    .sf-back:hover, .sf-back:focus { background: #f2f6fd; border-color: var(--sf-blue); text-decoration: none; }
     .sf-badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 14px;
                 font-weight: 700; vertical-align: middle; }
     .sf-badge.ok { background: var(--sf-ok-bg); color: var(--sf-ok); }
@@ -43,52 +46,45 @@
     .sf-pill.partial { background: var(--sf-warn-bg); color: var(--sf-warn); }
     .sf-pill.blocked { background: var(--sf-bad-bg); color: var(--sf-bad); }
     .sf-pill.none, .sf-pill.unknown { background: var(--sf-grey-bg); color: var(--sf-grey); }
-    .sf-steps { list-style: none; padding: 0; margin: 0; }
-    .sf-step { position: relative; display: flex; align-items: flex-start; gap: 14px; padding-bottom: 18px; }
-    .sf-step:not(:last-child)::before { content: ""; position: absolute; left: 19px; top: 40px; bottom: 0;
-                                        width: 3px; background: #c9d4ea; border-radius: 2px; }
-    .sf-step-icon { flex: none; width: 41px; height: 41px; border-radius: 50%; display: flex;
-                    align-items: center; justify-content: center; background: #eaf0fb; color: var(--sf-blue); }
-    .sf-step.board .sf-step-icon { background: var(--sf-blue); color: #fff; }
-    .sf-step-text { padding-top: 9px; }
     .sf-note { background: var(--sf-warn-bg); color: var(--sf-warn); border-radius: 10px; padding: 10px 14px;
                margin-bottom: 14px; }
     .sf-facts { list-style: none; padding: 0; margin: 0; }
     .sf-facts li { display: flex; align-items: center; gap: 12px; padding: 6px 0; }
     .sf-facts .sf-icon-svg { color: var(--sf-blue); flex: none; }
-    details.sf-map summary { cursor: pointer; font-size: 18px; font-weight: 700; list-style: none; }
-    details.sf-map summary::-webkit-details-marker { display: none; }
-    details.sf-map summary::after { content: "Show"; float: right; font-size: 14px; color: var(--sf-blue); font-weight: 600; }
-    details.sf-map[open] summary::after { content: "Hide"; }
-    details.sf-map .sf-map-hint { color: var(--sf-muted); margin: 10px 0; }
-    /* The map: drawn at full size; the wrapper scrolls sideways when it
-       doesn't fit, so the labels stay readable on a phone. */
-    .diagram-scroll { overflow-x: auto; }
-    .step-free-diagram { display: block; font-family: Montserrat, sans-serif; }
-    .step-free-diagram .band-bg { fill: #f6f8fb; }
-    .step-free-diagram .band { stroke: var(--sf-line); }
-    .step-free-diagram .band-label { font-size: 11px; font-weight: 600; fill: #7b8495; }
-    .step-free-diagram .place { fill: #fff; stroke: #cfd6e2; stroke-width: 1.2; }
-    .step-free-diagram .entrance { stroke: var(--sf-blue); stroke-width: 2; }
-    .step-free-diagram .platform { fill: #f2f6fd; stroke: #9fb3d9; }
-    .step-free-diagram .box-label { font-size: 10.5px; fill: var(--sf-ink); }
-    .step-free-diagram .link { fill: none; stroke: #b7c0cf; stroke-width: 2.5; stroke-linecap: round; }
-    .step-free-diagram .ramp { stroke-dasharray: 6 5; }
-    .step-free-diagram .lift { stroke: var(--sf-blue); }
-    .step-free-diagram .link-label { font-size: 10px; font-weight: 600; fill: var(--sf-blue); }
-    .step-free-diagram .broken { stroke: var(--sf-bad); }
-    .step-free-diagram .link-label.broken { fill: var(--sf-bad); }
-    .step-free-diagram rect.on-route { fill: #fff4d6; stroke: #e0a800; stroke-width: 3; }
-    .step-free-diagram .link.on-route { stroke: #e0a800; stroke-width: 4.5; }
-    .step-free-diagram .box-link, .step-free-diagram .lift-link { cursor: pointer; }
-    /* The site's link styles (bold, underlined) would apply to every name. */
-    .step-free-diagram a, .step-free-diagram a:hover, .step-free-diagram a:focus {
-        text-decoration: none; font-weight: normal;
+    /* The route, level by level: each level a block, the places on it
+       joined by a rail, and the lift or ramp to the next level between. */
+    .sf-journey, .sf-stops { list-style: none; padding: 0; margin: 0; }
+    .sf-journey a { color: var(--sf-ink); text-decoration: none; font-weight: inherit; }
+    .sf-journey a:hover, .sf-journey a:focus { color: var(--sf-blue); text-decoration: underline; }
+    .sf-level { background: #f3f6fb; border: 1px solid #dde4ef; border-radius: 12px; padding: 10px 14px 12px; }
+    .sf-level-name { font-size: 12px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+                     color: var(--sf-muted); margin-bottom: 6px; }
+    .sf-stop { position: relative; padding: 3px 0 3px 32px; font-weight: 600; }
+    .sf-stop::before { content: ""; position: absolute; left: 3px; top: 6px; width: 16px; height: 16px;
+                       box-sizing: border-box; border-radius: 50%; background: #fff; border: 3px solid var(--sf-blue); }
+    .sf-stop.platform::before { left: 1px; top: 4px; width: 20px; height: 20px; border: 3px solid #fff;
+                                background: var(--dot, var(--sf-blue)); box-shadow: 0 0 0 1px rgba(0, 0, 0, .2); }
+    .sf-stop-note { font-weight: 400; font-size: 14px; color: var(--sf-muted); }
+    .sf-move { position: relative; padding: 4px 0 4px 32px; font-size: 14px; color: var(--sf-muted); }
+    .sf-move::before { content: ""; position: absolute; left: 10px; top: -3px; bottom: -3px;
+                       border-left: 2px dashed #9aa6b8; }
+    .sf-change { position: relative; display: flex; align-items: center; gap: 12px;
+                 padding: 12px 0 12px 46px; min-height: 66px; }
+    .sf-change::before { content: ""; position: absolute; left: 21px; top: 0; bottom: 0; width: 10px;
+                         background: var(--sf-blue); }
+    .sf-change.ramp::before, .sf-change.walk::before {
+        background: repeating-linear-gradient(var(--sf-blue) 0 6px, transparent 6px 10px);
     }
-    .step-free-diagram .box-link:hover rect.place, .step-free-diagram .box-link:focus rect.place { stroke: var(--sf-blue); stroke-width: 2.5; }
-    .step-free-diagram .info-icon circle { fill: #fff; stroke: var(--sf-blue); stroke-width: 1.2; }
-    .step-free-diagram .info-icon text { font-size: 9px; font-weight: bold; font-style: italic; fill: var(--sf-blue); }
-    /* Details panels: hidden until a box's link targets one, then shown as a
+    .sf-change-icon { flex: none; width: 38px; height: 38px; border-radius: 50%; display: flex;
+                      align-items: center; justify-content: center; background: #eaf0fb; color: var(--sf-blue); }
+    .sf-change-text { font-weight: 700; }
+    .sf-change-detail { font-weight: 400; color: var(--sf-muted); }
+    .sf-change .sf-pill { margin-left: 4px; }
+    .sf-i { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px;
+            margin-left: 3px; vertical-align: 1px; border: 1.5px solid var(--sf-blue); border-radius: 50%;
+            color: var(--sf-blue); font: italic 700 11px Georgia, serif; }
+    .sf-journey-hint { color: var(--sf-muted); font-size: 14px; margin: 12px 0 0; }
+    /* Details panels: hidden until a place's or lift's link targets one, then shown as a
        sheet along the bottom of the screen. No JavaScript involved. */
     .detail-panel { display: none; }
     .detail-panel:target {
@@ -107,6 +103,7 @@
 {% block content %}
     <div class="row sf">
         <div class="col-md-8 col-md-offset-2">
+            <a class="sf-back" href="{% url 'step_free_index' %}"><span aria-hidden="true">←</span> All stations</a>
             <h2>{{ station.name }}{% if routes %} <span class="sf-badge {{ status.0 }}">{{ status.1 }}</span>{% endif %}</h2>
 
             {% if routes %}
@@ -151,14 +148,7 @@
                             {% if route.unlinked_entrance %}
                                 <p class="sf-note">TfL's data has no step-free route from the street to this platform except through this entrance, and doesn't show a step-free way into the entrance itself. Check before you travel.</p>
                             {% endif %}
-                            <ol class="sf-steps">
-                                {% for step in steps %}
-                                    <li class="sf-step {{ step.kind }}">
-                                        <span class="sf-step-icon">{% include "step_free_icon.svg.html" with kind=step.kind %}</span>
-                                        <span class="sf-step-text">{{ step.text }}</span>
-                                    </li>
-                                {% endfor %}
-                            </ol>
+                            {% include "step_free_journey.html" %}
                         {% elif route.status == BLOCKED %}
                             <p class="sf-alert bad">No step-free route to this platform right now. Out of service: {{ route.blocking_lifts|join:", " }}.</p>
                         {% elif route.status == NO_INFO %}
@@ -204,14 +194,9 @@
                     </div>
                 {% endif %}
 
-                <details class="sf-card sf-map" id="station-diagram"{% if not route %} open{% endif %}>
-                    <summary>Station map</summary>
-                    <p class="sf-map-hint">Every step-free way through the station. Tap a box or lift for details.</p>
-                    <div class="diagram-scroll">{% include "step_free_diagram.svg.html" %}</div>
-                </details>
                 {% for panel in panels %}
                     <section class="detail-panel" id="{{ panel.id }}" tabindex="-1" aria-labelledby="{{ panel.id }}-title">
-                        <a class="detail-close" href="#station-diagram" aria-label="Close details">✕</a>
+                        <a class="detail-close" href="#route" aria-label="Close details">✕</a>
                         <h3 id="{{ panel.id }}-title">{{ panel.title }}</h3>
                         <ul>{% for item in panel.items %}<li>{{ item }}</li>{% endfor %}</ul>
                     </section>

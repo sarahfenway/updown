@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .labels import is_dropped, place_label
-from .layout import compute_layout
 
 REQUIRED_FILES = (
     "FeedInfo.csv",
@@ -69,7 +68,7 @@ MAX_UNPACKED_BYTES = 50 * 1024 * 1024
 # Bump when the stored route data changes shape or meaning, so the import
 # re-runs even if TfL's file hasn't changed (stored data without it, or
 # with an older number, is out of date).
-DATA_FORMAT = 3
+DATA_FORMAT = 4  # 4: no grid layout (the whole-station map is gone)
 
 
 class FeedError(Exception):
@@ -364,7 +363,6 @@ def _build_feed(tables):
             # platform-area place id -> the platform it is drawn and named as
             "merged": merged,
             "facilities": _facilities(station_rows[sid], toilets.get(sid, [])),
-            "layout": compute_layout(station_places, hidden=merged),
         }
 
     return Feed(published=published, stations=stations,
@@ -428,7 +426,6 @@ def merge_routes(routes_list):
         "starts": starts,
         "merged": merged,
         "facilities": facilities,
-        "layout": compute_layout(places, hidden=merged),
     }
 
 

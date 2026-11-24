@@ -67,7 +67,6 @@ class StationRoutesModelTests(TestCase):
 
 
 from stations.step_free.labels import is_dropped, place_label
-from stations.step_free.layout import compute_layout
 
 
 class LabelTests(SimpleTestCase):
@@ -117,27 +116,6 @@ class LabelTests(SimpleTestCase):
         self.assertTrue(is_dropped("BUS"))
         self.assertTrue(is_dropped("Taxi"))
         self.assertFalse(is_dropped("BookH"))
-
-
-class LayoutTests(SimpleTestCase):
-    def test_rows_run_from_highest_level_and_columns_west_to_east(self):
-        places = {
-            "street": {"level": 0, "kind": "street", "lon": None},
-            "east": {"level": 0, "kind": "entrance", "lon": -0.10},
-            "west": {"level": 0, "kind": "entrance", "lon": -0.20},
-            "bridge": {"level": 1, "kind": "place", "lon": -0.15},
-            "platform": {"level": -2, "kind": "platform", "lon": None},
-        }
-
-        layout = compute_layout(places)
-
-        self.assertEqual(layout["levels"], [1, 0, -2])
-        self.assertEqual(layout["columns"], 2)
-        self.assertEqual(layout["positions"]["bridge"], [0, 0])
-        self.assertEqual(layout["positions"]["west"], [0, 1])
-        self.assertEqual(layout["positions"]["east"], [1, 1])
-        self.assertEqual(layout["positions"]["platform"], [0, 2])
-        self.assertNotIn("street", layout["positions"])
 
 
 from stations.step_free.tfl_data import (
@@ -211,22 +189,12 @@ class FeedParsingTests(SimpleTestCase):
         self.assertIn("940GZZLUEXC", self.feed.codes[EXC])
         self.assertIn("HUBEXC", self.feed.codes[EXC])
 
-    def test_layout_is_stored_for_every_drawn_place(self):
-        layout = self.exc["layout"]
-        self.assertEqual(layout["levels"], [0, -1, -2, -3, -4, -5])
-        for pid, place in self.exc["places"].items():
-            if place["kind"] != "street" and pid not in self.exc["merged"]:
-                self.assertIn(pid, layout["positions"])
-
     def test_platforms_with_no_step_free_link_get_no_level(self):
         # Testbury's Northern line platforms have no step-free link at all;
         # they mustn't be drawn at street level.
         testbury = self.feed.stations["HUBTST"]
         for platform_id in ("HUBTST-Plat01-NB-northern", "HUBTST-Plat02-SB-northern"):
             self.assertIsNone(testbury["places"][platform_id]["level"])
-        self.assertEqual(testbury["layout"]["levels"][-1], None)
-        self.assertEqual(testbury["layout"]["positions"]["HUBTST-Plat01-NB-northern"][1],
-                         len(testbury["layout"]["levels"]) - 1)
 
     def test_merged_stations_keep_names_distinct_and_sources_unchanged(self):
         sample_downs, testbury = self.feed.stations["910GSMPLDN"], self.feed.stations["HUBTST"]
@@ -260,7 +228,6 @@ class FeedParsingTests(SimpleTestCase):
             "910GSMPLDN-1000002-RPL-1-2": "910GSMPLDN-Plat01-SB-london-overground|national-rail",
             "910GSMPLDN-1000002-RPL-2-4": "910GSMPLDN-Plat02-NB-london-overground|national-rail",
         })
-        self.assertNotIn("910GSMPLDN-1000002-RPL-1-2", sample_downs["layout"]["positions"])
         self.assertEqual(
             sample_downs["places"]["910GSMPLDN-Plat01-SB-london-overground|national-rail"]["name"],
             "Weaver line – Southbound Platform 1",
@@ -272,7 +239,6 @@ class FeedParsingTests(SimpleTestCase):
         self.assertEqual(self.exc["merged"]["HUBEXC-1000001-CenWB-8"], "HUBEXC-Plat01-WB-central")
         # An area with no direction that serves several platforms stays.
         self.assertNotIn("HUBEXC-1000001-ELEL-10", self.exc["merged"])
-        self.assertIn("HUBEXC-1000001-ELEL-10", self.exc["layout"]["positions"])
 
     def test_platform_boarding_and_notes(self):
         platform = self.exc["platforms"]["HUBEXC-Plat03-NB-northern"]
@@ -528,7 +494,7 @@ class ImportTests(TestCase):
         self.assertEqual(routes.tfl_station_id, "HUBEXC")
         self.assertEqual(routes.published, PUBLISHED)
         self.assertIn(CENTRAL_EB, routes.data["platforms"])
-        self.assertIn("positions", routes.data["layout"])
+        self.assertEqual(routes.data["format"], DATA_FORMAT)
 
     def test_child_record_codes_match_to_the_parent(self):
         # A name the TfL file doesn't use, so only the child's code can match.
@@ -587,9 +553,6 @@ class ImportTests(TestCase):
         self.assertIn("HUBTST-Plat01-NB-northern", routes["platforms"])
         self.assertIn("HUBEXC-Outside", routes["starts"])
         self.assertIn("HUBTST-Outside", routes["starts"])
-        for pid, place in routes["places"].items():
-            if place["kind"] != "street" and pid not in routes["merged"]:
-                self.assertIn(pid, routes["layout"]["positions"])
         self.assertEqual(find_route(routes, CENTRAL_EB).status, OK)
 
     def test_stations_missing_from_the_file_are_cleared(self):
@@ -804,15 +767,22 @@ class UpdatePipelineTests(TestCase):
 
 
 from incidents.models import Incident
-from stations.step_free.diagram import build_diagram, level_name
+from stations.step_free.journey import build_journey, level_name
 
 
-class DiagramTests(SimpleTestCase):
+class JourneyTests(SimpleTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.feed = load_feed(fixture_zip())
         cls.exc = cls.feed.stations[EXC]
+
+    def journey(self, routes, platform_id, known=True):
+        return build_journey(routes, find_route(routes, platform_id), known)
+
+    @staticmethod
+    def stops(level):
+        return [item["name"] for item in level["items"] if item.get("stop")]
 
     def test_level_names(self):
         self.assertEqual(level_name(0), "Street level")
@@ -821,84 +791,67 @@ class DiagramTests(SimpleTestCase):
         self.assertEqual(level_name(2), "2 levels above street")
         self.assertEqual(level_name(None), "No step-free route")
 
-    def test_one_box_per_drawn_place_and_one_band_per_level(self):
-        diagram = build_diagram(self.exc)
-        drawn = [p for pid, p in self.exc["places"].items()
-                 if p["kind"] != "street" and pid not in self.exc["merged"]]
-        self.assertEqual(len(diagram["boxes"]), len(drawn))
-        self.assertEqual(len(diagram["bands"]), len(self.exc["layout"]["levels"]))
+    def test_one_block_per_level_with_the_lift_between(self):
+        journey = self.journey(self.exc, CENTRAL_EB)
+        levels = journey["levels"]
+        self.assertEqual([level["name"] for level in levels],
+                         ["Street level", "1 level below street", "2 levels below street",
+                          "3 levels below street"])
+        self.assertEqual([self.stops(level) for level in levels],
+                         [["North-west entrance"], ["North-west ticket hall"], ["Upper concourse"],
+                          ["Central line – Eastbound Platform 2"]])
+        self.assertEqual([(level["then"]["text"], level["then"]["detail"]) for level in levels[:-1]],
+                         [("Lift A", "down 1 level"), ("Lift D", "down 1 level"), ("Lift F", "down 1 level")])
+        self.assertIsNone(levels[-1]["then"])
+        self.assertEqual({level["then"]["status"] for level in levels[:-1]}, {"Working"})
 
-    def test_platforms_with_no_step_free_link_have_their_own_band(self):
-        diagram = build_diagram(self.feed.stations["HUBTST"])
-        self.assertEqual(diagram["bands"][-1]["label"], "No step-free route")
+    def test_walks_on_one_level_stay_in_its_block(self):
+        journey = self.journey(self.exc, "HUBEXC-Plat03-NB-northern")
+        last = journey["levels"][-1]
+        self.assertEqual(last["name"], "4 levels below street")
+        self.assertEqual([item.get("name") or item["text"] for item in last["items"]],
+                         ["Northern line platforms", "Walk", "Northern line – Northbound Platform 3"])
+        # A lift that skips levels says how many.
+        self.assertEqual(journey["levels"][-2]["then"]["detail"], "down 3 levels")
 
-    def test_broken_lift_is_marked(self):
-        diagram = build_diagram(self.exc, ["HUBEXC-Lift-6"])
-        broken = [line for line in diagram["lines"] if "broken" in line["cls"]]
-        self.assertTrue(broken)
-        # Lift F has two branches; it is labelled once.
-        self.assertEqual([line["label"] for line in broken if line["label"]],
-                         ["Lift F – out of service"])
-        self.assertEqual({line["label_cls"] for line in broken}, {"link-label broken"})
+    def test_platform_stop_has_line_colour_and_boarding_notes(self):
+        journey = self.journey(self.exc, "HUBEXC-Plat03-NB-northern")
+        platform = journey["levels"][-1]["items"][-1]
+        self.assertEqual(platform["kind"], "platform")
+        self.assertEqual(platform["colour"], "#000000")
+        self.assertEqual(platform["notes"], ["Step to train 0–50 mm", "Gap 0–85 mm"])
 
-    def test_labels_do_not_take_the_line_stroke(self):
-        diagram = build_diagram(self.exc)
-        self.assertEqual({line["label_cls"] for line in diagram["lines"] if line["label"]},
-                         {"link-label"})
-
-    def test_lift_labels_and_lanes_do_not_overlap(self):
-        # Example Cross puts six lifts in its first column, more lanes than
-        # the first version had before they wrapped round.
-        diagram = build_diagram(self.exc)
-        labelled = [(line["label_x"], line["label_y"]) for line in diagram["lines"] if line["label"]]
-        self.assertEqual(len(labelled), len(set(labelled)))
-        lift_names = sorted(line["label"] for line in diagram["lines"] if line["label"])
-        self.assertEqual(lift_names, sorted({link["lift_name"] for link in self.exc["links"]
-                                             if link["kind"] == "lift"}))
-        verticals = {}
-        for line in diagram["lines"]:
-            if "lift" in line["cls"].split():
-                first = line["points"].split()[0]
-                verticals.setdefault(first.split(",")[0], set()).add(line["lift"])
-        # Every vertical x carries one lift only.
-        self.assertTrue(all(len(lifts) == 1 for lifts in verticals.values()), verticals)
-
-    def test_labels_fit_inside_the_drawing(self):
-        diagram = build_diagram(self.exc, ["HUBEXC-Lift-2"])  # Lift B, rightmost column
-        widest = max(int(line["label_x"]) for line in diagram["lines"] if line["label"])
-        # "Lift B – out of service" at 10px bold is about 130px wide.
-        self.assertLessEqual(widest + 130, diagram["width"])
-
-    def test_each_pair_of_boxes_is_joined_once(self):
-        # CenEB and CenWB both merge into platforms, so CenEB-CenWB, CenEB-Plat01
-        # and CenWB-Plat02 would all draw Platform 1 to Platform 2.
-        diagram = build_diagram(self.exc)
-        walkways = [line["points"] for line in diagram["lines"] if "walkway" in line["cls"]]
-        ends = [tuple(sorted(points.split())) for points in walkways]
-        self.assertEqual(len(ends), len(set(ends)))
-
-    def test_merged_platform_is_one_box_with_the_lift_drawn_to_it(self):
+    def test_merged_platform_area_is_the_platform(self):
         sample_downs = self.feed.stations["910GSMPLDN"]
-        diagram = build_diagram(sample_downs)
-        names = [" ".join(box["lines"]) for box in diagram["boxes"]]
-        self.assertNotIn("North platform level", names)
-        self.assertEqual(sum("Southbound Platform 1" in name for name in names), 1)
-        lift = next(line for line in diagram["lines"] if line["lift"])
-        platform_box = next(box for box in diagram["boxes"]
-                            if "Southbound Platform 1" in " ".join(box["lines"]))
-        # Lifts are drawn down from their upper end, here the platform.
-        start_x, _ = lift["points"].split()[0].split(",")
-        self.assertEqual(start_x, platform_box["cx"])
+        journey = self.journey(sample_downs, "910GSMPLDN-Plat01-SB-london-overground|national-rail")
+        self.assertEqual([self.stops(level) for level in journey["levels"]],
+                         [["East entrance"], ["Weaver line – Southbound Platform 1"]])
+        self.assertEqual(journey["levels"][0]["then"]["detail"], "up 2 levels")
 
-    def test_route_is_highlighted(self):
-        route = find_route(self.exc, CENTRAL_EB)
-        diagram = build_diagram(self.exc, route=route)
-        on_route = [box for box in diagram["boxes"] if "on-route" in box["cls"]]
-        # Every place on the route except the street node, which is not
-        # drawn; an area merged into its platform is that platform's box.
-        merged = self.exc["merged"]
-        drawn = {merged.get(pid, pid) for pid in route.places[1:]}
-        self.assertEqual(len(on_route), len(drawn))
+    def test_lift_status_left_out_when_unknown(self):
+        journey = self.journey(self.exc, CENTRAL_EB, known=False)
+        self.assertEqual({level["then"]["status"] for level in journey["levels"][:-1]}, {""})
+
+    def test_no_route_draws_nothing(self):
+        journey = build_journey(self.exc, find_route(self.exc, CENTRAL_EB, ["HUBEXC-Lift-6"]))
+        self.assertEqual(journey, {"levels": [], "place_panels": {}, "lift_panels": {}})
+        self.assertEqual(build_journey(self.exc, None)["levels"], [])
+
+    def test_every_place_and_lift_has_a_panel(self):
+        journey = self.journey(self.exc, CENTRAL_EB)
+        panels = {panel["id"] for panel in build_panels(self.exc, journey)}
+        linked = [item["panel"] for level in journey["levels"] for item in level["items"] if item["panel"]]
+        linked += [level["then"]["panel"] for level in journey["levels"] if level["then"]]
+        self.assertEqual(len(linked), 7)
+        self.assertEqual(set(linked), panels)
+
+    def test_panel_ids_are_stable_and_hide_tfl_ids(self):
+        journey = self.journey(self.exc, CENTRAL_EB)
+        reordered = dict(self.exc, places=dict(reversed(list(self.exc["places"].items()))))
+        again = self.journey(reordered, CENTRAL_EB)
+        self.assertEqual(journey["place_panels"], again["place_panels"])
+        for panel_id in list(journey["place_panels"].values()) + list(journey["lift_panels"].values()):
+            self.assertRegex(panel_id, r"^(place|lift)-[0-9a-f]{10}$")
 
 
 from stations.step_free.details import build_panels, facility_lines, station_summary
@@ -912,86 +865,68 @@ class DetailsTests(SimpleTestCase):
         cls.exc = cls.feed.stations[EXC]
 
     def panels(self, routes, broken=(), known=True):
-        diagram = build_diagram(routes, broken)
-        return diagram, {panel["id"]: panel for panel in build_panels(routes, diagram, broken, known)}
-
-    def test_every_box_and_lift_label_has_a_panel(self):
-        diagram, panels = self.panels(self.exc)
-        for box in diagram["boxes"]:
-            self.assertIn(box["panel"], panels)
-        for line in diagram["lines"]:
-            if line["label"]:
-                self.assertIn(line["panel"], panels)
+        """{title: items} for a panel on every place and lift."""
+        merged = routes.get("merged", {})
+        every = {
+            "place_panels": {pid: pid for pid, place in routes["places"].items()
+                             if place["kind"] != "street" and pid not in merged},
+            "lift_panels": {link["lift_id"]: link["lift_id"] for link in routes["links"]
+                            if link["kind"] == "lift"},
+        }
+        return {panel["title"]: panel["items"] for panel in build_panels(routes, every, broken, known)}
 
     def test_platform_panel(self):
-        diagram, panels = self.panels(self.exc)
-        box = next(b for b in diagram["boxes"] if "Northbound Platform 3" in " ".join(b["lines"]))
-        panel = panels[box["panel"]]
-        self.assertEqual(panel["title"], "Northern line – Northbound Platform 3")
-        self.assertIn("Step-free from the street", panel["items"])
-        self.assertIn("Step to the train: 0–50 mm", panel["items"])
-        self.assertIn("Gap to the train: 0–85 mm", panel["items"])
-        self.assertIn("Board at: 2 centre doors on car 5", panel["items"])
-        self.assertIn("Use the lift by the north entrance for this platform.", panel["items"])
+        items = self.panels(self.exc)["Northern line – Northbound Platform 3"]
+        self.assertIn("Step-free from the street", items)
+        self.assertIn("Step to the train: 0–50 mm", items)
+        self.assertIn("Gap to the train: 0–85 mm", items)
+        self.assertIn("Board at: 2 centre doors on car 5", items)
+        self.assertIn("Use the lift by the north entrance for this platform.", items)
 
     def test_unsurveyed_platform_panel(self):
-        diagram, panels = self.panels(self.feed.stations["HUBTST"])
-        box = next(b for b in diagram["boxes"] if "Southbound Platform 2" in " ".join(b["lines"]))
+        panels = self.panels(self.feed.stations["HUBTST"])
         self.assertIn("TfL hasn't surveyed this platform for step-free access",
-                      panels[box["panel"]]["items"])
+                      panels["Northern line – Southbound Platform 2"])
 
     def test_lift_panel_shows_stops_notes_and_status(self):
-        diagram, panels = self.panels(self.exc, ["HUBEXC-Lift-7"])
-        line = next(l for l in diagram["lines"] if l["label"].startswith("Lift G"))
-        panel = panels[line["panel"]]
-        self.assertEqual(panel["title"], "Lift G")
-        self.assertIn("Stops: Northern line platforms, Elizabeth line level", panel["items"])
-        self.assertIn("Small lift", panel["items"])
-        self.assertIn("Fits one wheelchair user at a time.", panel["items"])
-        self.assertIn("Out of service now", panel["items"])
+        items = self.panels(self.exc, ["HUBEXC-Lift-7"])["Lift G"]
+        self.assertIn("Stops: Northern line platforms, Elizabeth line level", items)
+        self.assertIn("Small lift", items)
+        self.assertIn("Fits one wheelchair user at a time.", items)
+        self.assertIn("Out of service now", items)
 
     def test_lift_status_unknown_when_stale(self):
-        diagram, panels = self.panels(self.exc, (), known=False)
-        line = next(l for l in diagram["lines"] if l["label"].startswith("Lift G"))
-        self.assertIn("Live lift status unavailable", panels[line["panel"]]["items"])
+        panels = self.panels(self.exc, (), known=False)
+        self.assertIn("Live lift status unavailable", panels["Lift G"])
 
     def test_place_panel_lists_lifts_and_entrance_link(self):
-        diagram, panels = self.panels(self.exc, ["HUBEXC-Lift-1"])
-        hall = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "North-west ticket hall")
-        items = panels[hall["panel"]]["items"]
+        panels = self.panels(self.exc, ["HUBEXC-Lift-1"])
+        items = panels["North-west ticket hall"]
         self.assertIn("1 level below street", items)
         self.assertIn("Lift A up to North-west entrance – out of service", items)
         self.assertIn("Lift C down to Elizabeth line level", items)
-        entrance = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "North-west entrance")
-        self.assertIn("Linked to the street in TfL's data", panels[entrance["panel"]]["items"])
+        self.assertIn("Linked to the street in TfL's data", panels["North-west entrance"])
 
     def test_street_linked_entrance_with_an_ent_code_is_linked(self):
         # Sample Downs' "Entr" is linked to the street; its code starts with
         # ENT, which puts it among the route starts too.
         sample_downs = self.feed.stations["910GSMPLDN"]
-        diagram, panels = self.panels(sample_downs)
-        box = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "South-west entrance")
-        self.assertIn("Linked to the street in TfL's data", panels[box["panel"]]["items"])
+        self.assertIn("Linked to the street in TfL's data", self.panels(sample_downs)["South-west entrance"])
 
     def test_platform_panel_reflects_a_broken_lift(self):
-        diagram, panels = self.panels(self.exc, ["HUBEXC-Lift-6"])  # Lift F
-        box = next(b for b in diagram["boxes"] if "Eastbound Platform 2" in " ".join(b["lines"]))
-        items = panels[box["panel"]]["items"]
+        items = self.panels(self.exc, ["HUBEXC-Lift-6"])["Central line – Eastbound Platform 2"]  # Lift F
         self.assertIn("No step-free route right now: Lift F out of service", items)
         self.assertNotIn("Step-free from the street", items)
 
     def test_merged_platform_panel_lists_lifts_that_reach_it(self):
         sample_downs = self.feed.stations["910GSMPLDN"]
-        diagram, panels = self.panels(sample_downs, ["910GSMPLDN-Lift-1"])
-        box = next(b for b in diagram["boxes"] if "Southbound Platform 1" in " ".join(b["lines"]))
-        self.assertIn("Lift 1 down to East entrance – out of service", panels[box["panel"]]["items"])
+        items = self.panels(sample_downs, ["910GSMPLDN-Lift-1"])["Weaver line – Southbound Platform 1"]
+        self.assertIn("Lift 1 down to East entrance – out of service", items)
 
     def test_platform_reached_only_through_an_unlinked_entrance_is_caveated(self):
         sample_downs = self.feed.stations["910GSMPLDN"]
-        diagram, panels = self.panels(sample_downs)
-        box = next(b for b in diagram["boxes"] if "Southbound Platform 1" in " ".join(b["lines"]))
         self.assertIn("Step-free only through an entrance TfL's data doesn't link to the street, "
-                      "which may have steps", panels[box["panel"]]["items"])
+                      "which may have steps", self.panels(sample_downs)["Weaver line – Southbound Platform 1"])
         summary = station_summary(sample_downs)
         self.assertEqual(summary["step_free"], [])
         self.assertEqual(summary["step_free_unlinked"], ["Weaver line – Southbound Platform 1"])
@@ -1002,20 +937,10 @@ class DetailsTests(SimpleTestCase):
             "baby_changing": False, "hours": ""}]})
         self.assertEqual(lines, ["Accessible toilet: Concourse"])
 
-    def test_panel_ids_are_stable_and_hide_tfl_ids(self):
-        diagram, _ = self.panels(self.exc)
-        reordered = dict(self.exc, places=dict(reversed(list(self.exc["places"].items()))))
-        again = build_diagram(reordered)
-        self.assertEqual(diagram["place_panels"], again["place_panels"])
-        for panel_id in list(diagram["place_panels"].values()) + list(diagram["lift_panels"].values()):
-            self.assertRegex(panel_id, r"^(place|lift)-[0-9a-f]{10}$")
-
     def test_unlinked_entrance_says_so(self):
         sample_downs = self.feed.stations["910GSMPLDN"]
-        diagram, panels = self.panels(sample_downs)
-        box = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "East entrance")
         self.assertIn("Not linked to the street in TfL's data, so it may have steps",
-                      panels[box["panel"]]["items"])
+                      self.panels(sample_downs)["East entrance"])
 
     def test_station_summary(self):
         summary = station_summary(self.exc)
@@ -1054,13 +979,16 @@ class StepFreePageTests(TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertContains(response, "Choose a station")
 
-    def test_station_page_shows_diagram_and_directions(self):
+    def test_station_page_shows_the_route_level_by_level(self):
         self.set_lift_status([])
         response = self.client.get("/step-free/example-cross/",
                                    {"platform": CENTRAL_EB})
 
-        self.assertContains(response, "<svg")
-        self.assertContains(response, "Take Lift F down to Central line – Eastbound Platform 2")
+        self.assertContains(response, 'class="sf-journey"')
+        self.assertContains(response, "3 levels below street")
+        self.assertContains(response, "Lift F")
+        self.assertContains(response, '<span class="sf-pill ok">Working</span>')
+        self.assertContains(response, 'href="/step-free/"')
         self.assertContains(response, 'name="robots" content="noindex"')
         # No route data reaches the page: no place ids, lift ids or JSON keys.
         # (base.html's site-wide jQuery scripts are unrelated and stay.)
@@ -1075,8 +1003,8 @@ class StepFreePageTests(TestCase):
                                    {"platform": CENTRAL_EB})
 
         self.assertContains(response, "No step-free route to this platform right now")
-        self.assertContains(response, "Lift F")
-        self.assertContains(response, "out of service")
+        self.assertContains(response, "Out of service: Lift F.")
+        self.assertContains(response, "Out of service now: Lift F.")
 
     def test_stale_lift_status_is_unavailable(self):
         self.set_lift_status(["HUBEXC-Lift-6"], age=timedelta(minutes=31))
@@ -1084,8 +1012,9 @@ class StepFreePageTests(TestCase):
                                    {"platform": CENTRAL_EB})
 
         self.assertContains(response, "Live lift status is unavailable")
-        self.assertContains(response, "Take Lift F down to Central line – Eastbound Platform 2")
+        self.assertContains(response, 'class="sf-journey"')
         self.assertNotContains(response, "out of service")
+        self.assertNotContains(response, '<span class="sf-pill ok">Working</span>')
 
     def test_no_route_in_tfl_data(self):
         response = self.client.get("/step-free/testbury/",
@@ -1093,13 +1022,15 @@ class StepFreePageTests(TestCase):
         # Literal template text, so Django does not escape the apostrophe.
         self.assertContains(response, "TfL's data shows no step-free route to this platform")
 
-    def test_boxes_open_detail_panels_without_javascript(self):
-        response = self.client.get("/step-free/example-cross/")
+    def test_places_open_detail_panels_without_javascript(self):
+        response = self.client.get("/step-free/example-cross/",
+                                   {"platform": "HUBEXC-Plat03-NB-northern"})
         content = response.content.decode()
         self.assertRegex(content, r'href="#place-[0-9a-f]{10}"')
+        self.assertRegex(content, r'href="#lift-[0-9a-f]{10}"')
         # tabindex lets the browser move focus to the opened panel.
         self.assertRegex(content, r'<section class="detail-panel" id="place-[0-9a-f]{10}" tabindex="-1"')
-        self.assertIn('class="info-icon"', content)
+        self.assertIn('class="sf-i"', content)
         self.assertIn("Board at: 2 centre doors on car 5", content)
         self.assertIn(":target", content)
         # Still no route data in the page.
@@ -1161,8 +1092,8 @@ class StepFreePageTests(TestCase):
     def test_bad_platform_is_ignored(self):
         response = self.client.get("/step-free/example-cross/", {"platform": "nope"})
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "<svg")
-        self.assertNotContains(response, "Take Lift")
+        self.assertContains(response, "Choose a platform")
+        self.assertNotContains(response, 'class="sf-journey"')
 
     def test_unknown_station_is_404(self):
         self.assertEqual(self.client.get("/step-free/nowhere/").status_code, 404)

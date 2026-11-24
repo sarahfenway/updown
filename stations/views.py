@@ -17,10 +17,10 @@ from incidents.views import _request_functions_key, _valid_functions_key
 from stations.models import Station, StationRoutes
 from stations.step_free.broken_lifts import lift_status_checked_at
 from stations.step_free.details import (
-    build_panels, facility_lines, platform_groups, route_steps, station_status, station_summary,
+    build_panels, facility_lines, platform_groups, station_status, station_summary,
 )
-from stations.step_free.diagram import build_diagram
 from stations.step_free.importer import covered_main_records
+from stations.step_free.journey import build_journey
 from stations.step_free.routing import BLOCKED, NO_INFO, NO_ROUTE, OK, find_route
 
 LIFT_STATUS_MAX_AGE = timedelta(minutes=30)
@@ -125,15 +125,14 @@ def step_free_station(request, slug):
             route=route,
             OK=OK, BLOCKED=BLOCKED, NO_ROUTE=NO_ROUTE, NO_INFO=NO_INFO,
         )
-        diagram = build_diagram(routes, broken, route if route and route.status == OK else None)
+        journey = build_journey(routes, route if route and route.status == OK else None, known)
         summary = station_summary(routes)
         context.update(
-            diagram=diagram,
-            panels=build_panels(routes, diagram, broken, known),
+            journey=journey,
+            panels=build_panels(routes, journey, broken, known),
             summary=summary,
             status=station_status(summary),
             groups=platform_groups(routes, broken, known),
-            steps=route_steps(route) if route and route.status == OK else [],
             facilities=facility_lines(routes.get("facilities")),
             platform_count=len(routes["platforms"]),
         )
