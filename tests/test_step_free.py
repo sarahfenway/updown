@@ -418,3 +418,62 @@ class ImportCommandTests(TestCase):
 
         self.tcr.refresh_from_db()
         self.assertEqual(self.tcr.step_free_routes, {"old": True})
+
+
+import requests
+
+from stations.step_free.broken_lifts import update_broken_lifts
+
+
+class FakeLiftResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code != 200:
+            raise requests.HTTPError("bad status")
+
+    def json(self):
+        return self._payload
+
+
+class BrokenLiftTests(TestCase):
+    def setUp(self):
+        self.tcr = make_station("Tottenham Court Road", tube=True, tfl_station_id="HUBTCR")
+        self.bank = make_station("Bank", tube=True, tfl_station_id="HUBBAN",
+                                 broken_lift_ids=["HUBBAN-Lift-1"])
+
+    def test_stores_broken_lift_ids_per_station(self):
+        payload = [
+            {"stationUniqueId": "HUBTCR", "disruptedLiftUniqueIds": ["HUBTCR-Lift-5"],
+             "message": "Tottenham Court Road: ..."},
+            {"stationUniqueId": "HUBXYZ", "disruptedLiftUniqueIds": ["HUBXYZ-Lift-1"],
+             "message": "Not one of ours"},
+        ]
+        with patch("stations.step_free.broken_lifts.requests.get",
+                   return_value=FakeLiftResponse(payload)):
+            self.assertTrue(update_broken_lifts())
+
+        self.tcr.refresh_from_db()
+        self.bank.refresh_from_db()
+        self.assertEqual(self.tcr.broken_lift_ids, ["HUBTCR-Lift-5"])
+        self.assertEqual(self.bank.broken_lift_ids, [])
+        self.assertIsNotNone(self.tcr.broken_lifts_checked_at)
+
+    def test_failed_fetch_keeps_previous_data(self):
+        with patch("stations.step_free.broken_lifts.requests.get",
+                   side_effect=requests.ConnectionError("down")):
+            self.assertFalse(update_broken_lifts())
+
+        self.bank.refresh_from_db()
+        self.assertEqual(self.bank.broken_lift_ids, ["HUBBAN-Lift-1"])
+        self.assertIsNone(self.bank.broken_lifts_checked_at)
+
+    def test_unexpected_payload_keeps_previous_data(self):
+        with patch("stations.step_free.broken_lifts.requests.get",
+                   return_value=FakeLiftResponse({"error": "nope"})):
+            self.assertFalse(update_broken_lifts())
+
+        self.bank.refresh_from_db()
+        self.assertEqual(self.bank.broken_lift_ids, ["HUBBAN-Lift-1"])
