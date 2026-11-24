@@ -477,3 +477,122 @@ class BrokenLiftTests(TestCase):
 
         self.bank.refresh_from_db()
         self.assertEqual(self.bank.broken_lift_ids, ["HUBBAN-Lift-1"])
+
+
+from django.test import override_settings
+
+from incidents.models import Incident
+from stations.step_free.diagram import build_diagram, level_name
+
+
+class DiagramTests(SimpleTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tcr = load_feed(fixture_zip()).stations[TCR]
+
+    def test_level_names(self):
+        self.assertEqual(level_name(0), "Street level")
+        self.assertEqual(level_name(-1), "1 level below street")
+        self.assertEqual(level_name(-3), "3 levels below street")
+        self.assertEqual(level_name(2), "2 levels above street")
+
+    def test_one_box_per_drawn_place_and_one_band_per_level(self):
+        diagram = build_diagram(self.tcr)
+        drawn = [p for p in self.tcr["places"].values() if p["kind"] != "street"]
+        self.assertEqual(len(diagram["boxes"]), len(drawn))
+        self.assertEqual(len(diagram["bands"]), len(self.tcr["layout"]["levels"]))
+
+    def test_broken_lift_is_marked(self):
+        diagram = build_diagram(self.tcr, ["HUBTCR-Lift-5"])
+        broken = [line for line in diagram["lines"] if "broken" in line["cls"]]
+        self.assertTrue(broken)
+        self.assertTrue(all("out of service" in line["label"] for line in broken))
+
+    def test_route_is_highlighted(self):
+        route = find_route(self.tcr, CENTRAL_EB)
+        diagram = build_diagram(self.tcr, route=route)
+        on_route = [box for box in diagram["boxes"] if "on-route" in box["cls"]]
+        # Every place on the route except the street node, which is not drawn.
+        self.assertEqual(len(on_route), len(route.places) - 1)
+
+
+@override_settings(ROOT_URLCONF="updown.urls")
+class StepFreePageTests(TestCase):
+    def setUp(self):
+        self.tcr, self.hackney, self.balham = make_fixture_stations()
+        import_feed(load_feed(fixture_zip()), min_stations=1)
+        self.tcr.refresh_from_db()
+
+    def set_lift_status(self, broken, age=timedelta(minutes=1)):
+        Station.objects.filter(pk=self.tcr.pk).update(
+            broken_lift_ids=broken, broken_lifts_checked_at=timezone.now() - age
+        )
+
+    def test_index_lists_stations_and_redirects_to_choice(self):
+        response = self.client.get("/step-free/")
+        self.assertContains(response, "Tottenham Court Road")
+        self.assertContains(response, 'name="robots" content="noindex"')
+
+        response = self.client.get("/step-free/", {"station": "tottenham-court-road"})
+        self.assertRedirects(response, "/step-free/tottenham-court-road/",
+                             fetch_redirect_response=False)
+
+    def test_station_page_shows_diagram_and_directions(self):
+        self.set_lift_status([])
+        response = self.client.get("/step-free/tottenham-court-road/",
+                                   {"platform": CENTRAL_EB})
+
+        self.assertContains(response, "<svg")
+        self.assertContains(response, "Take Lift F down to Central line eastbound platform")
+        self.assertContains(response, 'name="robots" content="noindex"')
+        # No route data reaches the page: no place ids, lift ids or JSON keys.
+        # (base.html's site-wide jQuery scripts are unrelated and stay.)
+        content = response.content.decode()
+        self.assertNotIn("HUBTCR-1000235-", content)
+        self.assertNotIn("HUBTCR-Lift-", content)
+        self.assertNotIn('"places"', content)
+
+    def test_broken_lift_blocks_route_and_is_named(self):
+        self.set_lift_status(["HUBTCR-Lift-5"])
+        response = self.client.get("/step-free/tottenham-court-road/",
+                                   {"platform": CENTRAL_EB})
+
+        self.assertContains(response, "No step-free route to this platform right now")
+        self.assertContains(response, "Lift F")
+        self.assertContains(response, "out of service")
+
+    def test_stale_lift_status_is_unavailable(self):
+        self.set_lift_status(["HUBTCR-Lift-5"], age=timedelta(minutes=31))
+        response = self.client.get("/step-free/tottenham-court-road/",
+                                   {"platform": CENTRAL_EB})
+
+        self.assertContains(response, "Live lift status is unavailable")
+        self.assertContains(response, "Take Lift F down to Central line eastbound platform")
+        self.assertNotContains(response, "out of service")
+
+    def test_no_route_in_tfl_data(self):
+        response = self.client.get("/step-free/balham/",
+                                   {"platform": "HUBBAL-Plat01-NB-northern"})
+        # Literal template text, so Django does not escape the apostrophe.
+        self.assertContains(response, "TfL's data shows no step-free route to this platform")
+
+    def test_current_issues_are_shown(self):
+        Incident.objects.create(station=self.tcr, information=False,
+                                text="Step free access is not available to the Central line.")
+        response = self.client.get("/step-free/tottenham-court-road/")
+        self.assertContains(response, "Step free access is not available to the Central line.")
+
+    def test_bad_platform_is_ignored(self):
+        response = self.client.get("/step-free/tottenham-court-road/", {"platform": "nope"})
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "<svg")
+        self.assertNotContains(response, "Take Lift")
+
+    def test_unknown_station_is_404(self):
+        self.assertEqual(self.client.get("/step-free/nowhere/").status_code, 404)
+
+    def test_station_without_route_data(self):
+        make_station("Oval", hub_naptan_id="HUBOVL", tube=True)
+        response = self.client.get("/step-free/oval/")
+        self.assertContains(response, "TfL has not published step-free route data for this station.")

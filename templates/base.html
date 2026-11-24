@@ -26,6 +26,7 @@
         <link rel="stylesheet" type="text/css" href="{% static "updown.css" %}">
     {% endif %}
     <link href='https://fonts.googleapis.com/css?family=Montserrat:400,700' rel='stylesheet' type='text/css'>
+    {% block head_extra %}{% endblock %}
 </head>
 <body class="{% block body_class %}{% endblock %}">
 <a href="#main-content" class="skip-link">Skip to main content</a>

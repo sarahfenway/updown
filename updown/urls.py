@@ -16,6 +16,7 @@ from incidents.views import (
 )
 from incidents.ratelimit import cache_api_incidents
 from pages.views import FAQPageView, PrivacyPageView
+from stations.views import step_free_index, step_free_station
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -32,4 +33,6 @@ urlpatterns = [
     path("privacy/", PrivacyPageView.as_view(), name="privacy"),
     path("stp/", stp, name="stp"),
     path("stats/", stats, name="stats"),
+    path("step-free/", step_free_index, name="step_free_index"),
+    path("step-free/<slug:slug>/", step_free_station, name="step_free_station"),
 ]
