@@ -548,7 +548,26 @@ class DiagramTests(SimpleTestCase):
         diagram = build_diagram(self.tcr, ["HUBTCR-Lift-5"])
         broken = [line for line in diagram["lines"] if "broken" in line["cls"]]
         self.assertTrue(broken)
-        self.assertTrue(all("out of service" in line["label"] for line in broken))
+        # Lift F has two branches; it is labelled once.
+        self.assertEqual([line["label"] for line in broken if line["label"]],
+                         ["Lift F – out of service"])
+
+    def test_lift_labels_and_lanes_do_not_overlap(self):
+        # Lifts D and E join the same two places; D and H share a column.
+        diagram = build_diagram(self.tcr)
+        labelled = [(line["label_x"], line["label_y"]) for line in diagram["lines"] if line["label"]]
+        self.assertEqual(len(labelled), len(set(labelled)))
+        lift_names = sorted(line["label"] for line in diagram["lines"] if line["label"])
+        self.assertEqual(lift_names, sorted({link["lift_name"] for link in self.tcr["links"]
+                                             if link["kind"] == "lift"}))
+        verticals = {}
+        for line in diagram["lines"]:
+            if "lift" in line["cls"].split():
+                first, second = line["points"].split()[:2]
+                x = first.split(",")[0]
+                verticals.setdefault(x, set()).add(line["lift"])
+        # Every vertical x carries one lift only.
+        self.assertTrue(all(len(lifts) == 1 for lifts in verticals.values()), verticals)
 
     def test_route_is_highlighted(self):
         route = find_route(self.tcr, CENTRAL_EB)

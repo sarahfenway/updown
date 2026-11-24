@@ -11,6 +11,9 @@ BOX_HEIGHT = 44
 LEFT = 130   # room for the level labels
 TOP = 24
 LINE_CHARS = 20
+# Horizontal offsets from a box's centre for each lift lane in its column.
+LANE_OFFSETS = (0, -22, 22, -44, 44)
+LABEL_STAGGER = 13
 
 
 def level_name(level):
@@ -63,28 +66,49 @@ def build_diagram(routes, broken_lift_ids=(), route=None):
         y = TOP + row * ROW_HEIGHT
         bands.append({"y": y - 14, "label_y": y + BOX_HEIGHT / 2 + 4, "label": level_name(level)})
 
+    places = routes["places"]
+    lanes = {}       # column -> lift ids, in the order first drawn
+    labelled = set()  # lifts already labelled (a lift may have several links)
     lines = []
     for link in routes["links"]:
         if link["a"] not in positions or link["b"] not in positions:
             continue  # links to the street node are not drawn
-        (x1, y1), (x2, y2) = centre(link["a"]), centre(link["b"])
         classes = [link["kind"]]
         label = ""
+        lift_id = link.get("lift_id")
         if link["kind"] == "lift":
-            # Lifts read as vertical: down from the first place, then across.
-            points = f"{x1:.0f},{y1:.0f} {x1:.0f},{y2:.0f} {x2:.0f},{y2:.0f}"
-            label = link["lift_name"]
-            if link["lift_id"] in broken:
+            # Lifts read as vertical: down from the upper place, then across
+            # to the lower one. Each lift in a column gets its own lane, so
+            # long lifts don't run hidden along another lift's line.
+            top, bottom = sorted((link["a"], link["b"]), key=lambda pid: -places[pid]["level"])
+            (x1, y1), (x2, y2) = centre(top), centre(bottom)
+            column = lanes.setdefault(positions[top][0], [])
+            if lift_id not in column:
+                column.append(lift_id)
+            lane = column.index(lift_id)
+            x = x1 + LANE_OFFSETS[lane % len(LANE_OFFSETS)]
+            points = f"{x:.0f},{y1:.0f} {x:.0f},{y2:.0f} {x2:.0f},{y2:.0f}"
+            if lift_id not in labelled:
+                labelled.add(lift_id)
+                label = link["lift_name"]
+                if lift_id in broken:
+                    label = f"{label} – out of service"
+            if lift_id in broken:
                 classes.append("broken")
-                label = f"{label} – out of service"
-            label_x, label_y = x1 + 6, (y1 + y2) / 2
+            # Labels go in the gap just below the upper box: a long lift's
+            # midpoint can fall behind a box on an in-between level.
+            # Neighbouring lanes are closer than a label is wide, so each
+            # lane's label sits a line lower than the previous lane's.
+            label_x = x + 4
+            label_y = y1 + BOX_HEIGHT / 2 + 14 + (lane % len(LANE_OFFSETS)) * LABEL_STAGGER
         else:
+            (x1, y1), (x2, y2) = centre(link["a"]), centre(link["b"])
             points = f"{x1:.0f},{y1:.0f} {x2:.0f},{y2:.0f}"
             label_x, label_y = 0, 0
         if _link_key(link) in route_links:
             classes.append("on-route")
         lines.append({"points": points, "cls": " ".join(classes), "label": label,
-                      "label_x": f"{label_x:.0f}", "label_y": f"{label_y:.0f}"})
+                      "lift": lift_id, "label_x": f"{label_x:.0f}", "label_y": f"{label_y:.0f}"})
 
     boxes = []
     for pid, place in routes["places"].items():

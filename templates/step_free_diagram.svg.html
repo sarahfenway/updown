@@ -1,4 +1,5 @@
-<svg class="step-free-diagram" viewBox="0 0 {{ diagram.width }} {{ diagram.height }}" width="100%"
+<svg class="step-free-diagram" viewBox="0 0 {{ diagram.width }} {{ diagram.height }}"
+     width="{{ diagram.width }}" height="{{ diagram.height }}"
      role="img" aria-labelledby="diagram-title">
     <title id="diagram-title">Step-free routes at {{ station.name }}</title>
     {% for band in diagram.bands %}

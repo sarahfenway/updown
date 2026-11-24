@@ -5,7 +5,9 @@
 {% block head_extra %}
 <meta name="robots" content="noindex">
 <style>
-    .step-free-diagram { max-width: 100%; height: auto; font-family: Montserrat, sans-serif; }
+    /* Drawn at full size; the wrapper scrolls sideways when it doesn't fit,
+       so the labels stay readable on a phone instead of shrinking. */
+    .step-free-diagram { display: block; font-family: Montserrat, sans-serif; }
     .step-free-diagram .band { stroke: #ddd; }
     .step-free-diagram .band-label { font-size: 11px; fill: #666; }
     .step-free-diagram .place { fill: #fff; stroke: #888; }
