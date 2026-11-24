@@ -43,13 +43,18 @@ def update_broken_lifts():
         station_id = (item.get("stationUniqueId") or "").strip()
         broken.setdefault(station_id, set()).update(item.get("disruptedLiftUniqueIds") or [])
 
+    # A station's route data can cover several TfL stations (see
+    # tfl_data.merge_routes). Read just that list, not the whole route JSON.
     now = timezone.now()
-    stations = list(
-        Station.objects.filter(tfl_station_id__isnull=False)
-        .only("pk", "tfl_station_id", "broken_lift_ids", "broken_lifts_checked_at")
+    stations = []
+    rows = Station.objects.filter(tfl_station_id__isnull=False).values_list(
+        "pk", "tfl_station_id", "step_free_routes__tfl_ids"
     )
-    for station in stations:
-        station.broken_lift_ids = sorted(broken.get(station.tfl_station_id, ()))
-        station.broken_lifts_checked_at = now
+    for pk, tfl_station_id, tfl_ids in rows:
+        lift_ids = set()
+        for tfl_id in tfl_ids or [tfl_station_id]:
+            lift_ids |= broken.get(tfl_id, set())
+        stations.append(Station(pk=pk, broken_lift_ids=sorted(lift_ids),
+                                broken_lifts_checked_at=now))
     Station.objects.bulk_update(stations, ["broken_lift_ids", "broken_lifts_checked_at"])
     return True

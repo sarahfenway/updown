@@ -364,6 +364,28 @@ class ImportTests(TestCase):
         self.tcr.refresh_from_db()
         self.assertEqual(self.tcr.step_free_routes, {"old": True})
 
+    def test_two_tfl_stations_for_one_of_ours_are_merged(self):
+        # TfL lists West Hampstead's Tube and Overground stations separately
+        # under one hub code; we count them as one station. Simulate that by
+        # giving one record codes from two fixture stations.
+        Station.objects.filter(pk=self.balham.pk).delete()
+        self.tcr.naptan_id = "940GZZLUBLM"  # Balham's Tube code
+        self.tcr.save()
+
+        import_feed(load_feed(fixture_zip()), min_stations=1)
+
+        self.tcr.refresh_from_db()
+        routes = self.tcr.step_free_routes
+        self.assertEqual(routes["tfl_ids"], ["HUBBAL", "HUBTCR"])
+        self.assertIn(CENTRAL_EB, routes["platforms"])
+        self.assertIn("HUBBAL-Plat01-NB-northern", routes["platforms"])
+        self.assertIn("HUBTCR-Outside", routes["starts"])
+        self.assertIn("HUBBAL-Outside", routes["starts"])
+        for pid, place in routes["places"].items():
+            if place["kind"] != "street":
+                self.assertIn(pid, routes["layout"]["positions"])
+        self.assertEqual(find_route(routes, CENTRAL_EB).status, OK)
+
     def test_stations_missing_from_the_file_are_cleared(self):
         gone = make_station("Old Street", hub_naptan_id="HUBOLD", tube=True,
                             step_free_routes={"old": True}, tfl_station_id="HUBOLD")
@@ -440,9 +462,28 @@ class FakeLiftResponse:
 
 class BrokenLiftTests(TestCase):
     def setUp(self):
-        self.tcr = make_station("Tottenham Court Road", tube=True, tfl_station_id="HUBTCR")
+        self.tcr = make_station("Tottenham Court Road", tube=True, tfl_station_id="HUBTCR",
+                                step_free_routes={"tfl_ids": ["HUBTCR"]})
         self.bank = make_station("Bank", tube=True, tfl_station_id="HUBBAN",
+                                 step_free_routes={"tfl_ids": ["HUBBAN"]},
                                  broken_lift_ids=["HUBBAN-Lift-1"])
+
+    def test_merged_station_gets_lifts_from_every_tfl_station(self):
+        west_hampstead = make_station(
+            "West Hampstead", tube=True, tfl_station_id="910GWHMDSTD",
+            step_free_routes={"tfl_ids": ["910GWHMDSTD", "940GZZLUWHP"]},
+        )
+        payload = [
+            {"stationUniqueId": "910GWHMDSTD", "disruptedLiftUniqueIds": ["910GWHMDSTD-Lift-1"]},
+            {"stationUniqueId": "940GZZLUWHP", "disruptedLiftUniqueIds": ["940GZZLUWHP-Lift-2"]},
+        ]
+        with patch("stations.step_free.broken_lifts.requests.get",
+                   return_value=FakeLiftResponse(payload)):
+            update_broken_lifts()
+
+        west_hampstead.refresh_from_db()
+        self.assertEqual(west_hampstead.broken_lift_ids,
+                         ["910GWHMDSTD-Lift-1", "940GZZLUWHP-Lift-2"])
 
     def test_stores_broken_lift_ids_per_station(self):
         payload = [

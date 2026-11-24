@@ -12,7 +12,7 @@ from django.db.models import F, Max, Q
 from stations.models import Station
 from stations.utils import cleanup_station_name
 
-from .tfl_data import FeedError
+from .tfl_data import FeedError, merge_routes
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,11 @@ def match_stations(feed):
     our naptan_id/hub_naptan_id on the main record or any child), then a
     unique normalised name. Where two of our main records are the same
     station, the lower pk wins.
+
+    Returns ``({main pk: [tfl id, ...]}, [unmatched tfl id, ...])``. Several
+    TfL stations map to one record when they share our codes (West
+    Hampstead's Tube and Overground share hub HUBWHD); a name match never
+    joins a record that already has a station, since names are ambiguous.
     """
     mains = list(covered_main_records().only("pk", "name"))
     main_pks = {station.pk for station in mains}
@@ -89,24 +94,25 @@ def match_stations(feed):
         by_name.setdefault(_normalise(station.name), []).append(station.pk)
 
     matches = {}
+    by_name_only = []
     unmatched = []
     for tfl_id in sorted(feed.stations):
         hits = [by_code[code] for code in feed.codes[tfl_id] if code in by_code]
-        pk = min(hits) if hits else None
-        if pk is None:
-            candidates = by_name.get(_normalise(feed.stations[tfl_id]["name"]), [])
-            pk = min(candidates) if candidates else None
+        if hits:
+            matches.setdefault(min(hits), []).append(tfl_id)
+        else:
+            by_name_only.append(tfl_id)
+    for tfl_id in by_name_only:
+        candidates = by_name.get(_normalise(feed.stations[tfl_id]["name"]), [])
+        pk = min(candidates) if candidates else None
         if pk is None:
             unmatched.append(tfl_id)
-            continue
-        if pk in matches:
-            other = matches[pk]
-            keep = max((other, tfl_id), key=lambda sid: len(feed.stations[sid]["platforms"]))
-            logger.warning("TfL stations %s and %s both match station %s; keeping %s",
-                           other, tfl_id, pk, keep)
-            matches[pk] = keep
-            continue
-        matches[pk] = tfl_id
+        elif pk in matches:
+            logger.warning("TfL station %s matches station %s by name only, but it already "
+                           "has %s; skipping", tfl_id, pk, ", ".join(matches[pk]))
+            unmatched.append(tfl_id)
+        else:
+            matches[pk] = [tfl_id]
     return matches, unmatched
 
 
@@ -136,10 +142,14 @@ def import_feed(feed, min_stations=None):
             .filter(Q(step_free_routes__isnull=False) | Q(tfl_station_id__isnull=False))
             .update(step_free_routes=None, step_free_routes_published=None, tfl_station_id=None)
         )
-        for pk, tfl_id in matches.items():
+        for pk, tfl_ids in matches.items():
+            if len(tfl_ids) == 1:
+                routes = feed.stations[tfl_ids[0]]
+            else:
+                routes = merge_routes([feed.stations[tfl_id] for tfl_id in tfl_ids])
             Station.objects.filter(pk=pk).update(
-                step_free_routes=feed.stations[tfl_id],
+                step_free_routes=routes,
                 step_free_routes_published=feed.published,
-                tfl_station_id=tfl_id,
+                tfl_station_id=routes["tfl_id"],
             )
     return ImportResult(matched=len(matches), unmatched=unmatched, cleared=cleared)

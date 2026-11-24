@@ -267,6 +267,7 @@ def _build_feed(tables):
         _name_places(station_places)
         stations[sid] = {
             "tfl_id": sid,
+            "tfl_ids": [sid],
             "name": station_rows[sid]["Name"].strip(),
             "places": station_places,
             "links": station_links,
@@ -277,6 +278,34 @@ def _build_feed(tables):
 
     return Feed(published=published, stations=stations,
                 codes={sid: codes[sid] for sid in stations})
+
+
+def merge_routes(routes_list):
+    """One station's route data from several TfL stations.
+
+    TfL sometimes lists one interchange as separate stations sharing a hub
+    code (West Hampstead's Tube and Overground). We count it as one station,
+    so their places, links, platforms and starts are combined. They share no
+    links, so each part keeps its own street node and routes.
+    """
+    routes_list = sorted(routes_list, key=lambda routes: routes["tfl_id"])
+    places, links, platforms, starts = {}, [], {}, []
+    for routes in routes_list:
+        places.update(routes["places"])
+        links.extend(routes["links"])
+        platforms.update(routes["platforms"])
+        starts.extend(routes["starts"])
+    _name_places(places)
+    return {
+        "tfl_id": routes_list[0]["tfl_id"],
+        "tfl_ids": [routes["tfl_id"] for routes in routes_list],
+        "name": routes_list[0]["name"],
+        "places": places,
+        "links": links,
+        "platforms": platforms,
+        "starts": starts,
+        "layout": compute_layout(places),
+    }
 
 
 def _name_places(station_places):
