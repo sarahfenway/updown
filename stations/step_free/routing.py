@@ -33,6 +33,7 @@ def _search(routes, starts, platform_id, broken):
     lift through an intermediate stop costs one lift, not two. Ties are
     broken by place id, then by lift name, so results are stable.
     """
+    merged = routes.get("merged", {})
     adjacency = {}
     for link in routes["links"]:
         if link["kind"] == "lift" and link["lift_id"] in broken:
@@ -62,6 +63,10 @@ def _search(routes, starts, platform_id, broken):
             if link["kind"] == "lift":
                 lift_id = link["lift_id"]
                 step = LINK_COST if lift_id == riding else LIFT_COST
+            elif merged.get(node) == other or merged.get(other) == node:
+                # An area and the platform it's merged into are one place.
+                lift_id = ""
+                step = 0
             else:
                 lift_id = ""
                 step = LINK_COST
@@ -128,6 +133,17 @@ def describe(routes, places, links):
     """Turn a route into numbered-step text (without the numbers)."""
     info = routes["places"]
     platform = routes["platforms"][places[-1]]
+    # A platform area merged into its platform is the same place: name it as
+    # the platform and drop the walkway between the two.
+    merged = routes.get("merged", {})
+    if merged:
+        kept_places, kept_links = [merged.get(places[0], places[0])], []
+        for link, place in zip(links, places[1:]):
+            place = merged.get(place, place)
+            if place != kept_places[-1]:
+                kept_places.append(place)
+                kept_links.append(link)
+        places, links = kept_places, kept_links
     steps = []
     index = 0
     if info[places[0]]["kind"] == "street":

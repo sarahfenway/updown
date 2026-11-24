@@ -23,6 +23,30 @@
     .step-free-diagram rect.on-route { fill: #fff6d6; stroke: #e0a800; stroke-width: 3; }
     .step-free-diagram .link.on-route { stroke: #e0a800; stroke-width: 4; }
     .diagram-scroll { overflow-x: auto; }
+    .step-free-diagram .box-link, .step-free-diagram .lift-link { cursor: pointer; }
+    /* The site's link styles (bold, underlined) would apply to every name. */
+    .step-free-diagram a, .step-free-diagram a:hover, .step-free-diagram a:focus {
+        text-decoration: none; font-weight: normal;
+    }
+    .step-free-diagram .box-link:hover rect, .step-free-diagram .box-link:focus rect { stroke-width: 3; }
+    .step-free-diagram .info-icon circle { fill: #fff; stroke: #1c3f94; stroke-width: 1.2; }
+    .step-free-diagram .info-icon text { font-size: 9px; font-weight: bold; font-style: italic; fill: #1c3f94; }
+    .station-summary { margin: 12px 0 18px; }
+    .station-summary ul { padding-left: 20px; }
+    /* Details panels: hidden until a box's link targets one, then shown as a
+       sheet along the bottom of the screen. No JavaScript involved. */
+    .detail-panel { display: none; }
+    .detail-panel:target {
+        display: block; position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
+        max-height: 60vh; overflow-y: auto; background: #fff; padding: 16px 20px 20px;
+        border-top: 3px solid #1c3f94; box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.2);
+    }
+    .detail-panel h3 { margin-top: 0; padding-right: 40px; }
+    .detail-panel ul { padding-left: 20px; margin-bottom: 0; }
+    .detail-close {
+        position: absolute; top: 10px; right: 16px; font-size: 22px; line-height: 1;
+        text-decoration: none; color: #333;
+    }
 </style>
 {% endblock %}
 
@@ -44,6 +68,16 @@
             {% if not routes %}
                 <p>TfL has not published step-free route data for this station.</p>
             {% else %}
+                <div class="station-summary">
+                    {% if summary.step_free %}
+                        <p><strong>Step-free from the street to:</strong> {{ summary.step_free|join:", " }}</p>
+                        {% if summary.not_step_free %}<p><strong>Not step-free:</strong> {{ summary.not_step_free|join:", " }}</p>{% endif %}
+                    {% else %}
+                        <p><strong>No step-free access at this station</strong> in TfL's data.</p>
+                    {% endif %}
+                    {% if summary.no_information %}<p>TfL hasn't surveyed: {{ summary.no_information|join:", " }}</p>{% endif %}
+                    {% if facilities %}<ul>{% for line in facilities %}<li>{{ line }}</li>{% endfor %}</ul>{% endif %}
+                </div>
                 {% if not lift_status_known %}
                     <p><strong>Live lift status is unavailable</strong>, so routes assume every lift is working.</p>
                 {% elif broken_names %}
@@ -76,7 +110,15 @@
                     {% endif %}
                 {% endif %}
 
-                <div class="diagram-scroll">{% include "step_free_diagram.svg.html" %}</div>
+                <p class="text-muted">Tap a box or lift for details.</p>
+                <div class="diagram-scroll" id="station-diagram">{% include "step_free_diagram.svg.html" %}</div>
+                {% for panel in panels %}
+                    <section class="detail-panel" id="{{ panel.id }}" aria-labelledby="{{ panel.id }}-title">
+                        <a class="detail-close" href="#station-diagram" aria-label="Close details">✕</a>
+                        <h3 id="{{ panel.id }}-title">{{ panel.title }}</h3>
+                        <ul>{% for item in panel.items %}<li>{{ item }}</li>{% endfor %}</ul>
+                    </section>
+                {% endfor %}
             {% endif %}
         </div>
     </div>

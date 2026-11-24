@@ -1,7 +1,7 @@
 PlatformUniqueId,StopAreaNaptanCode,Line,DirectionTowards,MinGap,MaxGap,AverageGap,MinStep,MaxStep,AverageStep,DesignatedLevelAccessPoint,LocationOfLevelAccess,LevelAccessByManualRamp,AdditionalAccessibilityInformation,GroupName
 HUBEXC-Plat01-WB-central,940GZZLUEXC,central,,,,,,,,False,,FALSE,,
 HUBEXC-Plat02-EB-central,940GZZLUEXC,central,,,,,,,,False,,TRUE,,
-HUBEXC-Plat03-NB-northern,940GZZLUEXC,northern,,0,85,,0,50,,TRUE,,FALSE,,
+HUBEXC-Plat03-NB-northern,940GZZLUEXC,northern,,0,85,,0,50,,TRUE,2 centre doors on car 5,FALSE,Use the lift by the north entrance for this platform.,
 HUBEXC-Plat04-SB-northern,940GZZLUEXC,northern,,0,85,,0,50,,TRUE,,FALSE,,
 HUBEXC-PlatA-EB-elizabeth,910GEXMPLX,elizabeth,,,,,,,,TRUE,,FALSE,,
 HUBEXC-PlatB-WB-elizabeth,910GEXMPLX,elizabeth,,,,,,,,TRUE,,FALSE,,

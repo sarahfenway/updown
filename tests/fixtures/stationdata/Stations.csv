@@ -1,4 +1,4 @@
 UniqueId,Name,FareZones,HubNaptanCode,Wifi,OutsideStationUniqueId,BlueBadgeCarParking,BlueBadgeCarParkSpaces,TaxiRanksOutsideStation,MainBusInterchange,PierInterchange,NationalRailInterchange,AirportInterchange,EmiratesAirLineInterchange
-HUBEXC,Example Cross,1,HUBEXC,TRUE,HUBEXC-Outside,False,,False,,,,,
+HUBEXC,Example Cross,1,HUBEXC,TRUE,HUBEXC-Outside,True,2,True,,,,,
 910GSMPLDN,Sample Downs,2,,TRUE,910GSMPLDN-Outside,False,,False,,,,,
 HUBTST,Testbury,3,HUBTST,FALSE,HUBTST-Outside,False,,False,,,,,
