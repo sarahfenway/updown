@@ -103,3 +103,88 @@ class LayoutTests(SimpleTestCase):
         self.assertEqual(layout["positions"]["east"], [1, 1])
         self.assertEqual(layout["positions"]["platform"], [0, 2])
         self.assertNotIn("street", layout["positions"])
+
+
+from stations.step_free.tfl_data import FeedError, load_feed
+
+TCR = "HUBTCR"
+TCR_POINT = "HUBTCR-1000235-"
+
+
+class FeedParsingTests(SimpleTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.feed = load_feed(fixture_zip())
+        cls.tcr = cls.feed.stations[TCR]
+
+    def test_reads_publish_date_and_stations(self):
+        self.assertEqual(self.feed.published, date(2026, 10, 20))
+        self.assertEqual(sorted(self.feed.stations), ["910GHAKNYNM", "HUBBAL", "HUBTCR"])
+
+    def test_platform_labels_and_train_access(self):
+        platforms = self.tcr["platforms"]
+        self.assertEqual(
+            platforms["HUBTCR-Plat02-EB-central"]["label"],
+            "Central line – Eastbound Platform 2",
+        )
+        northern = platforms["HUBTCR-Plat03-NB-northern"]
+        self.assertEqual(northern["step"], "0–50 mm")
+        self.assertEqual(northern["gap"], "0–85 mm")
+
+    def test_only_covered_platforms_are_kept(self):
+        self.assertEqual(
+            set(self.feed.stations["HUBBAL"]["platforms"]),
+            {"HUBBAL-Plat01-NB-northern", "HUBBAL-Plat02-SB-northern"},
+        )
+
+    def test_bus_stops_are_dropped(self):
+        codes = [place["code"] for place in self.tcr["places"].values()]
+        self.assertFalse([code for code in codes if code.lower().startswith("bus")])
+
+    def test_places_get_readable_unique_names(self):
+        places = self.tcr["places"]
+        self.assertEqual(places[TCR_POINT + "BookH-13"]["name"], "Ticket hall (BookH)")
+        self.assertEqual(places[TCR_POINT + "DSBH-27"]["name"], "Ticket hall (DSBH)")
+        self.assertEqual(places[TCR_POINT + "D-NPE-21"]["name"], "Entrance (D-NPE)")
+        self.assertEqual(places[TCR_POINT + "UpCon-17"]["name"], "Upper concourse")
+
+    def test_lift_with_an_intermediate_stop_links_each_stop(self):
+        lift_d = [link for link in self.tcr["links"] if link.get("lift_id") == "HUBTCR-Lift-4"]
+        self.assertEqual(
+            {frozenset((link["a"], link["b"])) for link in lift_d},
+            {
+                frozenset((TCR_POINT + "BookH-13", TCR_POINT + "UpCon-17")),
+                frozenset((TCR_POINT + "UpCon-17", TCR_POINT + "NORPL-22")),
+            },
+        )
+        self.assertEqual({link["lift_name"] for link in lift_d}, {"Lift D"})
+
+    def test_street_level_entrances_are_starts(self):
+        self.assertEqual(
+            self.feed.stations["910GHAKNYNM"]["starts"],
+            [
+                "910GHAKNYNM-Outside",
+                "910GHAKNYNM-1001128-Entr-3",
+                "910GHAKNYNM-1001128-IENT-8",
+            ],
+        )
+
+    def test_codes_for_matching(self):
+        self.assertIn("940GZZLUTCR", self.feed.codes[TCR])
+        self.assertIn("HUBTCR", self.feed.codes[TCR])
+
+    def test_layout_is_stored_for_every_drawn_place(self):
+        layout = self.tcr["layout"]
+        self.assertEqual(layout["levels"], [0, -1, -2, -3, -5, -6])
+        for pid, place in self.tcr["places"].items():
+            if place["kind"] != "street":
+                self.assertIn(pid, layout["positions"])
+
+    def test_missing_file_is_a_feed_error(self):
+        with self.assertRaises(FeedError):
+            load_feed(fixture_zip(skip={"Lifts.csv"}))
+
+    def test_not_a_zip_is_a_feed_error(self):
+        with self.assertRaises(FeedError):
+            load_feed(b"not a zip")
