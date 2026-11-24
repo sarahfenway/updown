@@ -88,18 +88,27 @@ class LabelTests(SimpleTestCase):
             with self.subTest(code=code):
                 self.assertEqual(place_label(code), label)
 
+    def test_ticket_halls_and_mezzanines(self):
+        for code in ("TTH", "NTH", "WTH", "ELTH"):
+            with self.subTest(code=code):
+                self.assertEqual(place_label(code), "Ticket hall")
+        self.assertEqual(place_label("Mezz"), "Mezzanine")
+        self.assertIsNone(place_label("SOUTH"))
+        self.assertIsNone(place_label("NORTH"))
+
     def test_unknown_code_has_no_label(self):
         self.assertIsNone(place_label("BCQ"))
 
     def test_codes_that_only_look_like_line_names(self):
-        # Real codes in TfL's file: CEntr is an entrance; North, ELVER, ELM
-        # and ELTH are not the Northern or Elizabeth lines.
+        # Real codes in TfL's file: CEntr is an entrance; North, ELVER and
+        # ELM are not the Northern or Elizabeth lines (ELTH, a ticket hall,
+        # is covered by the ticket-hall rule).
         self.assertEqual(place_label("CEntr"), "Entrance")
         self.assertEqual(place_label("ELEnt"), "Entrance")
         self.assertEqual(place_label("Centr"), "Central line level")
         self.assertEqual(place_label("PICCA"), "Piccadilly line level")
         self.assertEqual(place_label("ELWL"), "Elizabeth line level")
-        for code in ("North", "ELVER", "ELM", "ELTH"):
+        for code in ("North", "ELVER", "ELM"):
             with self.subTest(code=code):
                 self.assertIsNone(place_label(code))
 
@@ -132,7 +141,7 @@ class LayoutTests(SimpleTestCase):
 
 
 from stations.step_free.tfl_data import (
-    FeedError, _merge_platform_areas, _name_places, load_feed, merge_routes,
+    DATA_FORMAT, FeedError, _merge_platform_areas, _name_places, load_feed, merge_routes,
 )
 
 EXC = "HUBEXC"
@@ -172,9 +181,9 @@ class FeedParsingTests(SimpleTestCase):
 
     def test_places_get_readable_unique_names(self):
         places = self.exc["places"]
-        self.assertEqual(places[EXC_POINT + "BookH-5"]["name"], "Ticket hall (BookH)")
-        self.assertEqual(places[EXC_POINT + "DSBH-4"]["name"], "Ticket hall (DSBH)")
-        self.assertEqual(places[EXC_POINT + "A-NOR-1"]["name"], "Entrance (A-NOR)")
+        self.assertEqual(places[EXC_POINT + "BookH-5"]["name"], "North-west ticket hall")
+        self.assertEqual(places[EXC_POINT + "DSBH-4"]["name"], "East ticket hall")
+        self.assertEqual(places[EXC_POINT + "A-NOR-1"]["name"], "North-west entrance")
         self.assertEqual(places[EXC_POINT + "UpCon-6"]["name"], "Upper concourse")
 
     def test_lift_with_an_intermediate_stop_links_each_stop(self):
@@ -231,7 +240,7 @@ class FeedParsingTests(SimpleTestCase):
         self.assertEqual(lift_names, {"Lift 1 – Weaver line", "Lift 1 – Northern line"})
         names = [p["name"] for p in merged["places"].values() if p["kind"] != "street"]
         self.assertEqual(len(names), len(set(names)))
-        self.assertIn("Platform level (RLY) – Weaver line", names)
+        self.assertIn("South-west platform level", names)
 
     def test_area_joined_to_its_platform_by_a_lift_or_ramp_is_not_merged(self):
         places = {
@@ -299,7 +308,14 @@ class FeedParsingTests(SimpleTestCase):
         }
         _name_places(places)
         self.assertEqual([p["name"] for p in places.values()],
-                         ["BCQ 1", "BCQ 2", "Entrance (XYZ 3)", "Entrance (XYZ 4)"])
+                         ["Passageway 1", "Passageway 2", "Entrance 1", "Entrance 2"])
+
+    def test_places_are_named_by_compass_direction_never_by_code(self):
+        names = [p["name"] for p in self.exc["places"].values() if p["kind"] not in ("street", "platform")]
+        self.assertIn("North-west entrance", names)
+        self.assertIn("South-east entrance", names)
+        for name in names:
+            self.assertNotRegex(name, r"\(|BookH|DSBH|A-NOR|ELEL")
 
     def test_blank_lift_id_gets_one_of_its_own(self):
         lifts = (b"StationUniqueId,LiftUniqueId,LiftId,NationalRailUprn,LiftName,FriendlyName,"
@@ -359,8 +375,8 @@ class RoutingTests(SimpleTestCase):
         self.assertEqual(result.places[0], "HUBEXC-Outside")
         self.assertEqual(result.places[-1], CENTRAL_EB)
         self.assertEqual(result.steps, [
-            "Enter at Entrance (A-NOR)",
-            "Take Lift A down to Ticket hall (BookH)",
+            "Enter at North-west entrance",
+            "Take Lift A down to North-west ticket hall",
             "Take Lift D down to Upper concourse",
             "Take Lift F down to Central line – Eastbound Platform 2",
             "Eastbound Platform 2: staff ramp available",
@@ -372,8 +388,8 @@ class RoutingTests(SimpleTestCase):
         result = find_route(self.exc, NORTHERN_NB)
 
         self.assertEqual(result.steps[:3], [
-            "Enter at Entrance (A-NOR)",
-            "Take Lift A down to Ticket hall (BookH)",
+            "Enter at North-west entrance",
+            "Take Lift A down to North-west ticket hall",
             "Take Lift D down to Northern line platforms",
         ])
         self.assertEqual(
@@ -400,7 +416,7 @@ class RoutingTests(SimpleTestCase):
         result = find_route(sample_downs, "910GSMPLDN-Plat01-SB-london-overground|national-rail")
 
         self.assertEqual(result.steps, [
-            "Enter at Entrance (IENT)",
+            "Enter at East entrance",
             "Take Lift 1 up to Weaver line – Southbound Platform 1",
             "Southbound Platform 1: staff ramp available",
         ])
@@ -613,12 +629,21 @@ class ImportCommandTests(TestCase):
         self.assertEqual(routes_of(self.exc).tfl_station_id, "HUBEXC")
 
     def test_unchanged_publish_time_skips_the_import(self):
-        make_routes(self.exc, published=PUBLISHED)
+        make_routes(self.exc, published=PUBLISHED, data={"format": DATA_FORMAT})
 
         output = self.run_command()
 
         self.assertIn("unchanged", output)
         self.assertIsNone(routes_of(self.testbury))
+
+    def test_stored_data_in_an_older_format_is_reimported(self):
+        # Same publish time, but data stored before the format existed.
+        make_routes(self.exc, published=PUBLISHED, data={"tfl_ids": ["HUBEXC"]})
+
+        output = self.run_command()
+
+        self.assertIn("Imported step-free routes", output)
+        self.assertEqual(routes_of(self.exc).data["format"], DATA_FORMAT)
 
     def test_same_day_republish_is_imported(self):
         make_routes(self.exc, published=PUBLISHED - timedelta(hours=2))
@@ -856,7 +881,7 @@ class DiagramTests(SimpleTestCase):
         sample_downs = self.feed.stations["910GSMPLDN"]
         diagram = build_diagram(sample_downs)
         names = [" ".join(box["lines"]) for box in diagram["boxes"]]
-        self.assertNotIn("Platform level (RPL-1)", names)
+        self.assertNotIn("North platform level", names)
         self.assertEqual(sum("Southbound Platform 1" in name for name in names), 1)
         lift = next(line for line in diagram["lines"] if line["lift"])
         platform_box = next(box for box in diagram["boxes"]
@@ -932,12 +957,12 @@ class DetailsTests(SimpleTestCase):
 
     def test_place_panel_lists_lifts_and_entrance_link(self):
         diagram, panels = self.panels(self.exc, ["HUBEXC-Lift-1"])
-        hall = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "Ticket hall (BookH)")
+        hall = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "North-west ticket hall")
         items = panels[hall["panel"]]["items"]
         self.assertIn("1 level below street", items)
-        self.assertIn("Lift A up to Entrance (A-NOR) – out of service", items)
+        self.assertIn("Lift A up to North-west entrance – out of service", items)
         self.assertIn("Lift C down to Elizabeth line level", items)
-        entrance = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "Entrance (A-NOR)")
+        entrance = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "North-west entrance")
         self.assertIn("Linked to the street in TfL's data", panels[entrance["panel"]]["items"])
 
     def test_street_linked_entrance_with_an_ent_code_is_linked(self):
@@ -945,7 +970,7 @@ class DetailsTests(SimpleTestCase):
         # ENT, which puts it among the route starts too.
         sample_downs = self.feed.stations["910GSMPLDN"]
         diagram, panels = self.panels(sample_downs)
-        box = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "Entrance (Entr)")
+        box = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "South-west entrance")
         self.assertIn("Linked to the street in TfL's data", panels[box["panel"]]["items"])
 
     def test_platform_panel_reflects_a_broken_lift(self):
@@ -959,7 +984,7 @@ class DetailsTests(SimpleTestCase):
         sample_downs = self.feed.stations["910GSMPLDN"]
         diagram, panels = self.panels(sample_downs, ["910GSMPLDN-Lift-1"])
         box = next(b for b in diagram["boxes"] if "Southbound Platform 1" in " ".join(b["lines"]))
-        self.assertIn("Lift 1 down to Entrance (IENT) – out of service", panels[box["panel"]]["items"])
+        self.assertIn("Lift 1 down to East entrance – out of service", panels[box["panel"]]["items"])
 
     def test_platform_reached_only_through_an_unlinked_entrance_is_caveated(self):
         sample_downs = self.feed.stations["910GSMPLDN"]
@@ -988,7 +1013,7 @@ class DetailsTests(SimpleTestCase):
     def test_unlinked_entrance_says_so(self):
         sample_downs = self.feed.stations["910GSMPLDN"]
         diagram, panels = self.panels(sample_downs)
-        box = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "Entrance (IENT)")
+        box = next(b for b in diagram["boxes"] if " ".join(b["lines"]) == "East entrance")
         self.assertIn("Not linked to the street in TfL's data, so it may have steps",
                       panels[box["panel"]]["items"])
 

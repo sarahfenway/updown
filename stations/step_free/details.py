@@ -6,6 +6,7 @@ page shows it as plain HTML (no JSON, no TfL ids).
 
 from .diagram import level_name
 from .routing import BLOCKED, NO_INFO, OK, find_route
+from .style import line_colour
 
 
 UNLINKED_CAVEAT = ("Step-free only through an entrance TfL's data doesn't link to the street, "
@@ -174,3 +175,57 @@ def _platform_items(routes, pid, broken):
         items.append(f"Accessible entrance: {platform['entrance']}")
     items.extend(platform.get("notes", []))
     return items
+
+
+def station_status(summary):
+    """(css class, words) for the badge by the station's name."""
+    partial = summary["not_step_free"] or summary["no_information"] or summary["step_free_unlinked"]
+    if summary["step_free"]:
+        return ("partial", "Partly step-free") if partial else ("ok", "Step-free")
+    if summary["step_free_unlinked"]:
+        return ("partial", "Possibly step-free")
+    if summary["not_step_free"]:
+        return ("none", "No step-free access")
+    return ("unknown", "No step-free information")
+
+
+def platform_groups(routes, broken_lift_ids=(), lift_status_known=True):
+    """Platforms grouped by line, each with its step-free status now:
+    [{"lines": [{"name", "colour"}], "platforms": [{"id", "name", "status", "words"}]}]."""
+    broken = set(broken_lift_ids) if lift_status_known else set()
+    groups = {}
+    for pid, platform in routes["platforms"].items():
+        usual = find_route(routes, pid)
+        if usual.status == OK:
+            now = find_route(routes, pid, broken) if broken else usual
+            if now.status == BLOCKED:
+                status, words = "blocked", "Not step-free right now"
+            elif usual.unlinked_entrance:
+                status, words = "partial", "Possibly step-free"
+            else:
+                status, words = "ok", "Step-free"
+        elif usual.status == NO_INFO:
+            status, words = "unknown", "No information"
+        else:
+            status, words = "none", "Not step-free"
+        key = tuple(platform["lines"])
+        groups.setdefault(key, []).append(
+            {"id": pid, "name": platform["name"], "status": status, "words": words})
+    return [
+        {"lines": [{"name": line, "colour": line_colour(line)} for line in key],
+         "platforms": sorted(members, key=lambda p: p["name"])}
+        for key, members in sorted(groups.items())
+    ]
+
+
+_STEP_KINDS = (("Enter at", "enter"), ("Start at", "start"), ("Take ", "lift"),
+               ("Use the ramp", "ramp"), ("Go to", "walk"))
+
+
+def route_steps(route):
+    """The route's directions with a kind for each step's icon."""
+    steps = []
+    for text in route.steps:
+        kind = next((k for prefix, k in _STEP_KINDS if text.startswith(prefix)), "board")
+        steps.append({"kind": kind, "text": text})
+    return steps

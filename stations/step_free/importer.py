@@ -12,7 +12,7 @@ from django.db.models import F, Max, Q
 from stations.models import Station, StationRoutes
 from stations.utils import cleanup_station_name
 
-from .tfl_data import FeedError, merge_routes
+from .tfl_data import DATA_FORMAT, FeedError, merge_routes
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,14 @@ def covered_main_records():
 
 def last_published():
     return StationRoutes.objects.aggregate(latest=Max("published"))["latest"]
+
+
+def stored_format_is_current():
+    """False if any station's stored data predates this code's format."""
+    # exclude() alone skips rows where the key is missing, which is exactly
+    # the data stored before formats existed.
+    outdated = Q(data__format__isnull=True) | ~Q(data__format=DATA_FORMAT)
+    return not StationRoutes.objects.filter(outdated).exists()
 
 
 def download_zip():

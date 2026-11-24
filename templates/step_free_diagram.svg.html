@@ -8,6 +8,7 @@ drawing is a group rather than one image, so screen readers reach each link.
      role="group" aria-labelledby="diagram-title">
     <title id="diagram-title">Step-free routes at {{ station.name }}</title>
     {% for band in diagram.bands %}
+        {% if band.shade %}<rect class="band-bg" x="0" y="{{ band.y }}" width="{{ diagram.width }}" height="{{ band.height }}"/>{% endif %}
         <line class="band" x1="0" x2="{{ diagram.width }}" y1="{{ band.y }}" y2="{{ band.y }}"/>
         <text class="band-label" x="4" y="{{ band.label_y }}">{{ band.label }}</text>
     {% endfor %}
@@ -17,7 +18,8 @@ drawing is a group rather than one image, so screen readers reach each link.
     {% endfor %}
     {% for box in diagram.boxes %}
         <a href="#{{ box.panel }}" class="box-link" aria-label="Details: {{ box.label }}">
-            <rect class="{{ box.cls }}" x="{{ box.x }}" y="{{ box.y }}" width="{{ box.w }}" height="{{ box.h }}" rx="6"/>
+            <rect class="{{ box.cls }}" x="{{ box.x }}" y="{{ box.y }}" width="{{ box.w }}" height="{{ box.h }}" rx="9"/>
+            {% if box.stripe %}<rect x="{{ box.x }}" y="{{ box.y }}" width="6" height="{{ box.h }}" rx="3" fill="{{ box.stripe }}"/>{% endif %}
             <text class="box-label" text-anchor="middle" x="{{ box.cx }}" y="{{ box.ty }}">{% for text in box.lines %}<tspan x="{{ box.cx }}" dy="{% if forloop.first %}0{% else %}13{% endif %}">{{ text }}</tspan>{% endfor %}</text>
             <g class="info-icon" aria-hidden="true"><circle cx="{{ box.icon_x }}" cy="{{ box.icon_y }}" r="6"/><text x="{{ box.icon_x }}" y="{{ box.icon_ty }}" text-anchor="middle">i</text></g>
         </a>
