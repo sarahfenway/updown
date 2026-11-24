@@ -188,3 +188,103 @@ class FeedParsingTests(SimpleTestCase):
     def test_not_a_zip_is_a_feed_error(self):
         with self.assertRaises(FeedError):
             load_feed(b"not a zip")
+
+
+from stations.step_free.routing import BLOCKED, NO_ROUTE, OK, find_route
+
+CENTRAL_EB = "HUBTCR-Plat02-EB-central"
+NORTHERN_NB = "HUBTCR-Plat03-NB-northern"
+
+
+class RoutingTests(SimpleTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.feed = load_feed(fixture_zip())
+        cls.tcr = cls.feed.stations[TCR]
+
+    def test_route_to_central_line_eastbound(self):
+        result = find_route(self.tcr, CENTRAL_EB)
+
+        self.assertEqual(result.status, OK)
+        self.assertEqual(result.places[0], "HUBTCR-Outside")
+        self.assertEqual(result.places[-1], CENTRAL_EB)
+        self.assertEqual(result.steps, [
+            "Enter at Entrance (D-NPE)",
+            "Take Lift B down to Ticket hall (BookH)",
+            "Take Lift E down to Upper concourse",
+            "Take Lift F down to Central line eastbound platform",
+            "Go to Eastbound Platform 2",
+            "Eastbound Platform 2: staff ramp available",
+        ])
+
+    def test_one_lift_ride_through_a_stop_counts_as_one_lift(self):
+        # Lift D goes ticket hall -> upper concourse -> Northern line, so
+        # B then D (two lifts) beats B, C, G (three).
+        result = find_route(self.tcr, NORTHERN_NB)
+
+        self.assertEqual(result.steps[:3], [
+            "Enter at Entrance (D-NPE)",
+            "Take Lift B down to Ticket hall (BookH)",
+            "Take Lift D down to Northern line platforms",
+        ])
+        self.assertEqual(
+            result.steps[-1],
+            "Northbound Platform 3: step to train 0–50 mm, gap 0–85 mm",
+        )
+
+    def test_broken_lift_with_an_alternative_is_avoided(self):
+        result = find_route(self.tcr, NORTHERN_NB, ["HUBTCR-Lift-4"])  # Lift D
+
+        self.assertEqual(result.status, OK)
+        self.assertFalse([step for step in result.steps if "Lift D" in step])
+        self.assertIn("Take Lift G down to Northern line platforms", result.steps)
+
+    def test_broken_lift_on_the_only_route_blocks_it(self):
+        result = find_route(self.tcr, CENTRAL_EB, ["HUBTCR-Lift-5"])  # Lift F
+
+        self.assertEqual(result.status, BLOCKED)
+        self.assertEqual(result.blocking_lifts, ["Lift F"])
+        self.assertEqual(result.steps, [])
+
+    def test_hackney_downs_side_entrance_reaches_platform_1(self):
+        hackney = self.feed.stations["910GHAKNYNM"]
+        result = find_route(hackney, "910GHAKNYNM-Plat01-SB-london-overground|national-rail")
+
+        self.assertEqual(result.steps, [
+            "Enter at Entrance (IENT)",
+            "Take Lift 1 up to Platform level (RPL-1)",
+            "Go to Southbound Platform 1",
+            "Southbound Platform 1: staff ramp available",
+        ])
+
+    def test_balham_northern_line_has_no_step_free_route(self):
+        balham = self.feed.stations["HUBBAL"]
+        for platform_id in balham["platforms"]:
+            with self.subTest(platform=platform_id):
+                self.assertEqual(find_route(balham, platform_id).status, NO_ROUTE)
+
+    def test_ramp_and_small_lift_wording(self):
+        routes = {
+            "places": {
+                "out": {"name": "Street", "level": 0, "kind": "street"},
+                "e": {"name": "Main entrance", "level": 0, "kind": "entrance"},
+                "h": {"name": "Ticket hall", "level": -1, "kind": "place"},
+                "p": {"name": "Platform 1", "level": -1, "kind": "platform"},
+            },
+            "links": [
+                {"a": "out", "b": "e", "kind": "walkway"},
+                {"a": "e", "b": "h", "kind": "lift", "lift_id": "L1",
+                 "lift_name": "Lift 1", "small": True},
+                {"a": "h", "b": "p", "kind": "ramp"},
+            ],
+            "platforms": {"p": {"name": "Platform 1", "step": None, "gap": None,
+                                "manual_ramp": False}},
+            "starts": ["out"],
+        }
+
+        self.assertEqual(find_route(routes, "p").steps, [
+            "Enter at Main entrance",
+            "Take Lift 1 (small lift) down to Ticket hall",
+            "Use the ramp to Platform 1",
+        ])
