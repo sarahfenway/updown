@@ -71,11 +71,19 @@
                 <div class="station-summary">
                     {% if summary.step_free %}
                         <p><strong>Step-free from the street to:</strong> {{ summary.step_free|join:", " }}</p>
-                        {% if summary.not_step_free %}<p><strong>Not step-free:</strong> {{ summary.not_step_free|join:", " }}</p>{% endif %}
-                    {% else %}
-                        <p><strong>No step-free access at this station</strong> in TfL's data.</p>
                     {% endif %}
-                    {% if summary.no_information %}<p>TfL hasn't surveyed: {{ summary.no_information|join:", " }}</p>{% endif %}
+                    {% if summary.step_free_unlinked %}
+                        <p><strong>Possibly step-free</strong>, through an entrance TfL's data doesn't link to the street (it may have steps): {{ summary.step_free_unlinked|join:", " }}</p>
+                    {% endif %}
+                    {% if summary.step_free or summary.step_free_unlinked %}
+                        {% if summary.not_step_free %}<p><strong>Not step-free:</strong> {{ summary.not_step_free|join:", " }}</p>{% endif %}
+                        {% if summary.no_information %}<p>TfL hasn't surveyed: {{ summary.no_information|join:", " }}</p>{% endif %}
+                    {% elif summary.not_step_free %}
+                        <p><strong>No step-free access at this station</strong> in TfL's data.</p>
+                        {% if summary.no_information %}<p>TfL hasn't surveyed: {{ summary.no_information|join:", " }}</p>{% endif %}
+                    {% else %}
+                        <p>TfL hasn't published step-free information for this station.</p>
+                    {% endif %}
                     {% if facilities %}<ul>{% for line in facilities %}<li>{{ line }}</li>{% endfor %}</ul>{% endif %}
                 </div>
                 {% if not lift_status_known %}
@@ -113,7 +121,7 @@
                 <p class="text-muted">Tap a box or lift for details.</p>
                 <div class="diagram-scroll" id="station-diagram">{% include "step_free_diagram.svg.html" %}</div>
                 {% for panel in panels %}
-                    <section class="detail-panel" id="{{ panel.id }}" aria-labelledby="{{ panel.id }}-title">
+                    <section class="detail-panel" id="{{ panel.id }}" tabindex="-1" aria-labelledby="{{ panel.id }}-title">
                         <a class="detail-close" href="#station-diagram" aria-label="Close details">✕</a>
                         <h3 id="{{ panel.id }}-title">{{ panel.title }}</h3>
                         <ul>{% for item in panel.items %}<li>{{ item }}</li>{% endfor %}</ul>

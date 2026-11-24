@@ -124,6 +124,11 @@ def _true(value):
     return (value or "").strip().upper() == "TRUE"
 
 
+def _true_or_none(value):
+    value = (value or "").strip().upper()
+    return True if value == "TRUE" else False if value == "FALSE" else None
+
+
 def _platform_modes(platform_id):
     parts = platform_id.split("-", 3)
     return set(parts[3].split("|")) if len(parts) == 4 else set()
@@ -276,7 +281,8 @@ def _build_feed(tables):
             continue
         toilets.setdefault((row.get("StationUniqueId") or "").strip(), []).append({
             "location": (row.get("Location") or "").strip(),
-            "inside_gates": _true(row.get("IsInsideGateLine")),
+            # None when TfL leaves it blank: unknown, not "outside".
+            "inside_gates": _true_or_none(row.get("IsInsideGateLine")),
             "radar_key": _true(row.get("RadarKey")),
             "fee": _true(row.get("IsFeeCharged")),
             "baby_changing": _true(row.get("HasBabyChanging")),
@@ -467,15 +473,19 @@ def _merge_platform_areas(station_places, station_links, station_platforms):
     place: draw and name them once, as the platform. An area that serves
     several platforms (an island, a shared concourse) stays a place.
     """
-    walkways = {}
+    walkways, stepped = {}, set()
     for link in station_links:
         if link["kind"] == "walkway":
             walkways.setdefault(link["a"], set()).add(link["b"])
             walkways.setdefault(link["b"], set()).add(link["a"])
+        else:
+            # A lift or ramp between an area and a platform is a step worth
+            # showing; merging the two would hide it.
+            stepped.add(frozenset((link["a"], link["b"])))
     merged = {}
     for pid in station_platforms:
         areas = [n for n in walkways.get(pid, ()) if station_places[n]["kind"] == "place"]
-        if len(areas) != 1:
+        if len(areas) != 1 or frozenset((areas[0], pid)) in stepped:
             continue
         served = [n for n in walkways.get(areas[0], ()) if station_places[n]["kind"] == "platform"]
         if served == [pid]:
@@ -496,6 +506,7 @@ def _merge_platform_areas(station_places, station_links, station_platforms):
             n for n in walkways.get(area, ())
             if n in station_platforms and n not in claimed
             and _platform_direction(n) == direction and line in _platform_modes(n)
+            and frozenset((area, n)) not in stepped
         ]
         if len(candidates) == 1:
             merged[area] = candidates[0]
