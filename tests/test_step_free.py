@@ -288,3 +288,133 @@ class RoutingTests(SimpleTestCase):
             "Take Lift 1 (small lift) down to Ticket hall",
             "Use the ramp to Platform 1",
         ])
+
+
+from io import StringIO
+
+from django.core.management import CommandError, call_command
+
+from stations.step_free.importer import ImportAborted, import_feed
+
+
+def make_fixture_stations():
+    """Our records for the three fixture stations, as update_stations makes them."""
+    tcr = make_station("Tottenham Court Road", hub_naptan_id="HUBTCR",
+                       naptan_id="940GZZLUTCR", tube=True, crossrail=True)
+    hackney = make_station("Hackney Downs", naptan_id="910GHAKNYNM", overground=True)
+    balham = make_station("Balham", hub_naptan_id="HUBBAL",
+                          naptan_id="940GZZLUBLM", tube=True)
+    return tcr, hackney, balham
+
+
+class ImportTests(TestCase):
+    def setUp(self):
+        self.tcr, self.hackney, self.balham = make_fixture_stations()
+
+    def test_stores_routes_on_main_records(self):
+        result = import_feed(load_feed(fixture_zip()), min_stations=1)
+
+        self.assertEqual(result.matched, 3)
+        self.tcr.refresh_from_db()
+        self.assertEqual(self.tcr.tfl_station_id, "HUBTCR")
+        self.assertEqual(self.tcr.step_free_routes_published, date(2026, 10, 20))
+        self.assertIn(CENTRAL_EB, self.tcr.step_free_routes["platforms"])
+        self.assertIn("positions", self.tcr.step_free_routes["layout"])
+
+    def test_child_record_codes_match_to_the_parent(self):
+        self.tcr.hub_naptan_id = None
+        self.tcr.naptan_id = None
+        self.tcr.save()
+        child = make_station("Tottenham Court Road", naptan_id="910GTOTCTRD",
+                             crossrail=True, parent_station=self.tcr)
+
+        import_feed(load_feed(fixture_zip()), min_stations=1)
+
+        self.tcr.refresh_from_db()
+        child.refresh_from_db()
+        self.assertEqual(self.tcr.tfl_station_id, "HUBTCR")
+        self.assertIsNone(child.step_free_routes)
+
+    def test_name_match_when_no_code_matches(self):
+        self.hackney.naptan_id = "SOMETHING-ELSE"
+        self.hackney.save()
+
+        import_feed(load_feed(fixture_zip()), min_stations=1)
+
+        self.hackney.refresh_from_db()
+        self.assertEqual(self.hackney.tfl_station_id, "910GHAKNYNM")
+
+    def test_duplicate_records_store_on_the_lower_id(self):
+        duplicate = make_station("Balham", hub_naptan_id="HUBBAL", tube=True)
+
+        import_feed(load_feed(fixture_zip()), min_stations=1)
+
+        self.balham.refresh_from_db()
+        duplicate.refresh_from_db()
+        self.assertEqual(self.balham.tfl_station_id, "HUBBAL")
+        self.assertIsNone(duplicate.tfl_station_id)
+
+    def test_too_few_stations_aborts_and_keeps_old_data(self):
+        self.tcr.step_free_routes = {"old": True}
+        self.tcr.save()
+
+        with self.assertRaises(ImportAborted):
+            import_feed(load_feed(fixture_zip()), min_stations=200)
+
+        self.tcr.refresh_from_db()
+        self.assertEqual(self.tcr.step_free_routes, {"old": True})
+
+    def test_stations_missing_from_the_file_are_cleared(self):
+        gone = make_station("Old Street", hub_naptan_id="HUBOLD", tube=True,
+                            step_free_routes={"old": True}, tfl_station_id="HUBOLD")
+
+        result = import_feed(load_feed(fixture_zip()), min_stations=1)
+
+        gone.refresh_from_db()
+        self.assertIsNone(gone.step_free_routes)
+        self.assertIsNone(gone.tfl_station_id)
+        self.assertEqual(result.cleared, 1)
+
+
+@patch("stations.step_free.importer.MIN_STATIONS", 1)
+class ImportCommandTests(TestCase):
+    def setUp(self):
+        self.tcr, _, _ = make_fixture_stations()
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command("import_station_routes", *args, stdout=out)
+        return out.getvalue()
+
+    def test_downloads_and_imports(self):
+        with patch("stations.management.commands.import_station_routes.download_zip",
+                   return_value=fixture_zip()):
+            output = self.run_command()
+
+        self.assertIn("Imported step-free routes for 3 stations", output)
+        self.tcr.refresh_from_db()
+        self.assertEqual(self.tcr.tfl_station_id, "HUBTCR")
+
+    def test_unchanged_publish_date_skips_the_import(self):
+        self.tcr.step_free_routes_published = date(2026, 10, 20)
+        self.tcr.save()
+
+        with patch("stations.management.commands.import_station_routes.download_zip",
+                   return_value=fixture_zip()):
+            output = self.run_command()
+
+        self.assertIn("unchanged", output)
+        self.tcr.refresh_from_db()
+        self.assertIsNone(self.tcr.tfl_station_id)
+
+    def test_broken_file_fails_and_keeps_data(self):
+        self.tcr.step_free_routes = {"old": True}
+        self.tcr.save()
+
+        with patch("stations.management.commands.import_station_routes.download_zip",
+                   return_value=fixture_zip(skip={"Platforms.csv"})):
+            with self.assertRaises(CommandError):
+                self.run_command()
+
+        self.tcr.refresh_from_db()
+        self.assertEqual(self.tcr.step_free_routes, {"old": True})

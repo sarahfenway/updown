@@ -20,3 +20,8 @@
 #     worker-level timeout is ever a factor.
 
 */5 * * * * /usr/bin/flock -n /tmp/update_incidents.lock /opt/venv/bin/python -c "import os,requests; requests.post('http://127.0.0.1:8080/functions/update_incidents', data={'key': os.environ['FUNCTIONS_SECRET_KEY']}, timeout=(5, 170)).raise_for_status()"
+
+# Weekly, early Monday: re-import TfL's step-free route data if the file has
+# changed. Runs as its own short process (no ML model needed; a few MB of
+# memory). WORKDIR is /app, which ``python -m django`` needs on sys.path.
+23 4 * * 1 /usr/bin/flock -n /tmp/import_station_routes.lock sh -c 'cd /app && /opt/venv/bin/python -m django import_station_routes --settings=updown.settings'
