@@ -633,6 +633,26 @@ class StepFreePageTests(TestCase):
     def test_unknown_station_is_404(self):
         self.assertEqual(self.client.get("/step-free/nowhere/").status_code, 404)
 
+    def test_different_stations_with_one_name_each_get_a_page(self):
+        # Like the two Bethnal Greens (Central line; Weaver line): separate
+        # stations that happen to share a name.
+        feed = load_feed(fixture_zip())
+        make_station("Bethnal Green", tube=True, tfl_station_id="HUBTCR",
+                     step_free_routes=feed.stations["HUBTCR"])
+        make_station("Bethnal Green", overground=True, tfl_station_id="910GHAKNYNM",
+                     step_free_routes=feed.stations["910GHAKNYNM"])
+
+        index = self.client.get("/step-free/")
+        self.assertContains(index, "Bethnal Green (Central line, Elizabeth line, Northern line)")
+        self.assertContains(index, "Bethnal Green (Weaver line)")
+
+        tube = self.client.get("/step-free/bethnal-green-central-line/")
+        overground = self.client.get("/step-free/bethnal-green-weaver-line/")
+        self.assertContains(tube, "Central line – Eastbound Platform 2")
+        self.assertContains(overground, "Weaver line – Southbound Platform 1")
+        # The plain name still works, for links made before the suffix.
+        self.assertEqual(self.client.get("/step-free/bethnal-green/").status_code, 200)
+
     def test_station_without_route_data(self):
         make_station("Oval", hub_naptan_id="HUBOVL", tube=True)
         response = self.client.get("/step-free/oval/")
