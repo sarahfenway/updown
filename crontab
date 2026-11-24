@@ -20,3 +20,11 @@
 #     worker-level timeout is ever a factor.
 
 */5 * * * * /usr/bin/flock -n /tmp/update_incidents.lock /opt/venv/bin/python -c "import os,requests; requests.post('http://127.0.0.1:8080/functions/update_incidents', data={'key': os.environ['FUNCTIONS_SECRET_KEY']}, timeout=(5, 170)).raise_for_status()"
+
+# Weekly, early Monday: re-import TfL's step-free route data if the file has
+# changed. Like the update above, it POSTs to the running web process instead
+# of starting a second Django process: that would add ~100MB (Django setup
+# imports tweepy, atproto and the rest) on a 512MB machine, and it would
+# write to the database straight past the maintenance freeze, which works by
+# intercepting HTTP requests. The import itself takes a few seconds.
+23 4 * * 1 /usr/bin/flock -n /tmp/import_station_routes.lock /opt/venv/bin/python -c "import os,requests; requests.post('http://127.0.0.1:8080/functions/import_station_routes', data={'key': os.environ['FUNCTIONS_SECRET_KEY']}, timeout=(5, 170)).raise_for_status()"

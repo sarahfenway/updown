@@ -16,6 +16,7 @@ from incidents.views import (
 )
 from incidents.ratelimit import cache_api_incidents
 from pages.views import FAQPageView, PrivacyPageView
+from stations.views import ImportStationRoutesView, step_free_index, step_free_station
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -25,6 +26,7 @@ urlpatterns = [
     path("api/stations/", api_stations, name="stations"),
     path("problems.txt", alexa),
     path("functions/update_incidents", UpdateIncidentsView.as_view()),
+    path("functions/import_station_routes", ImportStationRoutesView.as_view()),
     path("functions/upload_model", UploadModelView.as_view()),
     path("api/training-data/", api_training_data, name="training_data"),
     path("api/incidents.tsv", incidents_tsv, name="incidents_tsv"),
@@ -32,4 +34,6 @@ urlpatterns = [
     path("privacy/", PrivacyPageView.as_view(), name="privacy"),
     path("stp/", stp, name="stp"),
     path("stats/", stats, name="stats"),
+    path("step-free/", step_free_index, name="step_free_index"),
+    path("step-free/<slug:slug>/", step_free_station, name="step_free_station"),
 ]

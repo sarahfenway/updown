@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+
+{% block title %}Step-free routes | {% endblock %}
+
+{% block head_extra %}<meta name="robots" content="noindex">{% endblock %}
+
+{% block content %}
+    <div class="row">
+        <div class="col-md-6 col-md-offset-3">
+            <h2>Step-free routes</h2>
+            <form method="get" action="/step-free/">
+                <label for="station">Choose a station</label>
+                <select id="station" name="station" class="form-control">
+                    {% for slug, name in options %}
+                        <option value="{{ slug }}">{{ name }}</option>
+                    {% endfor %}
+                </select>
+                <button type="submit" class="btn btn-default">Go</button>
+            </form>
+        </div>
+    </div>
+{% endblock %}

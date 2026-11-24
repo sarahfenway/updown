@@ -2468,6 +2468,8 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         with patch(
             "incidents.management.commands.update_incidents.check_tflv1"
         ) as check_tflv1_mock, patch(
+            "incidents.management.commands.update_incidents.update_broken_lifts"
+        ) as update_broken_lifts_mock, patch(
             "incidents.management.commands.update_incidents.consolidate_incidents"
         ) as consolidate_mock, patch(
             "incidents.management.commands.update_incidents.update_last_updated"
@@ -2475,6 +2477,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
             call_command("update_incidents", stdout=stdout)
 
         check_tflv1_mock.assert_called_once_with()
+        update_broken_lifts_mock.assert_called_once_with()
         consolidate_mock.assert_called_once_with()
         update_last_updated_mock.assert_called_once_with()
         self.assertIn("Successfully updated incident list", stdout.getvalue())
@@ -2482,6 +2485,8 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         with patch(
             "incidents.management.commands.update_incidents.check_tflv1",
             side_effect=Exception("boom"),
+        ), patch(
+            "incidents.management.commands.update_incidents.update_broken_lifts"
         ):
             with self.assertRaises(CommandError):
                 call_command("update_incidents")

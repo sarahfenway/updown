@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}{{ station.name }} step-free routes | {% endblock %}
+
+{% block head_extra %}
+<meta name="robots" content="noindex">
+<style>
+    /* Drawn at full size; the wrapper scrolls sideways when it doesn't fit,
+       so the labels stay readable on a phone instead of shrinking. */
+    .step-free-diagram { display: block; font-family: Montserrat, sans-serif; }
+    .step-free-diagram .band { stroke: #ddd; }
+    .step-free-diagram .band-label { font-size: 11px; fill: #666; }
+    .step-free-diagram .place { fill: #fff; stroke: #888; }
+    .step-free-diagram .entrance { stroke: #1c3f94; stroke-width: 2; }
+    .step-free-diagram .platform { fill: #eef3fb; stroke: #1c3f94; }
+    .step-free-diagram .box-label { font-size: 10px; fill: #222; }
+    .step-free-diagram .link { fill: none; stroke: #999; stroke-width: 2; }
+    .step-free-diagram .ramp { stroke-dasharray: 6 4; }
+    .step-free-diagram .lift { stroke: #1c3f94; }
+    .step-free-diagram .link-label { font-size: 10px; fill: #1c3f94; }
+    .step-free-diagram .broken { stroke: #c0392b; fill: none; }
+    .step-free-diagram .link-label.broken { fill: #c0392b; stroke: none; font-weight: bold; }
+    .step-free-diagram rect.on-route { fill: #fff6d6; stroke: #e0a800; stroke-width: 3; }
+    .step-free-diagram .link.on-route { stroke: #e0a800; stroke-width: 4; }
+    .diagram-scroll { overflow-x: auto; }
+</style>
+{% endblock %}
+
+{% block content %}
+    <div class="row">
+        <div class="col-md-8 col-md-offset-2">
+            <h2>{{ station.name }}</h2>
+
+            {% if issues %}
+                <h3>Current issues</h3>
+                {% for issue in issues %}
+                    <p>
+                        {% if issue.text %}{{ issue.main_text }}{% else %}There is no step free access at this station.{% endif %}
+                        {% if issue.additional_info %}<br><span class="issue-advice">{{ issue.additional_info }}</span>{% endif %}
+                    </p>
+                {% endfor %}
+            {% endif %}
+
+            {% if not routes %}
+                <p>TfL has not published step-free route data for this station.</p>
+            {% else %}
+                {% if not lift_status_known %}
+                    <p><strong>Live lift status is unavailable</strong>, so routes assume every lift is working.</p>
+                {% elif broken_names %}
+                    <p>Out of service now: {{ broken_names|join:", " }}.</p>
+                {% endif %}
+
+                <form method="get">
+                    <label for="platform">Route from the street to</label>
+                    <select id="platform" name="platform" class="form-control">
+                        {% for pid, label in platform_options %}
+                            <option value="{{ pid }}"{% if pid == chosen %} selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                    <button type="submit" class="btn btn-default">Show route</button>
+                </form>
+
+                {% if route %}
+                    <h3>{{ chosen_label }}</h3>
+                    {% if route.status == OK %}
+                        {% if route.unlinked_entrance %}
+                            <p>TfL's data has no step-free route from the street to this platform except through this entrance, and doesn't show a step-free way into the entrance itself. Check before you travel.</p>
+                        {% endif %}
+                        <ol>{% for step in route.steps %}<li>{{ step }}</li>{% endfor %}</ol>
+                    {% elif route.status == BLOCKED %}
+                        <p>No step-free route to this platform right now. Out of service: {{ route.blocking_lifts|join:", " }}.</p>
+                    {% elif route.status == NO_INFO %}
+                        <p>TfL hasn't published step-free route information for this platform.</p>
+                    {% else %}
+                        <p>TfL's data shows no step-free route to this platform.</p>
+                    {% endif %}
+                {% endif %}
+
+                <div class="diagram-scroll">{% include "step_free_diagram.svg.html" %}</div>
+            {% endif %}
+        </div>
+    </div>
+{% endblock %}

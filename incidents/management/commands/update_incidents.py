@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from incidents.models import Report, Incident
 from incidents.sources.tflapiv1 import check as check_tflv1
+from stations.step_free.broken_lifts import update_broken_lifts
 # from incidents.sources.tflapiv2 import check as check_tflv2
 from incidents.utils import send_tweet, update_last_updated, send_bluesky_messages
 from incidents.ml import predict_duration
@@ -238,6 +239,9 @@ class Command(BaseCommand):
             posts = _phase("consolidate", consolidate_incidents)
             _phase("social_posts", lambda: _send_pending_posts(posts))
             update_last_updated()
+            # Last, and it never raises: the step-free pages' lift status
+            # must not delay or stop the incident update.
+            _phase("lift_status", update_broken_lifts)
         except Exception as e:
             raise CommandError(f"Error updating incidents list: {e}")
 
