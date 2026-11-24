@@ -9,14 +9,24 @@ ROW_HEIGHT = 110
 BOX_WIDTH = 128
 BOX_HEIGHT = 44
 LEFT = 130   # room for the level labels
+RIGHT = 150  # room for lift labels that start in the last column
 TOP = 24
 LINE_CHARS = 20
-# Horizontal offsets from a box's centre for each lift lane in its column.
-LANE_OFFSETS = (0, -22, 22, -44, 44)
+# Lift lanes in a column sit this far apart, alternating either side of the
+# box centre: 0, -14, +14, -28, +28 ... They never wrap round, so every
+# lift in a column keeps a line of its own.
+LANE_STEP = 14
 LABEL_STAGGER = 13
 
 
+def _lane_offset(lane):
+    side = -1 if lane % 2 else 1
+    return side * ((lane + 1) // 2) * LANE_STEP
+
+
 def level_name(level):
+    if level is None:
+        return "No step-free route"
     if level == 0:
         return "Street level"
     count = abs(level)
@@ -69,6 +79,7 @@ def build_diagram(routes, broken_lift_ids=(), route=None):
     places = routes["places"]
     lanes = {}       # column -> lift ids, in the order first drawn
     labelled = set()  # lifts already labelled (a lift may have several links)
+    labels_below = {}  # upper place -> lift labels already placed under it
     lines = []
     for link in routes["links"]:
         if link["a"] not in positions or link["b"] not in positions:
@@ -80,35 +91,44 @@ def build_diagram(routes, broken_lift_ids=(), route=None):
             # Lifts read as vertical: down from the upper place, then across
             # to the lower one. Each lift in a column gets its own lane, so
             # long lifts don't run hidden along another lift's line.
-            top, bottom = sorted((link["a"], link["b"]), key=lambda pid: -places[pid]["level"])
+            top, bottom = sorted(
+                (link["a"], link["b"]),
+                key=lambda pid: -(places[pid]["level"] if places[pid]["level"] is not None else -99),
+            )
             (x1, y1), (x2, y2) = centre(top), centre(bottom)
             column = lanes.setdefault(positions[top][0], [])
             if lift_id not in column:
                 column.append(lift_id)
             lane = column.index(lift_id)
-            x = x1 + LANE_OFFSETS[lane % len(LANE_OFFSETS)]
+            x = x1 + _lane_offset(lane)
             points = f"{x:.0f},{y1:.0f} {x:.0f},{y2:.0f} {x2:.0f},{y2:.0f}"
+            if lift_id in broken:
+                classes.append("broken")
+            label_x = label_y = 0
             if lift_id not in labelled:
                 labelled.add(lift_id)
                 label = link["lift_name"]
                 if lift_id in broken:
                     label = f"{label} – out of service"
-            if lift_id in broken:
-                classes.append("broken")
-            # Labels go in the gap just below the upper box: a long lift's
-            # midpoint can fall behind a box on an in-between level.
-            # Neighbouring lanes are closer than a label is wide, so each
-            # lane's label sits a line lower than the previous lane's.
-            label_x = x + 4
-            label_y = y1 + BOX_HEIGHT / 2 + 14 + (lane % len(LANE_OFFSETS)) * LABEL_STAGGER
+                # Labels go in the gap just below the upper box (a long
+                # lift's midpoint can fall behind a box on an in-between
+                # level), each a line below the last one under that box.
+                stacked = labels_below.get(top, 0)
+                labels_below[top] = stacked + 1
+                label_x = x + 4
+                label_y = y1 + BOX_HEIGHT / 2 + 14 + stacked * LABEL_STAGGER
         else:
             (x1, y1), (x2, y2) = centre(link["a"]), centre(link["b"])
             points = f"{x1:.0f},{y1:.0f} {x2:.0f},{y2:.0f}"
             label_x, label_y = 0, 0
         if _link_key(link) in route_links:
             classes.append("on-route")
+        # The label's own classes: the line's "lift" class sets a stroke,
+        # which would outline the text.
+        label_cls = "link-label broken" if "broken" in classes else "link-label"
         lines.append({"points": points, "cls": " ".join(classes), "label": label,
-                      "lift": lift_id, "label_x": f"{label_x:.0f}", "label_y": f"{label_y:.0f}"})
+                      "label_cls": label_cls, "lift": lift_id,
+                      "label_x": f"{label_x:.0f}", "label_y": f"{label_y:.0f}"})
 
     boxes = []
     for pid, place in routes["places"].items():
@@ -126,6 +146,6 @@ def build_diagram(routes, broken_lift_ids=(), route=None):
             "lines": text_lines, "cls": " ".join(classes),
         })
 
-    width = LEFT + max(layout["columns"], 1) * COLUMN_WIDTH
+    width = LEFT + max(layout["columns"], 1) * COLUMN_WIDTH + RIGHT
     height = TOP + max(len(layout["levels"]), 1) * ROW_HEIGHT
     return {"width": width, "height": height, "bands": bands, "lines": lines, "boxes": boxes}

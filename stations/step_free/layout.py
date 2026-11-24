@@ -8,13 +8,17 @@ def compute_layout(places):
     ``kind`` and ``lon`` (float or None). The street node (kind "street")
     is not drawn. Rows run from the highest level to the lowest, so the
     street sits above anything below ground and below any footbridge.
-    Within a row, places run west to east by longitude.
+    Within a row, places run west to east by longitude. Places whose level
+    is None (platforms with no step-free link) go in a last row.
 
     Returns ``{"levels": [int, ...], "columns": int,
     "positions": {place_id: [column, row]}}``.
     """
     drawn = {pid: p for pid, p in places.items() if p["kind"] != "street"}
-    levels = sorted({p["level"] for p in drawn.values()}, reverse=True)
+    levels = sorted({p["level"] for p in drawn.values() if p["level"] is not None}, reverse=True)
+    # Platforms with no step-free link have no level: a last row of their own.
+    if any(p["level"] is None for p in drawn.values()):
+        levels.append(None)
     row_of = {level: row for row, level in enumerate(levels)}
 
     by_level = {}

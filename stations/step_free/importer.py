@@ -1,4 +1,4 @@
-"""Store TfL's step-free route data on our station records."""
+"""Store TfL's step-free route data against our station records."""
 
 import logging
 import re
@@ -9,7 +9,7 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import F, Max, Q
 
-from stations.models import Station
+from stations.models import Station, StationRoutes
 from stations.utils import cleanup_station_name
 
 from .tfl_data import FeedError, merge_routes
@@ -31,6 +31,8 @@ class ImportResult:
     matched: int
     unmatched: list = field(default_factory=list)
     cleared: int = 0
+    # Area codes with no readable name, so labels.py can be extended.
+    unnamed: list = field(default_factory=list)
 
 
 def covered_main_records():
@@ -43,7 +45,7 @@ def covered_main_records():
 
 
 def last_published():
-    return Station.objects.aggregate(latest=Max("step_free_routes_published"))["latest"]
+    return StationRoutes.objects.aggregate(latest=Max("published"))["latest"]
 
 
 def download_zip():
@@ -52,11 +54,17 @@ def download_zip():
         for key, value in {"app_id": settings.TFL_API_ID, "app_key": settings.TFL_API_KEY}.items()
         if value
     }
-    response = requests.get(FEED_URL, params=params, timeout=(5, 60))
-    response.raise_for_status()
-    if len(response.content) > MAX_ZIP_BYTES:
-        raise FeedError("station data file is unexpectedly large")
-    return response.content
+    # Stream, so an unexpectedly huge response is refused before it is all
+    # in memory.
+    with requests.get(FEED_URL, params=params, timeout=(5, 60), stream=True) as response:
+        response.raise_for_status()
+        chunks, size = [], 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            size += len(chunk)
+            if size > MAX_ZIP_BYTES:
+                raise FeedError("station data file is unexpectedly large")
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _normalise(name):
@@ -70,7 +78,7 @@ def match_stations(feed):
     Codes first (TfL id, hub code, platform and stop-area NaPTANs against
     our naptan_id/hub_naptan_id on the main record or any child), then a
     unique normalised name. Where two of our main records are the same
-    station, the lower pk wins.
+    station, the lower pk wins and the other is logged.
 
     Returns ``({main pk: [tfl id, ...]}, [unmatched tfl id, ...])``. Several
     TfL stations map to one record when they share our codes (West
@@ -86,8 +94,11 @@ def match_stations(feed):
         main_pk = station.pk if station.pk in main_pks else station.parent_station_id
         for code in (station.naptan_id, station.hub_naptan_id):
             if code:
-                by_code.setdefault(code, main_pk)
-                by_code[code] = min(by_code[code], main_pk)
+                by_code.setdefault(code, set()).add(main_pk)
+    for code, pks in sorted(by_code.items()):
+        if len(pks) > 1:
+            logger.warning("Stations %s share code %s; using %s",
+                           ", ".join(map(str, sorted(pks))), code, min(pks))
 
     by_name = {}
     for station in mains:
@@ -97,7 +108,7 @@ def match_stations(feed):
     by_name_only = []
     unmatched = []
     for tfl_id in sorted(feed.stations):
-        hits = [by_code[code] for code in feed.codes[tfl_id] if code in by_code]
+        hits = [min(by_code[code]) for code in feed.codes[tfl_id] if code in by_code]
         if hits:
             matches.setdefault(min(hits), []).append(tfl_id)
         else:
@@ -131,25 +142,24 @@ def import_feed(feed, min_stations=None):
         for place in routes["places"].values()
         if place["kind"] == "place" and place["name"] == place["code"]
     })
-    if unnamed:
-        logger.info("No readable name for %d area codes: %s", len(unnamed), ", ".join(unnamed))
-    if unmatched:
-        logger.info("TfL stations with no matching station: %s", ", ".join(unmatched))
 
     with transaction.atomic():
-        cleared = (
-            Station.objects.exclude(pk__in=matches)
-            .filter(Q(step_free_routes__isnull=False) | Q(tfl_station_id__isnull=False))
-            .update(step_free_routes=None, step_free_routes_published=None, tfl_station_id=None)
-        )
+        cleared, _ = StationRoutes.objects.exclude(station_id__in=matches).delete()
         for pk, tfl_ids in matches.items():
             if len(tfl_ids) == 1:
                 routes = feed.stations[tfl_ids[0]]
             else:
                 routes = merge_routes([feed.stations[tfl_id] for tfl_id in tfl_ids])
-            Station.objects.filter(pk=pk).update(
-                step_free_routes=routes,
-                step_free_routes_published=feed.published,
-                tfl_station_id=routes["tfl_id"],
+            # broken_lift_ids is left alone; the next lift-status run
+            # recomputes it against the new data.
+            StationRoutes.objects.update_or_create(
+                station_id=pk,
+                defaults={
+                    "tfl_station_id": routes["tfl_id"],
+                    "tfl_ids": routes["tfl_ids"],
+                    "published": feed.published,
+                    "data": routes,
+                },
             )
-    return ImportResult(matched=len(matches), unmatched=unmatched, cleared=cleared)
+    return ImportResult(matched=len(matches), unmatched=unmatched, cleared=cleared,
+                        unnamed=unnamed)

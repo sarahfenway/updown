@@ -38,7 +38,7 @@ class Command(BaseCommand):
             raise CommandError(f"Could not read station data ({type(exc).__name__})")
 
         if not options.get("force") and published == last_published():
-            self.stdout.write(f"Station data unchanged (published {published})")
+            self.stdout.write(f"Station data unchanged (published {published:%Y-%m-%d %H:%M})")
             return
 
         try:
@@ -47,8 +47,17 @@ class Command(BaseCommand):
             logger.warning("Station data import aborted: %s", exc)
             raise CommandError(f"Import aborted: {exc}")
 
+        # Printed rather than logged at INFO, which production's logging
+        # config drops: these lists are how unmatched stations and unnamed
+        # area codes get noticed and fixed.
         self.stdout.write(self.style.SUCCESS(
             f"Imported step-free routes for {result.matched} stations "
-            f"(published {published}; {result.cleared} cleared; "
+            f"(published {published:%Y-%m-%d %H:%M}; {result.cleared} cleared; "
             f"{len(result.unmatched)} TfL stations unmatched)"
         ))
+        if result.unmatched:
+            self.stdout.write(f"TfL stations with no matching station: {', '.join(result.unmatched)}")
+        if result.unnamed:
+            self.stdout.write(
+                f"No readable name for {len(result.unnamed)} area codes: {', '.join(result.unnamed)}"
+            )

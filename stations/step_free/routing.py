@@ -11,6 +11,7 @@ LINK_COST = 1
 OK = "ok"            # a route exists right now
 BLOCKED = "blocked"  # routes exist, but broken lifts block all of them
 NO_ROUTE = "none"    # TfL's data has no step-free route at all
+NO_INFO = "unknown"  # no route, and TfL hasn't surveyed this platform
 
 
 @dataclass
@@ -20,10 +21,13 @@ class RouteResult:
     links: list = field(default_factory=list)    # link dicts, in order
     steps: list = field(default_factory=list)    # readable directions
     blocking_lifts: list = field(default_factory=list)  # lift names
+    # True when the route starts at an entrance TfL's data doesn't link to
+    # the street (only used when no route from the street exists).
+    unlinked_entrance: bool = False
 
 
-def _search(routes, platform_id, broken):
-    """Dijkstra from every start. Returns (places, links) or None.
+def _search(routes, starts, platform_id, broken):
+    """Dijkstra from ``starts``. Returns (places, links) or None.
 
     The search state is (place, lift we arrived in), so staying in the same
     lift through an intermediate stop costs one lift, not two. Ties are
@@ -41,7 +45,7 @@ def _search(routes, platform_id, broken):
     best = {}
     previous = {}
     heap = []
-    for start in routes["starts"]:
+    for start in starts:
         state = (start, "")
         best[state] = 0
         heapq.heappush(heap, (0, state))
@@ -79,16 +83,34 @@ def _search(routes, platform_id, broken):
     return [node for node, _ in states], links
 
 
+def _search_from_street_first(routes, platform_id, broken):
+    """(places, links, unlinked) or None.
+
+    ``starts`` is the street node, then any street-level entrances TfL's
+    data doesn't link to the street. Those may have steps in reality (the
+    file holds step-free links only), so they are used only when the street
+    itself has no route — never because they are a link shorter.
+    """
+    street = [start for start in routes["starts"] if routes["places"][start]["kind"] == "street"]
+    found = _search(routes, street, platform_id, broken)
+    if found:
+        return (*found, False)
+    found = _search(routes, routes["starts"], platform_id, broken)
+    return (*found, True) if found else None
+
+
 def find_route(routes, platform_id, broken_lift_ids=()):
     """Route from the street to ``platform_id``, avoiding broken lifts."""
     broken = set(broken_lift_ids)
-    found = _search(routes, platform_id, broken)
+    found = _search_from_street_first(routes, platform_id, broken)
     if found:
-        places, links = found
-        return RouteResult(OK, places, links, describe(routes, places, links))
-    unblocked = _search(routes, platform_id, set())
+        places, links, unlinked = found
+        return RouteResult(OK, places, links, describe(routes, places, links),
+                           unlinked_entrance=unlinked)
+    unblocked = _search_from_street_first(routes, platform_id, set())
     if not unblocked:
-        return RouteResult(NO_ROUTE)
+        surveyed = routes["platforms"][platform_id].get("route_info", True)
+        return RouteResult(NO_ROUTE if surveyed else NO_INFO)
     names = []
     for link in unblocked[1]:
         if link["kind"] == "lift" and link["lift_id"] in broken and link["lift_name"] not in names:
@@ -111,8 +133,13 @@ def describe(routes, places, links):
     if info[places[0]]["kind"] == "street":
         if not links:
             return steps
-        steps.append(f"Enter at {info[places[1]]['name']}")
-        index = 1
+        if links[0]["kind"] == "walkway":
+            steps.append(f"Enter at {info[places[1]]['name']}")
+            index = 1
+        else:
+            # A lift or ramp straight from the street: describe it as a step
+            # of its own rather than folding it into "Enter at".
+            steps.append("Start at street level")
     else:
         steps.append(f"Enter at {info[places[0]]['name']}")
 

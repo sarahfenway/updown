@@ -63,18 +63,6 @@ class Station(models.Model):
         "stations.Station", on_delete=models.DO_NOTHING, null=True, blank=True
     )
 
-    # Step-free route data from TfL's station data file, stored on the
-    # station's main record by the weekly ``import_station_routes`` command.
-    step_free_routes = models.JSONField(null=True, blank=True)
-    step_free_routes_published = models.DateField(null=True, blank=True)
-    tfl_station_id = models.CharField(
-        max_length=32, null=True, blank=True, db_index=True,
-        verbose_name="TfL station id",
-    )
-    # Live lift status, refreshed by every update_incidents run.
-    broken_lift_ids = models.JSONField(null=True, blank=True)
-    broken_lifts_checked_at = models.DateTimeField(null=True, blank=True)
-
     def __str__(self):
         return self.name
 
@@ -84,3 +72,37 @@ class Station(models.Model):
             models.Index(fields=["naptan_id"], name="station_naptan_idx"),
             models.Index(fields=["hub_naptan_id"], name="station_hub_naptan_idx"),
         ]
+
+
+class StationRoutes(models.Model):
+    """Step-free route data for one station, from TfL's station data file.
+
+    Kept off ``Station`` on purpose: station rows are loaded on every page
+    and API request (incidents select_related them), and this JSON is
+    3–22 KB per station. Written by the weekly ``import_station_routes``.
+    """
+
+    station = models.OneToOneField(
+        Station, on_delete=models.CASCADE, primary_key=True, related_name="step_free"
+    )
+    tfl_station_id = models.CharField(max_length=32, db_index=True, verbose_name="TfL station id")
+    # Every TfL station merged into this one (see tfl_data.merge_routes).
+    tfl_ids = models.JSONField(default=list)
+    # FeedStartDate of the TfL file this came from.
+    published = models.DateTimeField()
+    data = models.JSONField()
+    # Lift ids TfL reports out of service here. Written only when it changes.
+    broken_lift_ids = models.JSONField(default=list)
+
+    def __str__(self):
+        return f"Step-free routes for {self.station}"
+
+
+class LiftStatusCheck(models.Model):
+    """When TfL's lift feed was last read successfully. One row (pk 1).
+
+    A single timestamp instead of one per station, so a 5-minute run that
+    finds no change writes one small row, not ~420 large ones.
+    """
+
+    checked_at = models.DateTimeField()

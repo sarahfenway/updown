@@ -5,11 +5,13 @@ It describes each station as places joined by step-free links only (level
 walkways, ramps and lifts). This module is pure: bytes in, plain dicts out.
 """
 
+import copy
 import csv
 import io
 import zipfile
+import zlib
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime, timezone
 
 from .labels import is_dropped, place_label
 from .layout import compute_layout
@@ -57,13 +59,16 @@ LINE_NAMES = {
 }
 
 
+MAX_UNPACKED_BYTES = 50 * 1024 * 1024
+
+
 class FeedError(Exception):
     """The file is missing, unreadable or incomplete."""
 
 
 @dataclass
 class Feed:
-    published: date
+    published: datetime  # FeedStartDate, timezone-aware
     # tfl station id -> route dict (see build_feed for its shape)
     stations: dict = field(default_factory=dict)
     # tfl station id -> every NaPTAN-style code that identifies it
@@ -80,9 +85,17 @@ def read_zip(data):
     missing = [name for name in REQUIRED_FILES if name not in names]
     if missing:
         raise FeedError(f"missing {', '.join(missing)}")
+    # The real file unpacks to about 1.3 MB; refuse anything absurd before
+    # reading it into memory.
+    if sum(archive.getinfo(name).file_size for name in REQUIRED_FILES) > MAX_UNPACKED_BYTES:
+        raise FeedError("station data files are unexpectedly large")
     tables = {}
     for name in REQUIRED_FILES:
-        text = archive.read(name).decode("utf-8-sig")
+        try:
+            text = archive.read(name).decode("utf-8-sig")
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError,
+                RuntimeError, UnicodeDecodeError) as exc:
+            raise FeedError(f"can't read {name} ({type(exc).__name__})") from exc
         tables[name] = list(csv.DictReader(io.StringIO(text)))
     return tables
 
@@ -90,9 +103,11 @@ def read_zip(data):
 def read_published(tables):
     rows = tables["FeedInfo.csv"]
     try:
-        return datetime.fromisoformat(rows[0]["FeedStartDate"].strip()).date()
-    except (IndexError, KeyError, ValueError) as exc:
+        published = datetime.fromisoformat(rows[0]["FeedStartDate"].strip())
+    except (IndexError, KeyError, ValueError, AttributeError, TypeError) as exc:
         raise FeedError("FeedInfo.csv has no readable FeedStartDate") from exc
+    # The whole timestamp, not just the date, so a same-day republish is seen.
+    return published if published.tzinfo else published.replace(tzinfo=timezone.utc)
 
 
 def load_feed(data):
@@ -119,7 +134,9 @@ def _range(low, high):
 def build_feed(tables):
     try:
         return _build_feed(tables)
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, AttributeError, TypeError) as exc:
+        # AttributeError/TypeError: csv fills a short row's missing fields
+        # with None.
         raise FeedError(f"unexpected file contents: {exc!r}") from exc
 
 
@@ -143,11 +160,11 @@ def _build_feed(tables):
         if sid not in places or is_dropped(code):
             continue
         pid = row["UniqueId"].strip()
-        lon = row.get("Lon", "").strip()
+        lon = (row.get("Lon") or "").strip()
         places[sid][pid] = {
-            "name": None, "level": int(row["Level"].strip() or 0), "kind": "place",
+            "name": None, "level": int((row["Level"] or "").strip() or 0), "kind": "place",
             "lon": float(lon) if lon else None, "code": code,
-            "area_id": row.get("AreaId", "").strip(),
+            "area_id": (row.get("AreaId") or "").strip(),
         }
         node_station[pid] = sid
 
@@ -196,6 +213,9 @@ def _build_feed(tables):
             "gap": gap,
             "manual_ramp": manual_ramp,
             "entrance": (row.get("AccessibleEntranceName") or "").strip() or None,
+            # False where TfL hasn't surveyed the platform: "no route" then
+            # means "no information", not "not step-free".
+            "route_info": _true(row.get("HasStepFreeRouteInformation")),
         }
         places[sid][pid] = {"name": name, "level": None, "kind": "platform",
                             "lon": None, "code": "", "area_id": ""}
@@ -220,9 +240,10 @@ def _build_feed(tables):
         add(row["From"], row["To"], "walkway")
     for row in tables["RampRoutes.csv"]:
         add(row["From"], row["To"], "ramp")
-    for row in tables["Lifts.csv"]:
+    for number, row in enumerate(tables["Lifts.csv"]):
         lift = {
-            "id": row["LiftUniqueId"].strip(),
+            # A blank id would read as "not in a lift" to the route search.
+            "id": (row["LiftUniqueId"] or "").strip() or f"{row['StationUniqueId'].strip()}-lift-row{number}",
             "name": (row.get("FriendlyName") or "").strip() or (row.get("LiftName") or "").strip() or "Lift",
             "small": _true(row.get("LimitedCapacityLift")),
         }
@@ -244,11 +265,25 @@ def _build_feed(tables):
             neighbours.setdefault(link["a"], []).append((link["b"], link["kind"]))
             neighbours.setdefault(link["b"], []).append((link["a"], link["kind"]))
 
-        # Platforms take the level and longitude of the place they open onto.
+        # Platforms take the level and longitude of the place they open onto:
+        # a walkway neighbour first, then any linked place, then a linked
+        # platform. TfL's file has step-free links only, so a platform with
+        # no step-free access has no links at all: it gets no level (None)
+        # and the diagram shows it apart, not on the street row.
+        unplaced = []
         for pid in platforms[sid]:
+            linked = [(kind != "walkway", station_places[n]) for n, kind in neighbours.get(pid, [])
+                      if station_places[n]["kind"] == "place"]
+            linked.sort(key=lambda item: item[0])
+            if linked:
+                station_places[pid]["level"] = linked[0][1]["level"]
+                station_places[pid]["lon"] = linked[0][1]["lon"]
+            else:
+                unplaced.append(pid)
+        for pid in unplaced:
             near = [station_places[n] for n, kind in neighbours.get(pid, [])
-                    if kind == "walkway" and station_places[n]["kind"] == "place"]
-            station_places[pid]["level"] = near[0]["level"] if near else 0
+                    if station_places[n]["kind"] == "platform" and station_places[n]["level"] is not None]
+            station_places[pid]["level"] = near[0]["level"] if near else None
             station_places[pid]["lon"] = near[0]["lon"] if near else None
 
         # Places reached straight from the street are entrances.
@@ -265,6 +300,15 @@ def _build_feed(tables):
             station_places[pid]["kind"] = "entrance"
 
         _name_places(station_places)
+        # Different lines can share a platform name ("Westbound Platform 1"
+        # at Heathrow Terminals 2 & 3): add the line where names repeat.
+        counts = {}
+        for pid in platforms[sid]:
+            counts[station_places[pid]["name"]] = counts.get(station_places[pid]["name"], 0) + 1
+        for pid, platform in platforms[sid].items():
+            if counts[station_places[pid]["name"]] > 1:
+                station_places[pid]["name"] = f"{platform['name']} ({', '.join(platform['lines'])})"
+        _number_repeats(station_places)
         stations[sid] = {
             "tfl_id": sid,
             "tfl_ids": [sid],
@@ -287,19 +331,42 @@ def merge_routes(routes_list):
     code (West Hampstead's Tube and Overground). We count it as one station,
     so their places, links, platforms and starts are combined. They share no
     links, so each part keeps its own street node and routes.
+
+    Names are unique within each part, not across them, so where parts
+    repeat a place or lift name ("Lift 1", "Ticket hall") the name gets the
+    part's lines added. The parts are copied, never changed in place.
     """
-    routes_list = sorted(routes_list, key=lambda routes: routes["tfl_id"])
+    parts = sorted((copy.deepcopy(routes) for routes in routes_list),
+                   key=lambda routes: routes["tfl_id"])
+
+    def part_label(routes):
+        lines = sorted({line for p in routes["platforms"].values() for line in p["lines"]})
+        return ", ".join(lines) or routes["tfl_id"]
+
+    place_names, lift_names = {}, {}
+    for routes in parts:
+        for name in {p["name"] for p in routes["places"].values() if p["kind"] != "street"}:
+            place_names[name] = place_names.get(name, 0) + 1
+        for name in {link["lift_name"] for link in routes["links"] if link["kind"] == "lift"}:
+            lift_names[name] = lift_names.get(name, 0) + 1
+
     places, links, platforms, starts = {}, [], {}, []
-    for routes in routes_list:
+    for routes in parts:
+        label = part_label(routes)
+        for place in routes["places"].values():
+            if place["kind"] != "street" and place_names[place["name"]] > 1:
+                place["name"] = f"{place['name']} – {label}"
+        for link in routes["links"]:
+            if link["kind"] == "lift" and lift_names[link["lift_name"]] > 1:
+                link["lift_name"] = f"{link['lift_name']} – {label}"
         places.update(routes["places"])
         links.extend(routes["links"])
         platforms.update(routes["platforms"])
         starts.extend(routes["starts"])
-    _name_places(places)
     return {
-        "tfl_id": routes_list[0]["tfl_id"],
-        "tfl_ids": [routes["tfl_id"] for routes in routes_list],
-        "name": routes_list[0]["name"],
+        "tfl_id": parts[0]["tfl_id"],
+        "tfl_ids": [routes["tfl_id"] for routes in parts],
+        "name": parts[0]["name"],
         "places": places,
         "links": links,
         "platforms": platforms,
@@ -316,18 +383,34 @@ def _name_places(station_places):
             continue
         label = place_label(place["code"])
         if label is None:
-            label = f"Entrance ({place['code']})" if place["kind"] == "entrance" else place["code"]
-            place["name"] = label
+            base = f"Entrance ({place['code']})" if place["kind"] == "entrance" else place["code"]
+        else:
+            base = label
+        place["name"] = base
+        groups.setdefault(base, []).append((pid, label))
+    for base, members in groups.items():
+        if len(members) < 2:
             continue
-        place["name"] = label
-        groups.setdefault(label, []).append(pid)
-    for label, ids in groups.items():
-        if len(ids) < 2:
-            continue
-        codes = [station_places[pid]["code"] for pid in ids]
-        for pid in ids:
+        codes = [station_places[pid]["code"] for pid, _ in members]
+        for pid, label in members:
             place = station_places[pid]
-            suffix = place["code"]
-            if codes.count(place["code"]) > 1:
-                suffix = f"{place['code']} {place['area_id']}"
-            place["name"] = f"{label} ({suffix})"
+            unique_code = codes.count(place["code"]) == 1
+            detail = place["code"] if unique_code else f"{place['code']} {place['area_id']}"
+            if label is not None:
+                place["name"] = f"{label} ({detail})"
+            elif place["kind"] == "entrance":
+                place["name"] = f"Entrance ({place['code']} {place['area_id']})"
+            else:
+                place["name"] = f"{place['code']} {place['area_id']}"
+
+
+def _number_repeats(station_places):
+    """Last resort: TfL occasionally repeats a code and area id in one
+    station, so number whatever names still repeat."""
+    seen = {}
+    for place in station_places.values():
+        if place["kind"] == "street":
+            continue
+        seen[place["name"]] = seen.get(place["name"], 0) + 1
+        if seen[place["name"]] > 1:
+            place["name"] = f"{place['name']} #{seen[place['name']]}"

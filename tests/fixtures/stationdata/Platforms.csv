@@ -1,0 +1,13 @@
+UniqueId,StationUniqueId,PlatformNumber,CardinalDirection,PlatformNaptanCode,FriendlyName,IsCustomerFacing,HasServiceInterchange,AccessibleEntranceName,HasStepFreeRouteInformation
+HUBEXC-Plat01-WB-central,HUBEXC,1,Westbound,9400ZZLUEXC1,Westbound Platform 1,TRUE,FALSE,,TRUE
+HUBEXC-Plat02-EB-central,HUBEXC,2,Eastbound,9400ZZLUEXC2,Eastbound Platform 2,TRUE,FALSE,,TRUE
+HUBEXC-Plat03-NB-northern,HUBEXC,3,Northbound,9400ZZLUEXC3,Northbound Platform 3,TRUE,FALSE,,TRUE
+HUBEXC-Plat04-SB-northern,HUBEXC,4,Southbound,9400ZZLUEXC4,Southbound Platform 4,TRUE,FALSE,,TRUE
+HUBEXC-PlatA-EB-elizabeth,HUBEXC,A,Eastbound,,Eastbound Platform A,TRUE,FALSE,,TRUE
+HUBEXC-PlatB-WB-elizabeth,HUBEXC,B,Westbound,,Westbound Platform B,TRUE,FALSE,,TRUE
+910GSMPLDN-Plat01-SB-london-overground|national-rail,910GSMPLDN,1,Southbound,,Southbound Platform 1,TRUE,FALSE,,TRUE
+910GSMPLDN-Plat02-NB-london-overground|national-rail,910GSMPLDN,2,Northbound,,Northbound Platform 2,TRUE,FALSE,,TRUE
+HUBTST-Plat01-NB-northern,HUBTST,1,Northbound,9400ZZLUTST1,Northbound Platform 1,TRUE,FALSE,,TRUE
+HUBTST-Plat02-SB-northern,HUBTST,2,Southbound,9400ZZLUTST2,Southbound Platform 2,TRUE,FALSE,,FALSE
+HUBTST-Plat01-SB-national-rail,HUBTST,1,Southbound,,Southbound Platform 1,TRUE,FALSE,,TRUE
+HUBTST-Plat02-NB-national-rail,HUBTST,2,Northbound,,Northbound Platform 2,TRUE,FALSE,,TRUE

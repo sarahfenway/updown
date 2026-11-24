@@ -8,7 +8,7 @@
     {% endfor %}
     {% for line in diagram.lines %}
         <polyline class="link {{ line.cls }}" points="{{ line.points }}"/>
-        {% if line.label %}<text class="link-label {{ line.cls }}" x="{{ line.label_x }}" y="{{ line.label_y }}">{{ line.label }}</text>{% endif %}
+        {% if line.label %}<text class="{{ line.label_cls }}" x="{{ line.label_x }}" y="{{ line.label_y }}">{{ line.label }}</text>{% endif %}
     {% endfor %}
     {% for box in diagram.boxes %}
         <rect class="{{ box.cls }}" x="{{ box.x }}" y="{{ box.y }}" width="{{ box.w }}" height="{{ box.h }}" rx="6"/>

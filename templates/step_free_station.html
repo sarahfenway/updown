@@ -33,7 +33,12 @@
 
             {% if issues %}
                 <h3>Current issues</h3>
-                {% for issue in issues %}<p>{{ issue.text }}</p>{% endfor %}
+                {% for issue in issues %}
+                    <p>
+                        {% if issue.text %}{{ issue.main_text }}{% else %}There is no step free access at this station.{% endif %}
+                        {% if issue.additional_info %}<br><span class="issue-advice">{{ issue.additional_info }}</span>{% endif %}
+                    </p>
+                {% endfor %}
             {% endif %}
 
             {% if not routes %}
@@ -58,9 +63,14 @@
                 {% if route %}
                     <h3>{{ chosen_label }}</h3>
                     {% if route.status == OK %}
+                        {% if route.unlinked_entrance %}
+                            <p>TfL's data has no step-free route from the street to this platform except through this entrance, and doesn't show a step-free way into the entrance itself. Check before you travel.</p>
+                        {% endif %}
                         <ol>{% for step in route.steps %}<li>{{ step }}</li>{% endfor %}</ol>
                     {% elif route.status == BLOCKED %}
                         <p>No step-free route to this platform right now. Out of service: {{ route.blocking_lifts|join:", " }}.</p>
+                    {% elif route.status == NO_INFO %}
+                        <p>TfL hasn't published step-free route information for this platform.</p>
                     {% else %}
                         <p>TfL's data shows no step-free route to this platform.</p>
                     {% endif %}

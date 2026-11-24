@@ -34,9 +34,8 @@ _RULES = [
      lambda m: f"{LINE_PREFIXES[m[1]]} line {DIRECTIONS[m[2]]} platform"),
     (re.compile(rf"^({_LINES})pl$"), lambda m: f"{LINE_PREFIXES[m[1]]} line platforms"),
     (re.compile(r"^(book|th$|.*bh$)"), lambda m: "Ticket hall"),
-    (re.compile(r"^(bakerl|centr|circl|distr|hamme|jubil|metro|north|picca|victo)"),
-     lambda m: f"{LINE_WORDS[m[1]]} line level"),
-    (re.compile(r"^(i?ent|entr|[a-z][-+])"), lambda m: "Entrance"),
+    # "ent" anywhere: CEntr, MEntr, ELEnt, EntrW are entrances.
+    (re.compile(r"^(i?ent|[a-z][-+]|.*entr|.*ent$)"), lambda m: "Entrance"),
     (re.compile(r"^(upcon|up)$"), lambda m: "Upper concourse"),
     (re.compile(r"^locon$"), lambda m: "Lower concourse"),
     (re.compile(r"^micon$"), lambda m: "Middle concourse"),
@@ -44,8 +43,18 @@ _RULES = [
     (re.compile(r"^(fb|fbdg|footb|bridg|brdge)"), lambda m: "Footbridge"),
     (re.compile(r"^sub"), lambda m: "Subway"),
     (re.compile(r"^(rpl|rly|met$|dlr)"), lambda m: "Platform level"),
-    (re.compile(r"^el"), lambda m: "Elizabeth line level"),
+    # Only the Elizabeth line codes seen in TfL's file: ELVER, ELM or ELTH
+    # are other places that happen to start with EL.
+    (re.compile(r"^(elel|elwl|ell)$"), lambda m: "Elizabeth line level"),
 ]
+
+# TfL truncates line names to five or six letters for a line's level
+# ("Jubil", "Picca"). Matched whole and in TfL's capitalisation, so that
+# "CEntr" (an entrance) or "North" (a direction) aren't taken for lines.
+_LINE_WORD_CODE = re.compile(
+    r"(Bakerl|Centr|Circl|Distr|Hamme|Jubil|Metro|Picca|Victo)"
+    r"|(BAKERL|CENTR|CIRCL|DISTR|HAMME|JUBIL|METRO|PICCA|VICTO)"
+)
 
 
 def is_dropped(code):
@@ -55,6 +64,9 @@ def is_dropped(code):
 
 def place_label(code):
     """Readable name for an area code, or None when we have no rule for it."""
+    match = _LINE_WORD_CODE.fullmatch(code.strip())
+    if match:
+        return f"{LINE_WORDS[match[0].lower()]} line level"
     key = code.strip().lower()
     for pattern, make in _RULES:
         match = pattern.match(key)

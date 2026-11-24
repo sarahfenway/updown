@@ -1,16 +1,24 @@
+import threading
 from datetime import timedelta
+from io import StringIO
 
+from django.core.management import CommandError, call_command
 from django.db.models import Q
-from django.http import Http404
+from django.http import Http404, HttpResponse, HttpResponseNotFound
 from django.shortcuts import redirect, render
 from django.utils import timezone
+from django.utils.decorators import method_decorator
 from django.utils.text import slugify
+from django.views import View
+from django.views.decorators.csrf import csrf_exempt
 
 from incidents.models import Incident
-from stations.models import Station
+from incidents.views import _request_functions_key, _valid_functions_key
+from stations.models import Station, StationRoutes
+from stations.step_free.broken_lifts import lift_status_checked_at
 from stations.step_free.diagram import build_diagram
 from stations.step_free.importer import covered_main_records
-from stations.step_free.routing import BLOCKED, NO_ROUTE, OK, find_route
+from stations.step_free.routing import BLOCKED, NO_INFO, NO_ROUTE, OK, find_route
 
 LIFT_STATUS_MAX_AGE = timedelta(minutes=30)
 
@@ -27,7 +35,8 @@ def _station_slugs():
     duplicate records of one station stay on one page.
     """
     groups = {}
-    for pk, name, tfl_id in covered_main_records().values_list("pk", "name", "tfl_station_id"):
+    rows = covered_main_records().values_list("pk", "name", "step_free__tfl_station_id")
+    for pk, name, tfl_id in rows:
         groups.setdefault(slugify(name), []).append((pk, name, tfl_id))
 
     lookup, listed = {}, []
@@ -43,8 +52,8 @@ def _station_slugs():
                 listed.append((base, name))
             continue
         platforms = dict(
-            Station.objects.filter(pk__in=[row_pk for row_pk, _ in with_data.values()])
-            .values_list("pk", "step_free_routes__platforms")
+            StationRoutes.objects.filter(pk__in=[row_pk for row_pk, _ in with_data.values()])
+            .values_list("pk", "data__platforms")
         )
         for tfl_id, (row_pk, row_name) in with_data.items():
             lines = sorted({line for p in (platforms.get(row_pk) or {}).values() for line in p["lines"]})
@@ -56,9 +65,11 @@ def _station_slugs():
 
 
 def step_free_index(request):
-    chosen = request.GET.get("station")
+    # A value with no letters or digits slugifies to "", which the
+    # station URL can't take; show the index instead of a 500.
+    chosen = slugify(request.GET.get("station") or "")
     if chosen:
-        return redirect("step_free_station", slug=slugify(chosen))
+        return redirect("step_free_station", slug=chosen)
     _, options = _station_slugs()
     return render(request, "step_free_index.html", {"options": options})
 
@@ -72,18 +83,27 @@ def _station_for_slug(slug):
 
 def step_free_station(request, slug):
     station = _station_for_slug(slug)
+    # The site has a few duplicate records of one station (same name); the
+    # page shows one, so take issues from the others too, but not from a
+    # different station that happens to share the name and has routes.
+    same_station = [
+        pk for pk, name, tfl_id in
+        covered_main_records().values_list("pk", "name", "step_free__tfl_station_id")
+        if slugify(name) == slugify(station.name) and (pk == station.pk or tfl_id is None)
+    ]
     issues = Incident.objects.filter(
-        Q(station=station) | Q(station__parent_station=station),
+        Q(station__in=same_station) | Q(station__parent_station__in=same_station),
         resolved=False,
         information=False,
     ).order_by("start_time")
-    context = {"station": station, "issues": issues, "routes": station.step_free_routes}
+    stored = StationRoutes.objects.filter(station=station).first()
+    routes = stored.data if stored else None
+    context = {"station": station, "issues": issues, "routes": routes}
 
-    routes = station.step_free_routes
     if routes:
-        checked = station.broken_lifts_checked_at
+        checked = lift_status_checked_at()
         known = checked is not None and timezone.now() - checked <= LIFT_STATUS_MAX_AGE
-        broken = (station.broken_lift_ids or []) if known else []
+        broken = (stored.broken_lift_ids or []) if known else []
         platform_id = request.GET.get("platform")
         route = find_route(routes, platform_id, broken) if platform_id in routes["platforms"] else None
         broken_names = sorted({
@@ -100,7 +120,38 @@ def step_free_station(request, slug):
             chosen=platform_id if route else None,
             chosen_label=routes["platforms"][platform_id]["label"] if route else None,
             route=route,
-            OK=OK, BLOCKED=BLOCKED, NO_ROUTE=NO_ROUTE,
+            OK=OK, BLOCKED=BLOCKED, NO_ROUTE=NO_ROUTE, NO_INFO=NO_INFO,
             diagram=build_diagram(routes, broken, route if route and route.status == OK else None),
         )
     return render(request, "step_free_station.html", context)
+
+
+_import_lock = threading.Lock()
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ImportStationRoutesView(View):
+    """Run the weekly step-free import inside the web process.
+
+    The cron POSTs here, as it does for update_incidents, rather than
+    starting a second Django process: that would add ~100MB on a 512MB
+    machine and would write to the database past the maintenance freeze,
+    which works by intercepting HTTP requests.
+    """
+
+    def post(self, request, *args, **kwargs):
+        if not _valid_functions_key(_request_functions_key(request, request.POST)):
+            return HttpResponseNotFound()
+        if not _import_lock.acquire(blocking=False):
+            return HttpResponse("import already running", status=409)
+        try:
+            out = StringIO()
+            call_command("import_station_routes", stdout=out)
+        except CommandError as exc:
+            return HttpResponse(f"import failed: {exc}", status=500, content_type="text/plain")
+        finally:
+            _import_lock.release()
+        # The command's report (unmatched stations, unnamed area codes) goes
+        # to the process's stdout, which Fly keeps in its logs.
+        print(out.getvalue(), end="", flush=True)
+        return HttpResponse(status=204)

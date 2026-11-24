@@ -235,11 +235,13 @@ class Command(BaseCommand):
 
         try:
             _phase("tfl_fetch", check_tflv1)
-            _phase("lift_status", update_broken_lifts)
             # check_tflv2()
             posts = _phase("consolidate", consolidate_incidents)
             _phase("social_posts", lambda: _send_pending_posts(posts))
             update_last_updated()
+            # Last, and it never raises: the step-free pages' lift status
+            # must not delay or stop the incident update.
+            _phase("lift_status", update_broken_lifts)
         except Exception as e:
             raise CommandError(f"Error updating incidents list: {e}")
 

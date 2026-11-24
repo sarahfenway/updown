@@ -3,15 +3,19 @@
 Uses TfL's v2 lift feed because it names lifts by the same ids as the
 station data file. This is separate from the incident sources, which are
 not changed.
+
+It runs as the last phase of every 5-minute update_incidents run, so it
+must never raise: an optional feed must not stop the incident update.
 """
 
 import logging
 
 import requests
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
-from stations.models import Station
+from stations.models import LiftStatusCheck, StationRoutes
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +23,32 @@ LIFTS_V2_URL = "https://api.tfl.gov.uk/Disruptions/Lifts/v2/"
 
 
 def update_broken_lifts():
+    """Store broken lift ids per station. Returns True if stored."""
+    try:
+        return _update_broken_lifts()
+    except Exception as exc:  # noqa: BLE001 - see module docstring
+        logger.warning("Lift status update failed (%s); keeping previous data",
+                       type(exc).__name__)
+        return False
+
+
+def _broken_by_station(payload):
+    """{TfL station id: {lift id, ...}}, skipping malformed items."""
+    broken = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        station_id = item.get("stationUniqueId")
+        lift_ids = item.get("disruptedLiftUniqueIds")
+        if not isinstance(station_id, str) or not isinstance(lift_ids, list):
+            continue
+        broken.setdefault(station_id.strip(), set()).update(
+            lift_id for lift_id in lift_ids if isinstance(lift_id, str)
+        )
+    return broken
+
+
+def _update_broken_lifts():
     params = {
         key: value
         for key, value in {"app_id": settings.TFL_API_ID, "app_key": settings.TFL_API_KEY}.items()
@@ -36,25 +66,23 @@ def update_broken_lifts():
                        type(exc).__name__)
         return False
 
-    broken = {}
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        station_id = (item.get("stationUniqueId") or "").strip()
-        broken.setdefault(station_id, set()).update(item.get("disruptedLiftUniqueIds") or [])
+    broken = _broken_by_station(payload)
 
-    # A station's route data can cover several TfL stations (see
-    # tfl_data.merge_routes). Read just that list, not the whole route JSON.
-    now = timezone.now()
-    stations = []
-    rows = Station.objects.filter(tfl_station_id__isnull=False).values_list(
-        "pk", "tfl_station_id", "step_free_routes__tfl_ids"
-    )
-    for pk, tfl_station_id, tfl_ids in rows:
-        lift_ids = set()
-        for tfl_id in tfl_ids or [tfl_station_id]:
-            lift_ids |= broken.get(tfl_id, set())
-        stations.append(Station(pk=pk, broken_lift_ids=sorted(lift_ids),
-                                broken_lifts_checked_at=now))
-    Station.objects.bulk_update(stations, ["broken_lift_ids", "broken_lifts_checked_at"])
+    # Only rows whose broken lifts changed are written, and freshness is one
+    # small row: rewriting every station each run would ship hundreds of
+    # pointless WAL pages to B2 every 5 minutes.
+    changed = []
+    for pk, tfl_ids, old in StationRoutes.objects.values_list("pk", "tfl_ids", "broken_lift_ids"):
+        new = sorted(set().union(*(broken.get(tfl_id, set()) for tfl_id in tfl_ids or [])))
+        if new != (old or []):
+            changed.append(StationRoutes(pk=pk, broken_lift_ids=new))
+    with transaction.atomic():
+        if changed:
+            StationRoutes.objects.bulk_update(changed, ["broken_lift_ids"])
+        LiftStatusCheck.objects.update_or_create(pk=1, defaults={"checked_at": timezone.now()})
     return True
+
+
+def lift_status_checked_at():
+    """When the lift feed was last read successfully, or None."""
+    return LiftStatusCheck.objects.filter(pk=1).values_list("checked_at", flat=True).first()
