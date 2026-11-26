@@ -33,7 +33,7 @@ on:
       max_long_bound_share:
         description: "Max share of dates two or more days away (0-1)"
         required: false
-        default: "0.35"
+        default: "0.25"
       max_regression:
         description: "Max allowed drop vs incumbent live accuracy (0-1)"
         required: false
@@ -75,6 +75,6 @@ jobs:
             --key "$FUNCTIONS_SECRET_KEY" \
             --min-boundary-accuracy "${{ github.event.inputs.min_boundary_accuracy || '0.78' }}" \
             --min-category-accuracy "${{ github.event.inputs.min_category_accuracy || '0.75' }}" \
-            --max-long-bound-share "${{ github.event.inputs.max_long_bound_share || '0.35' }}" \
+            --max-long-bound-share "${{ github.event.inputs.max_long_bound_share || '0.25' }}" \
             --max-regression "${{ github.event.inputs.max_regression || '0.05' }}" \
             ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
