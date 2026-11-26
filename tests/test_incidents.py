@@ -1132,7 +1132,7 @@ class PredictionFeatureTests(StationFactoryMixin, TestCase):
         ):
             duration, confidence = predict_duration(incident)
 
-        # Blended probs are [0.578, 0.422] over offsets [0, 1]. The 95%
+        # Blended probs are [0.578, 0.422] over offsets [0, 1]. The 80%
         # cumulative bound falls on offset 1, so the prediction is "fixed
         # by" the end of the next (evening) block: 20:00 BST minus a second,
         # from a 10:30 BST start. Confidence is the cumulative mass (~1.0,
@@ -1431,10 +1431,10 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         self.assertEqual(command._with_lock_retry("test operation", operation), "ok")
         sleep_mock.assert_called_once_with(0.1)
 
-    def test_prepare_incidents_only_shows_buckets_right_nine_times_in_ten(self):
+    def test_prepare_incidents_only_shows_buckets_right_three_times_in_four(self):
         parent = self.create_parent_station("Waterloo")
         self.create_track_record(parent, right=28, wrong=2, confidence=0.95)  # 93%
-        self.create_track_record(parent, right=26, wrong=4, confidence=0.85)  # 87%
+        self.create_track_record(parent, right=22, wrong=8, confidence=0.85)  # 73%
         weak = self.create_incident(
             parent,
             text="Weak bucket outage",
@@ -1478,11 +1478,12 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
             "buckets"
         ][90]
 
-    def test_display_rule_needs_thirty_predictions_and_ninety_percent_right(self):
+    def test_display_rule_needs_thirty_predictions_and_three_in_four_right(self):
         self.assertFalse(self._bucket(right=29, wrong=0)["show_prediction"])
         self.assertTrue(self._bucket(right=30, wrong=0)["show_prediction"])
-        self.assertTrue(self._bucket(right=27, wrong=3)["show_prediction"])
-        self.assertFalse(self._bucket(right=26, wrong=4)["show_prediction"])
+        self.assertTrue(self._bucket(right=23, wrong=7)["show_prediction"])
+        self.assertFalse(self._bucket(right=22, wrong=8)["show_prediction"])
+        self.assertEqual(self._bucket(right=23, wrong=7)["label"], "likely")
         self.assertEqual(self._bucket(right=27, wrong=3)["label"], "very likely")
         self.assertNotIn("lower_bound", self._bucket(right=27, wrong=3))
 
@@ -1495,7 +1496,9 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
 
         self.assertContains(response, "Right first time: 29 / 30 (97%)")
         self.assertContains(response, "at least 30 recent predictions")
-        self.assertContains(response, "at least 90% of them")
+        self.assertContains(response, "at least 75% of them")
+        self.assertContains(response, "right about 80 times in 100")
+        self.assertNotContains(response, "deliberately cautious")
         self.assertNotContains(response, "narrow exception")
 
     def test_prediction_display_policy_falls_back_when_recent_bucket_is_sparse(self):
@@ -3069,11 +3072,11 @@ class ExtendedDecodeTests(StationFactoryMixin, TestCase):
         self.assertEqual(duration, timedelta(hours=4, minutes=59, seconds=59))
         self.assertEqual(confidence, 0.95)
 
-    def test_aim_is_ninety_five_percent(self):
-        duration, _ = self._decode({0: 0.80, 1: 0.14, 2: 0.06})
-        # 0.94 at offset 1 is not enough; offset 2 is the overnight block,
-        # ending 05:00 local on 2 July.
-        self.assertEqual(duration, timedelta(hours=18, minutes=59, seconds=59))
+    def test_aim_is_eighty_percent(self):
+        duration, _ = self._decode({0: 0.79, 1: 0.14, 2: 0.07})
+        # 0.79 at offset 0 is not enough; offset 1 is the evening block,
+        # ending 20:00 local.
+        self.assertEqual(duration, timedelta(hours=9, minutes=59, seconds=59))
 
     def test_open_ended_class_without_a_tail_table_gives_no_prediction(self):
         self.assertEqual(self._decode({8: 1.0}), (None, None))
