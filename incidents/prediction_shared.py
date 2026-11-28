@@ -17,8 +17,11 @@ BLOCKS_PER_DAY = 4
 BLOCK_OVERNIGHT = 3
 
 # A prediction is the earliest block by which the fault is this likely to be
-# fixed. 0.95 measured about 96% right first time in the 2026-11 backtest.
-PREDICTION_COVERAGE_TARGET = 0.95
+# fixed. It was 0.95 for eleven days in 2026-11: right 96% of the time, but
+# about one fault in ten lasts two days or more, so nearly every date had to
+# be days away (a median 62 hours promised for faults that took 4.5). 0.80
+# trades some of that certainty for dates people can plan around.
+PREDICTION_COVERAGE_TARGET = 0.80
 
 # The tail table covers block offsets MAX_OFFSET_CLASS..TAIL_HORIZON_BLOCKS
 # (2 to 30 days). A category needs TAIL_MIN_COUNT long faults to have its own
@@ -57,9 +60,8 @@ def is_planned_work(text, information=False):
 
     Information notices and anything that states its own end ("until ...")
     need no prediction. Planned maintenance is left out because it cannot be
-    predicted well: in the 2026-11 retrain design it was right first time
-    only 88% of the time even with dates eleven days out, below the 90% bar
-    for anything shown.
+    predicted well: in the 2026-11 retrain design even dates eleven days out
+    were right first time only 88% of the time.
     """
     text = (text or "").lower()
     return bool(information) or "planned" in text or "until " in text

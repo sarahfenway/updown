@@ -134,3 +134,8 @@ def test_round_up_to_service_day():
     assert shared.round_up_to_service_day(start_block_index=1, offset=8) == 10
     assert shared.round_up_to_service_day(start_block_index=1, offset=10) == 10
     assert shared.round_up_to_service_day(start_block_index=3, offset=9) == 12
+
+
+def test_the_default_aim_is_eighty_percent():
+    # 0.79 falls just short of the aim; the next block reaches it.
+    assert shared.bound_offset([0.79, 0.81, 0.96]) == 1
