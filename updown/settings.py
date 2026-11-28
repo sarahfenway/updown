@@ -271,6 +271,11 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 TFL_API_ID = os.getenv("TFL_API_ID")
 TFL_API_KEY = os.getenv("TFL_API_KEY")
+# Also open and close issues from TfL's lift feed (incidents/sources/tflapiv2).
+# On by default. Set TFL_LIFT_FEED_AS_SOURCE=false to stop: the feed is still
+# recorded for per-lift history, and what it last listed is dropped six
+# hours later (sooner where the main feed agrees).
+TFL_LIFT_FEED_AS_SOURCE = os.getenv("TFL_LIFT_FEED_AS_SOURCE", "true").lower() != "false"
 
 # Authenticates the update/upload/training endpoints, one of which
 # ultimately joblib.loads (i.e. unpickles) an uploaded model — so a weak or

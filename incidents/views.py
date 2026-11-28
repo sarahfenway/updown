@@ -1386,6 +1386,9 @@ def api_training_data(request):
             incident_id=OuterRef("pk"),
             report__start_time__lte=OuterRef("start_time"),
         )
+        # The lift feed repeats the main feed; see
+        # incidents.ml.report_count_for_prediction.
+        .exclude(report__source=Report.SOURCE_TFLAPI_V2)
         .order_by()
         .values("incident_id")
         .annotate(count=Count("report_id"))

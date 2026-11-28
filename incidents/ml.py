@@ -618,6 +618,35 @@ def _history_features(incident, station, feature_text, start_time_local):
     return features
 
 
+
+def report_count_for_prediction(incident):
+    """How many reports the model is told an issue has.
+
+    Reports from TfL's lift feed are left out. That feed repeats the main
+    feed, so counting it would double the number for most lift faults from
+    the day it was switched on, and the model, trained on the main feed
+    alone, would read that as a different kind of fault. Never less than 1:
+    every issue the model has seen started from at least one report.
+    """
+    from incidents.models import Report
+
+    lift_feed = Report.SOURCE_TFLAPI_V2
+    if hasattr(incident, "prefetched_reports"):
+        count = sum(
+            1 for report in incident.prefetched_reports if report.source != lift_feed
+        )
+        return max(1, count)
+    if not incident.pk:
+        return 1
+    if hasattr(incident, "num_reports"):
+        count = incident.num_reports or 0
+    elif getattr(incident, "report_count", None) is not None:
+        count = incident.report_count
+    else:
+        return max(1, incident.reports.exclude(source=lift_feed).count())
+    return max(1, count - incident.reports.filter(source=lift_feed).count())
+
+
 def _incident_offset_probs(incident):
     """Build features for ``incident`` and return (model, probs, tail, category).
 
@@ -680,16 +709,7 @@ def _incident_offset_probs(incident):
             ]
             mean_offset = sum(offsets) / count
 
-    if hasattr(incident, "prefetched_reports"):
-        num_reports = len(incident.prefetched_reports)
-    elif hasattr(incident, "num_reports"):
-        num_reports = incident.num_reports or 0
-    elif getattr(incident, "report_count", None) is not None:
-        num_reports = incident.report_count
-    elif incident.pk:
-        num_reports = incident.reports.count()
-    else:
-        num_reports = 1
+    num_reports = report_count_for_prediction(incident)
 
     prev = (
         Incident.objects.filter(

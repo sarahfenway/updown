@@ -744,7 +744,8 @@ class BrokenLiftTests(TestCase):
         self.assertEqual(routes_of(self.bank).broken_lift_ids, ["HUBOTH-Lift-1"])
 
     def test_database_error_does_not_raise(self):
-        with lift_feed([]), patch.object(StationRoutes.objects, "values_list",
+        payload = [{"stationUniqueId": "HUBEXC", "disruptedLiftUniqueIds": ["HUBEXC-Lift-6"]}]
+        with lift_feed(payload), patch.object(StationRoutes.objects, "values_list",
                                          side_effect=OperationalError("database is locked")):
             self.assertFalse(update_broken_lifts())
 

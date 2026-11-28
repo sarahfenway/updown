@@ -1,17 +1,32 @@
+import logging
 import time
 from difflib import SequenceMatcher
 
+from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
-from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from incidents.models import Report, Incident
+from incidents.sources.helpers import (
+    FEED_SOURCES,
+    feeds_given_up,
+    stale_feed_sources,
+)
 from incidents.sources.tflapiv1 import check as check_tflv1
 from stations.step_free.broken_lifts import update_broken_lifts
-# from incidents.sources.tflapiv2 import check as check_tflv2
+from incidents.sources.tflapiv2 import check as check_tflv2
 from incidents.utils import send_tweet, update_last_updated, send_bluesky_messages
 from incidents.ml import predict_duration
+
+logger = logging.getLogger(__name__)
+
+# The most brand-new issues the lift feed may open in one run. It normally
+# repeats faults the main feed already lists, so more than this at once
+# means its wording has changed, not that this many lifts broke together.
+# Those reports are held back (no issue, no post) until they match an issue
+# or the feed drops them.
+LIFT_FEED_MAX_NEW_ISSUES = 3
 
 
 def refresh_prediction(incident):
@@ -44,6 +59,82 @@ def _attach_report(incident, report):
     incident.save(update_fields=["report_count"])
 
 
+def _matching_incident(report):
+    """The open issue at the report's station with near-identical text."""
+    incidents = Incident.objects.filter(
+        station=report.station.parent_station, resolved=False
+    )
+    for item in incidents:
+        # if the same report station and similar text, then same incident.
+        # autojunk must be off: for texts >=200 chars the default
+        # heuristic makes the ratio asymmetric and near-zero for
+        # near-identical strings (0.08 one way, 0.95 the other),
+        # which made this loop create a duplicate incident on
+        # every run instead of matching the existing one.
+        if (
+            SequenceMatcher(None, item.text, report.text, autojunk=False).ratio()
+            > 0.9
+        ):
+            return item
+    return None
+
+
+def _drop_reports_from_feeds_given_up(now):
+    """Close what a long-gone feed last listed; returns the issues affected.
+
+    Those issues then close in the usual way if nothing else lists them,
+    but without a "restored" post: we do not know the fault is fixed.
+    """
+    links = Incident.reports.through.objects
+    affected = set()
+    for source in feeds_given_up(now):
+        report_ids = list(
+            Report.objects.filter(source=source, resolved=False)
+            .order_by()
+            .values_list("pk", flat=True)
+        )
+        if not report_ids:
+            continue
+        affected.update(
+            links.filter(
+                report_id__in=report_ids, incident__resolved=False
+            ).values_list("incident_id", flat=True)
+        )
+        Report.objects.filter(pk__in=report_ids).update(resolved=True, end_time=now)
+        logger.warning(
+            "Gave up on feed %s: dropped %d open report(s)", source, len(report_ids)
+        )
+    return affected
+
+
+def _lift_feed_reports_to_hold(unresolved_reports):
+    """Lift-feed reports that would open too many new issues at once."""
+    lift_feed = [
+        report
+        for report in unresolved_reports
+        if report.source == Report.SOURCE_TFLAPI_V2
+    ]
+    if len(lift_feed) <= LIFT_FEED_MAX_NEW_ISSUES:
+        return set()
+    attached = set(
+        Incident.reports.through.objects.filter(
+            report_id__in=[report.pk for report in lift_feed]
+        ).values_list("report_id", flat=True)
+    )
+    unattached = [report for report in lift_feed if report.pk not in attached]
+    if len(unattached) <= LIFT_FEED_MAX_NEW_ISSUES:
+        return set()
+    new = {
+        report.pk for report in unattached if _matching_incident(report) is None
+    }
+    if len(new) <= LIFT_FEED_MAX_NEW_ISSUES:
+        return set()
+    logger.warning(
+        "Lift feed would open %d new issues at once; holding them back", len(new)
+    )
+    return new
+
+
 def consolidate_incidents():
     """Fold unresolved reports into incidents and detect resolutions.
 
@@ -57,6 +148,9 @@ def consolidate_incidents():
     prediction_incident_ids = set()
 
     with transaction.atomic():
+        now = timezone.now()
+        given_up_on = _drop_reports_from_feeds_given_up(now)
+
         # Take all the reports and consolidate them into incidents
         unresolved_reports = sorted(
             Report.objects.filter(resolved=False)
@@ -65,28 +159,11 @@ def consolidate_incidents():
             key=lambda report: (report.start_time, report.pk),
             reverse=True,
         )
+        held_back = _lift_feed_reports_to_hold(unresolved_reports)
         for report in unresolved_reports:
-            # Check if there is an incident for this station
-            incidents = Incident.objects.filter(
-                station=report.station.parent_station, resolved=False
-            )
-
-            incident = None
-            for item in incidents:
-                # if the same report station and similar text, then same incident.
-                # autojunk must be off: for texts >=200 chars the default
-                # heuristic makes the ratio asymmetric and near-zero for
-                # near-identical strings (0.08 one way, 0.95 the other),
-                # which made this loop create a duplicate incident on
-                # every run instead of matching the existing one.
-                if (
-                    SequenceMatcher(
-                        None, item.text, report.text, autojunk=False
-                    ).ratio()
-                    > 0.9
-                ):
-                    incident = item
-                    break
+            if report.pk in held_back:
+                continue
+            incident = _matching_incident(report)
 
             # A fault is predicted once, when it first appears. The first
             # date shown is the one we are scored on, so a later text edit
@@ -151,43 +228,77 @@ def consolidate_incidents():
             source=Report.SOURCE_USER, resolved=False, end_time__lt=timezone.now()
         ).update(resolved=True)
 
-        report_links = Incident.reports.through.objects.filter(
-            incident_id=OuterRef("pk")
-        )
-        unresolved_report_links = report_links.filter(report__resolved=False)
+        # An issue stays open while a feed we can read still lists it. A
+        # feed we cannot read (down, or switched off) never shows a fault
+        # leaving, so its open reports are set aside: see below.
+        stale_feeds = stale_feed_sources(now)
+        readable_feeds = set(FEED_SOURCES) - stale_feeds
+        links = Incident.reports.through.objects
+        listed = set()
+        unreadable_reports = {}
+        for incident_id, report_id, source in links.filter(
+            incident__resolved=False, report__resolved=False
+        ).values_list("incident_id", "report_id", "report__source"):
+            if source in stale_feeds:
+                unreadable_reports.setdefault(incident_id, []).append(report_id)
+            else:
+                listed.add(incident_id)
 
         unresolved_incidents = sorted(
             Incident.objects.filter(resolved=False)
             .order_by()
-            .select_related("station")
-            .annotate(has_unresolved_reports=Exists(unresolved_report_links)),
+            .select_related("station"),
             key=lambda incident: (incident.start_time, incident.pk),
             reverse=True,
         )
         for incident in unresolved_incidents:
             # Check if the incident has been resolved
-            if not incident.has_unresolved_reports:
-                incident.resolved = True
-                incident.end_time = timezone.now()
-                incident.save()
-
-                reports_count = (
-                    incident.report_count
-                    if incident.report_count is not None
-                    else incident.reports.count()
-                )
-                first_report_source = (
-                    incident.reports.order_by()
-                    .values_list("source", flat=True)
-                    .first()
-                )
-                if (
-                    reports_count > 1
-                    or first_report_source != Report.SOURCE_USER
+            if incident.pk in listed:
+                continue
+            held_by = unreadable_reports.get(incident.pk)
+            if held_by:
+                # Only an unreadable feed still lists this fault. Close it
+                # only on evidence: a feed we can read reported it too and
+                # has since dropped it. Without that we cannot know, so it
+                # stays open until the feed is back.
+                if not (
+                    readable_feeds
+                    and links.filter(
+                        incident_id=incident.pk,
+                        report__source__in=readable_feeds,
+                    ).exists()
                 ):
-                    pending_posts.append(
-                        f"Step free access has been restored at {incident.station.name}"
-                    )
+                    continue
+                # Close the unreadable feed's reports as well, or the next
+                # run would open a new issue from them.
+                Report.objects.filter(pk__in=held_by).update(
+                    resolved=True, end_time=now
+                )
+            incident.resolved = True
+            incident.end_time = now
+            incident.save()
+
+            reports_count = (
+                incident.report_count
+                if incident.report_count is not None
+                else incident.reports.count()
+            )
+            first_report_source = (
+                incident.reports.order_by()
+                .values_list("source", flat=True)
+                .first()
+            )
+            if incident.pk in given_up_on:
+                # Closed because its feed went away, not because we saw
+                # the fault end: nothing to announce.
+                continue
+            if (
+                reports_count > 1
+                or first_report_source != Report.SOURCE_USER
+            ):
+                pending_posts.append(
+                    f"Step free access has been restored at {incident.station.name}"
+                )
 
     for incident in (
         Incident.objects.filter(pk__in=prediction_incident_ids)
@@ -235,7 +346,8 @@ class Command(BaseCommand):
 
         try:
             _phase("tfl_fetch", check_tflv1)
-            # check_tflv2()
+            if settings.TFL_LIFT_FEED_AS_SOURCE:
+                _phase("tfl_lift_fetch", check_tflv2)
             posts = _phase("consolidate", consolidate_incidents)
             _phase("social_posts", lambda: _send_pending_posts(posts))
             update_last_updated()
