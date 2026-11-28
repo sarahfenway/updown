@@ -45,7 +45,9 @@ API = Limit("api", 120, 60)
 # Everything else: the pages, /stats/ and any unknown path.
 PAGES = Limit("pages", 60, 60)
 
-API_PATHS = frozenset({"/api/incidents/", "/api/stations/", "/problems.txt"})
+API_PATHS = frozenset(
+    {"/api/incidents/", "/api/escalators/", "/api/stations/", "/problems.txt"}
+)
 KEY_PROTECTED_PREFIXES = ("/functions/", "/api/training-data/")
 
 
@@ -185,6 +187,7 @@ API_INCIDENTS_CACHE_KEY = "response:api_incidents"
 # different response, so it gets its own entry.
 API_INCIDENTS_ALL_PREDICTIONS_CACHE_KEY = "response:api_incidents:all_predictions"
 API_INCIDENTS_CACHE_SECONDS = 60
+API_ESCALATORS_CACHE_KEY = "response:api_escalators"
 
 
 def _api_incidents_cache_key(request):
@@ -203,11 +206,20 @@ def cache_api_incidents(view):
     random query strings can't be used to bypass it.
     """
 
+    return _cache_response(view, _api_incidents_cache_key)
+
+
+def cache_api_escalators(view):
+    """Serve /api/escalators/ the same way. It reads no parameters."""
+    return _cache_response(view, lambda request: API_ESCALATORS_CACHE_KEY)
+
+
+def _cache_response(view, key_for):
     @wraps(view)
     def wrapped(request, *args, **kwargs):
         if request.method not in ("GET", "HEAD"):
             return view(request, *args, **kwargs)
-        key = _api_incidents_cache_key(request)
+        key = key_for(request)
         response = cache.get(key)
         if response is None:
             response = view(request, *args, **kwargs)
@@ -220,5 +232,9 @@ def cache_api_incidents(view):
 
 def invalidate_api_incidents_cache():
     cache.delete_many(
-        [API_INCIDENTS_CACHE_KEY, API_INCIDENTS_ALL_PREDICTIONS_CACHE_KEY]
+        [
+            API_INCIDENTS_CACHE_KEY,
+            API_INCIDENTS_ALL_PREDICTIONS_CACHE_KEY,
+            API_ESCALATORS_CACHE_KEY,
+        ]
     )

@@ -14,7 +14,8 @@ from incidents.views import (
     api_stations,
     api_training_data,
 )
-from incidents.ratelimit import cache_api_incidents
+from incidents.escalator_api import api_escalators
+from incidents.ratelimit import cache_api_escalators, cache_api_incidents
 from pages.views import FAQPageView, PrivacyPageView
 from stations.views import ImportStationRoutesView, step_free_index, step_free_station
 
@@ -23,6 +24,7 @@ urlpatterns = [
     path("", detail, name="home"),
     path("beta/", beta_detail, name="beta_home"),
     path("api/incidents/", cache_api_incidents(api_incidents), name="incidents"),
+    path("api/escalators/", cache_api_escalators(api_escalators), name="escalators"),
     path("api/stations/", api_stations, name="stations"),
     path("problems.txt", alexa),
     path("functions/update_incidents", UpdateIncidentsView.as_view()),
