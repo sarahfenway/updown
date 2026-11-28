@@ -32,6 +32,7 @@ from incidents.management.commands.update_incidents import consolidate_incidents
 from incidents.ml import predict_duration, prediction_outcome
 from incidents.models import Incident, MLModel, Report
 from incidents.sources import tflapiv1, tflapiv2
+from incidents.sources.helpers import mark_source_read
 from incidents.utils import (
     find_dates,
     fix_additional_info_grammar,
@@ -55,6 +56,9 @@ from incidents.views import (
 from stations.models import Station
 
 
+LIFT_FEED_GET = "stations.step_free.broken_lifts.requests.get"
+
+
 class FakeResponse:
     def __init__(self, payload, status_code=200, text=None):
         self._payload = payload
@@ -63,6 +67,9 @@ class FakeResponse:
 
     def json(self):
         return self._payload
+
+    def raise_for_status(self):
+        pass
 
 
 class StationFactoryMixin:
@@ -544,7 +551,9 @@ class SourceTests(StationFactoryMixin, TestCase):
             }
         ]
 
-        with patch.object(tflapiv2.requests, "get", return_value=FakeResponse(payload)):
+        # The lift feed has to say a thing twice before we act on it.
+        with patch(LIFT_FEED_GET, return_value=FakeResponse(payload)):
+            tflapiv2.check()
             tflapiv2.check()
 
         stale_report.refresh_from_db()
@@ -569,7 +578,7 @@ class SourceTests(StationFactoryMixin, TestCase):
             }
         ]
 
-        with patch.object(tflapiv2.requests, "get", return_value=FakeResponse(payload)):
+        with patch(LIFT_FEED_GET, return_value=FakeResponse(payload)):
             tflapiv2.check()
 
         existing.refresh_from_db()
@@ -587,10 +596,9 @@ class SourceTests(StationFactoryMixin, TestCase):
             text="Lift unavailable",
         )
 
-        with patch.object(
-            tflapiv2.requests,
-            "get",
-            side_effect=tflapiv2.requests.exceptions.ConnectionError,
+        with patch(
+            LIFT_FEED_GET,
+            side_effect=tflapiv1.requests.exceptions.ConnectionError,
         ):
             tflapiv2.check()
 
@@ -606,7 +614,7 @@ class SourceTests(StationFactoryMixin, TestCase):
             }
         ]
 
-        with patch.object(tflapiv2.requests, "get", return_value=FakeResponse(payload)):
+        with patch(LIFT_FEED_GET, return_value=FakeResponse(payload)):
             tflapiv2.check()
 
         self.assertEqual(
@@ -654,6 +662,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
             text=first_report.text,
             start_time=first_report.start_time,
         )
+        mark_source_read(Report.SOURCE_TFLAPI_V2)
         second_report = self.create_report(
             parent,
             text="Lift unavailable on the northbound platform.",
@@ -770,6 +779,7 @@ class ConsolidationTests(StationFactoryMixin, TestCase):
             start_time=first_report.start_time,
             **incident_overrides,
         )
+        mark_source_read(Report.SOURCE_TFLAPI_V2)
         self.create_report(
             parent,
             text="Lift unavailable on the northbound platform.",
@@ -2120,6 +2130,30 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         # denormalized 7 are excluded.
         self.assertEqual(payload["incidents"][0]["num_reports"], 2)
 
+    def test_api_training_data_num_reports_ignores_the_lift_feed(self):
+        # The lift feed repeats the main feed, so counting its reports would
+        # double the number for every lift fault from the day it was
+        # switched on, and the model would read that as a different fault.
+        parent = self.create_parent_station("Farringdon", naptan_id="ZFD")
+        start = datetime(2026, 7, 1, 9, 30, tzinfo=dt_timezone.utc)
+        end = datetime(2026, 7, 1, 11, 0, tzinfo=dt_timezone.utc)
+        main = self.create_report(parent, start_time=start, end_time=end, resolved=True)
+        lift_feed = self.create_report(
+            parent, start_time=start, end_time=end, resolved=True,
+            source=Report.SOURCE_TFLAPI_V2,
+        )
+        self.create_incident(
+            parent, text="Faulty lift", resolved=True, start_time=start,
+            end_time=end, reports=[main, lift_feed],
+        )
+
+        response = self.client.get(
+            "/api/training-data/", HTTP_X_FUNCTIONS_KEY="verysecret"
+        )
+        payload = json.loads(b"".join(response.streaming_content).decode("utf-8"))
+
+        self.assertEqual(payload["incidents"][0]["num_reports"], 1)
+
     def test_detail_and_api_exclude_resolved_incidents_older_than_twelve_hours(self):
         parent = self.create_parent_station("Tottenham Court Road", naptan_id="TCR")
         recent = self.create_incident(
@@ -2471,6 +2505,8 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
         with patch(
             "incidents.management.commands.update_incidents.check_tflv1"
         ) as check_tflv1_mock, patch(
+            "incidents.management.commands.update_incidents.check_tflv2"
+        ) as check_tflv2_mock, patch(
             "incidents.management.commands.update_incidents.update_broken_lifts"
         ) as update_broken_lifts_mock, patch(
             "incidents.management.commands.update_incidents.consolidate_incidents"
@@ -2480,6 +2516,7 @@ class ViewAndCommandTests(StationFactoryMixin, TestCase):
             call_command("update_incidents", stdout=stdout)
 
         check_tflv1_mock.assert_called_once_with()
+        check_tflv2_mock.assert_called_once_with()
         update_broken_lifts_mock.assert_called_once_with()
         consolidate_mock.assert_called_once_with()
         update_last_updated_mock.assert_called_once_with()

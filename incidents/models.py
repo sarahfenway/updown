@@ -171,3 +171,62 @@ class Report(models.Model):
             ),
         ]
         ordering = ["-start_time", "-id"]
+
+
+class SourceCheck(models.Model):
+    """When each TfL feed was last read successfully. One small row per feed.
+
+    A feed that has not been read for a while is treated as down: its open
+    reports stop holding issues open (see consolidate_incidents).
+    """
+
+    source = models.CharField(
+        max_length=1, primary_key=True, choices=Report.SOURCE_CHOICES
+    )
+    checked_at = models.DateTimeField()
+    # Changes the feed has shown once and must show again before we act on
+    # them (see incidents/sources/tflapiv2). Empty for the main feed.
+    pending = models.JSONField(default=dict, blank=True)
+
+    def __str__(self):
+        return f"{self.get_source_display()} read at {self.checked_at}"
+
+
+class EscalatorFault(models.Model):
+    """One spell of an escalator message in TfL's StopPoint disruption feed.
+
+    Recorded in the background so there is history to predict from later.
+    It makes no report or issue and is not shown anywhere. Written only
+    when a message enters or leaves the feed.
+    """
+
+    # Null for a station we do not hold (most without step-free access).
+    station = models.ForeignKey(
+        "stations.Station", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="escalator_faults",
+    )
+    atco_code = models.CharField(max_length=32)
+    station_name = models.CharField(max_length=200, blank=True)
+    text = models.TextField()
+    planned = models.BooleanField(default=False)
+    # TfL's own start time for the message, when it gives one.
+    source_start = models.DateTimeField(null=True, blank=True)
+    first_seen = models.DateTimeField()
+    # The last successful read that still listed the message. Only set when
+    # the fault closes: it ended between ``last_seen`` and ``cleared_at``.
+    last_seen = models.DateTimeField()
+    cleared_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-first_seen", "-id"]
+        indexes = [
+            models.Index(fields=["atco_code", "first_seen"], name="escalator_stop_idx"),
+            models.Index(
+                fields=["atco_code"],
+                name="escalator_open_idx",
+                condition=models.Q(cleared_at__isnull=True),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.station_name or self.atco_code} from {self.first_seen:%Y-%m-%d %H:%M}"

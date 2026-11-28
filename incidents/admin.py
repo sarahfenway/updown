@@ -8,7 +8,7 @@ from django.urls import reverse
 from django.utils.functional import cached_property
 from django.utils.html import format_html, format_html_join
 
-from incidents.models import Incident, Report
+from incidents.models import EscalatorFault, Incident, Report, SourceCheck
 
 
 class CachedCountPaginator(Paginator):
@@ -142,3 +142,18 @@ class ReportAdmin(admin.ModelAdmin):
 
 
 admin.site.site_header = "Up Down London Administration"
+
+
+@admin.register(EscalatorFault)
+class EscalatorFaultAdmin(admin.ModelAdmin):
+    """Background record only; see incidents/sources/escalators.py."""
+
+    list_display = ("station_name", "text", "planned", "first_seen", "cleared_at")
+    list_filter = ("planned",)
+    search_fields = ("station_name", "text")
+    raw_id_fields = ("station",)
+
+
+@admin.register(SourceCheck)
+class SourceCheckAdmin(admin.ModelAdmin):
+    list_display = ("source", "checked_at", "pending")

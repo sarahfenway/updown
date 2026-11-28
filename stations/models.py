@@ -106,3 +106,41 @@ class LiftStatusCheck(models.Model):
     """
 
     checked_at = models.DateTimeField()
+
+
+class LiftOutage(models.Model):
+    """One spell of a lift being listed as out of service in TfL's lift feed.
+
+    History for predictions, not shown anywhere. Written only when a lift
+    enters or leaves the feed, never on the 5-minute runs in between.
+    """
+
+    lift_id = models.CharField(max_length=64)
+    tfl_station_id = models.CharField(max_length=32, verbose_name="TfL station id")
+    # Null for a lift at a station we do not hold.
+    station = models.ForeignKey(
+        Station, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="lift_outages",
+    )
+    message = models.TextField(blank=True)
+    first_seen = models.DateTimeField()
+    # The last successful read that still listed the lift. Only set when the
+    # outage closes: the lift came back between ``last_seen`` and
+    # ``cleared_at``. A long gap means the feed was down in between.
+    last_seen = models.DateTimeField()
+    cleared_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-first_seen", "-id"]
+        indexes = [
+            models.Index(fields=["lift_id", "first_seen"], name="liftoutage_lift_idx"),
+            models.Index(fields=["station", "first_seen"], name="liftoutage_station_idx"),
+            models.Index(
+                fields=["tfl_station_id", "lift_id"],
+                name="liftoutage_open_idx",
+                condition=models.Q(cleared_at__isnull=True),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.lift_id} from {self.first_seen:%Y-%m-%d %H:%M}"

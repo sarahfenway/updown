@@ -13,7 +13,12 @@ from incidents.utils import (
     remove_tfl_specifics,
     strip_step_free_prefix,
 )
-from incidents.sources.helpers import existing_report_lookup
+from incidents.sources.escalators import record_escalator_faults
+from incidents.sources.helpers import (
+    existing_report_lookup,
+    mark_source_read,
+    usable_feed_items,
+)
 from stations.utils import find_station_from_naptan
 
 logger = logging.getLogger(__name__)
@@ -100,9 +105,15 @@ def check():
         # no other timeout in the call path.
         r = requests.get(StatusPageURI, timeout=(5, 20))
 
+        disruption = None
         if r.status_code == 200 and len(r.text) > 0:
-            disruption = r.json()
+            disruption = usable_feed_items(r.json())
+            if disruption is None:
+                logger.warning(
+                    "TfL v1 disruption feed was empty or malformed; skipping this run"
+                )
 
+        if disruption is not None:
             with transaction.atomic():
                 for issue in disruption:
                     if _is_step_free_disruption(issue):
@@ -139,6 +150,8 @@ def check():
                     report.resolved = True
                     report.end_time = now
                     report.save()
+                previous_read = mark_source_read(Report.SOURCE_TFLAPI_V1, now)
+            record_escalator_faults(disruption, previous_read, now)
 
     except requests.exceptions.RequestException as exc:
         # Covers connection errors and timeouts alike — a flaky or slow

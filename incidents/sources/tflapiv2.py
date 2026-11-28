@@ -1,83 +1,131 @@
+"""TfL's lift feed (Disruptions/Lifts/v2) as a second source of reports.
+
+On unless settings.TFL_LIFT_FEED_AS_SOURCE is false. It mostly repeats the
+StopPoint feed (tflapiv1) in the same words, so its reports fold into the
+same issues; its value is that the site keeps opening and closing issues
+while the StopPoint feed is down.
+
+It is the less trusted of the two, so it has to say a thing twice: a fault
+must be listed on two reads in a row before it becomes a report, and be
+missing from two reads in a row before its report is closed. One odd read
+(a truncated list, a fault that flickers) therefore changes nothing.
+
+It also drops faults early: on the morning of 28 November 2026 it listed
+none of the twelve live lift faults the StopPoint feed still had. That is
+harmless here, because an issue stays open while any readable feed lists it
+(consolidate_incidents), but never let this feed close an issue on its own
+word while the StopPoint feed disagrees.
+"""
+
+from datetime import datetime
+
 import logging
 
-import requests
-from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
 from incidents.models import Report
-from incidents.sources.helpers import existing_report_lookup
+from incidents.prediction_shared import is_planned_work
+from incidents.sources.helpers import (
+    existing_report_lookup,
+    mark_source_read,
+    pending_changes,
+)
 from incidents.utils import remove_tfl_specifics, strip_step_free_prefix
+from stations.step_free.broken_lifts import fetch_lift_feed
 from stations.utils import find_station_from_naptan
 
 logger = logging.getLogger(__name__)
 
 
 def check():
-    StatusPageURI = f"https://api.tfl.gov.uk/Disruptions/Lifts/?app_id={settings.TFL_API_ID}&app_key={settings.TFL_API_KEY}"
-
-    reports_by_key, cleared_disruption = existing_report_lookup(
-        Report.SOURCE_TFLAPI_V2, resolved=None
-    )
-
+    """Never raises: an optional second feed must not stop the incident update."""
     try:
-        # Hard cap (connect, read) so a hung TfL endpoint can't block the
-        # update_incidents run indefinitely.
-        r = requests.get(StatusPageURI, timeout=(5, 20))
-
-        if r.status_code == 200 and len(r.text) > 0:
-            disruption = r.json()
-
-            with transaction.atomic():
-                for issue in disruption:
-                    try:
-                        station = find_station_from_naptan(issue["stationUniqueId"])
-
-                        if not station:
-                            continue
-
-                        first_colon = issue["message"].find(":")
-                        status_details = issue["message"][first_colon + 1 :].strip()
-                        status_details = strip_step_free_prefix(status_details)
-                        status_details = remove_tfl_specifics(status_details)
-
-                        key = (
-                            station.pk,
-                            status_details,
-                            Report.SOURCE_TFLAPI_V2,
-                            False,
-                        )
-                        existing_reports = reports_by_key.get(key)
-
-                        if existing_reports:
-                            if len(existing_reports) > 1:
-                                raise Report.MultipleObjectsReturned
-                            for report in existing_reports:
-                                cleared_disruption.pop(report.pk, None)
-                        else:
-                            report = Report.objects.create(
-                                station=station,
-                                text=status_details,
-                                source=Report.SOURCE_TFLAPI_V2,
-                                information=False,
-                            )
-                            reports_by_key[key] = [report]
-
-                    except ValueError:
-                        pass
-
-                now = timezone.now()
-                for report in cleared_disruption.values():
-                    report.resolved = True
-                    report.end_time = now
-                    report.save()
-
-    except requests.exceptions.RequestException as exc:
-        # Covers connection errors and timeouts alike — a flaky or slow
-        # TfL endpoint just means we skip this run, not crash or hang. Log
-        # it so a prolonged TfL outage is visible instead of silent. Only the
-        # exception type: requests' messages embed the URL with app_key.
+        _check()
+    except Exception as exc:  # noqa: BLE001 - see docstring
         logger.warning(
-            "TfL v2 lifts fetch failed (%s); skipping this run",
-            type(exc).__name__,
+            "TfL lift feed source failed (%s); skipping this run", type(exc).__name__
+        )
+
+
+def _report_text(item):
+    message = item["message"]
+    text = message[message.find(":") + 1 :].strip()
+    return remove_tfl_specifics(strip_step_free_prefix(text))
+
+
+def _first_seen(value, now):
+    try:
+        seen = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return now
+    return seen if timezone.is_aware(seen) and seen <= now else now
+
+
+def _listed_faults(items):
+    """(station pk, text) for each usable item, in feed order, no repeats."""
+    listed = {}
+    for item in items:
+        try:
+            station = find_station_from_naptan(item["stationUniqueId"])
+            text = _report_text(item)
+        except (KeyError, TypeError, AttributeError):
+            continue
+        # This feed lists dated and planned work as plain faults. The
+        # StopPoint feed handles those properly, with their dates.
+        if not station or not text or is_planned_work(text):
+            continue
+        listed[(station.pk, text)] = True
+    return list(listed)
+
+
+def _check():
+    items = fetch_lift_feed()
+    if items is None:
+        # Down, empty or malformed. Nothing is closed and the read is not
+        # recorded, so after SOURCE_STALE_AFTER this feed's open reports stop
+        # holding issues open. What was waiting for a second read keeps
+        # waiting: a failed read is not a read.
+        return
+
+    now = timezone.now()
+    source = Report.SOURCE_TFLAPI_V2
+    reports_by_key, not_listed = existing_report_lookup(source)
+    waiting = pending_changes(source)
+    seen_once = {
+        (entry[0], entry[1]): entry[2]
+        for entry in waiting.get("appeared", [])
+        if isinstance(entry, list) and len(entry) == 3
+    }
+    missed_once = set(waiting.get("missing", []))
+
+    appeared = []
+    missing = []
+    with transaction.atomic():
+        for station_pk, text in _listed_faults(items):
+            existing = reports_by_key.get((station_pk, text, source, False))
+            if existing:
+                for report in existing:
+                    not_listed.pop(report.pk, None)
+            elif (station_pk, text) in seen_once:
+                Report.objects.create(
+                    station_id=station_pk,
+                    text=text,
+                    source=source,
+                    information=False,
+                    start_time=_first_seen(seen_once[(station_pk, text)], now),
+                )
+            else:
+                appeared.append([station_pk, text, now.isoformat()])
+
+        for report in not_listed.values():
+            if report.pk in missed_once:
+                report.resolved = True
+                report.end_time = now
+                report.save()
+            else:
+                missing.append(report.pk)
+
+        mark_source_read(
+            source, now, pending={"appeared": appeared, "missing": missing}
         )
