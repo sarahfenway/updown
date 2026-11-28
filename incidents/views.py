@@ -35,6 +35,7 @@ from incidents.ml import (
     prediction_outcome,
     time_block_slot,
 )
+from incidents.prediction_shared import PREDICTION_COVERAGE_TARGET
 from incidents.text_features import normalise_incident_text
 from stations.models import Station
 
@@ -116,9 +117,9 @@ PREDICTION_POLICY_WINDOW_DAYS = 30
 PREDICTION_POLICY_FALLBACK_WINDOW_DAYS = (90, 180)
 PREDICTION_BUCKET_MIN_SAMPLES = 30
 # Shown only while at least this share of recent predictions in the bucket
-# were right first time. The model aims higher (about 96%); this is the floor
-# below which we stop showing predictions at all.
-PREDICTION_MIN_ACCURACY = 0.90
+# were right first time. The model aims higher (PREDICTION_COVERAGE_TARGET);
+# this is the floor below which we stop showing predictions at all.
+PREDICTION_MIN_ACCURACY = 0.75
 PREDICTION_STATION_DIAGNOSTIC_MIN_SAMPLES = 3
 PREDICTION_REVIEW_LIMIT = 50
 PREDICTION_NETWORK_LABELS = (
@@ -1232,6 +1233,7 @@ def _prediction_stats(since):
         ),
         "prediction_display_min_samples": PREDICTION_BUCKET_MIN_SAMPLES,
         "prediction_display_min_accuracy_pct": round(PREDICTION_MIN_ACCURACY * 100),
+        "prediction_aim_pct": round(PREDICTION_COVERAGE_TARGET * 100),
         "prediction_display_primary_window_days": PREDICTION_POLICY_WINDOW_DAYS,
         "prediction_display_fallback_window_days": ", ".join(
             str(days) for days in PREDICTION_POLICY_FALLBACK_WINDOW_DAYS

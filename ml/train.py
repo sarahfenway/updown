@@ -23,6 +23,7 @@ import argparse
 import bisect
 import os
 import re
+import statistics
 import sys
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta
@@ -569,13 +570,43 @@ def decode_bound(classes, probs, tail, category, start_block_idx):
     return round_up_to_service_day(int(start_block_idx), offset)
 
 
+def bound_length_summary(bound_offsets, actual_offsets):
+    """How far out the promised dates are, next to how long faults lasted.
+
+    A model can be right first time simply by promising dates far away, so
+    the accuracy gates alone cannot tell a useful model from a vague one.
+    "Long" means MAX_OFFSET_CLASS blocks (two days) or more.
+    """
+    def _summary(offsets):
+        if not offsets:
+            return 0.0, 0.0
+        long_share = sum(1 for o in offsets if o >= MAX_OFFSET_CLASS) / len(offsets)
+        return long_share, float(statistics.median(offsets))
+
+    long_bound_share, median_bound = _summary(list(bound_offsets))
+    long_actual_share, median_actual = _summary(list(actual_offsets))
+    return {
+        "long_bound_share": long_bound_share,
+        "median_bound_offset": median_bound,
+        "long_actual_share": long_actual_share,
+        "median_actual_offset": median_actual,
+    }
+
+
 def quality_gate_failure(
     cv_metrics,
     min_boundary_accuracy,
     min_category_accuracy=0.0,
     min_category_samples=100,
+    max_long_bound_share=1.0,
 ):
     """Why this model must not ship, or None when it may."""
+    long_share = cv_metrics.get("long_bound_share", 0.0)
+    if long_share > max_long_bound_share:
+        return (
+            f"{long_share * 100:.1f}% of its dates are two or more days away, "
+            f"above the allowed {max_long_bound_share * 100:.1f}%"
+        )
     overall = cv_metrics["mean_resolved_by_bound_grace"]
     if overall < min_boundary_accuracy:
         return (
@@ -646,6 +677,8 @@ def train_model(df, feature_cols):
     tscv = TimeSeriesSplit(n_splits=3)
     fold_scores = []
     category_tally = {}
+    bound_offsets = []
+    actual_offsets = []
     for train_idx, test_idx in tscv.split(X):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train = y.iloc[train_idx]
@@ -686,6 +719,8 @@ def train_model(df, feature_cols):
                 int(row.start_block_idx) + offset, row.end_time
             )
             given += 1
+            bound_offsets.append(offset)
+            actual_offsets.append(int(row.block_offset_raw))
             held += int(row.block_offset_raw <= offset)
             held_with_grace += int(close)
             tally = category_tally.setdefault(category, [0, 0])
@@ -729,6 +764,16 @@ def train_model(df, feature_cols):
             f"(n={entry['count']})"
         )
 
+    lengths = bound_length_summary(bound_offsets, actual_offsets)
+    print(
+        f"  dates two or more days away: {lengths['long_bound_share'] * 100:.1f}% "
+        f"(faults that lasted that long: {lengths['long_actual_share'] * 100:.1f}%)"
+    )
+    print(
+        f"  typical date: {lengths['median_bound_offset']:g} blocks after the "
+        f"start (typical fix: {lengths['median_actual_offset']:g})"
+    )
+
     # Train final model on all data
     model = _fresh_model()
     model.fit(X, y, sample_weight=sample_weights)
@@ -741,6 +786,7 @@ def train_model(df, feature_cols):
         "mean_resolved_by_bound_grace": mean_boundary,
         "by_category": by_category,
         "n_splits": tscv.n_splits,
+        **lengths,
     }
     return model, historical_baselines, tail_distribution, cv_metrics
 
@@ -922,6 +968,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--max-long-bound-share",
+        type=float,
+        default=1.0,
+        help=(
+            "Refuse to upload if more than this fraction (0-1) of the "
+            "cross-validated dates are two or more days after the fault "
+            "began. Stops a model passing the accuracy gates by being "
+            "vague. Default 1.0 (no gate)."
+        ),
+    )
+    parser.add_argument(
         "--max-regression",
         type=float,
         default=0.05,
@@ -965,6 +1022,7 @@ def main():
         args.min_boundary_accuracy,
         args.min_category_accuracy,
         args.min_category_samples,
+        args.max_long_bound_share,
     )
     if failure:
         print(

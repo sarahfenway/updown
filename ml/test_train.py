@@ -186,6 +186,8 @@ def test_training_returns_a_tail_table_and_scores_the_real_decode():
     assert 0 < cv["mean_bound_given"] <= 1
     assert 0 <= cv["mean_resolved_by_bound_grace"] <= 1
     assert sum(entry["count"] for entry in cv["by_category"].values()) > 0
+    assert 0 <= cv["long_bound_share"] <= 1
+    assert cv["median_bound_offset"] >= 0
 
 
 def test_decode_bound_matches_the_shared_decode():
@@ -214,3 +216,28 @@ def test_quality_gate_checks_overall_and_each_large_category():
         "by_category": {"faulty_lift": {"count": 500, "resolved_by_bound_grace": 0.89}},
     }
     assert "faulty_lift" in train.quality_gate_failure(weak_lifts, 0.93, 0.90, 100)
+
+
+def test_bound_length_summary_counts_dates_two_or_more_days_out():
+    summary = train.bound_length_summary(
+        bound_offsets=[0, 1, 1, 10], actual_offsets=[0, 0, 1, 2]
+    )
+    assert summary == {
+        "long_bound_share": 0.25,
+        "median_bound_offset": 1.0,
+        "long_actual_share": 0.0,
+        "median_actual_offset": 0.5,
+    }
+
+
+def test_quality_gate_rejects_a_model_whose_dates_are_mostly_days_away():
+    metrics = {
+        "mean_resolved_by_bound_grace": 0.99,
+        "long_bound_share": 0.60,
+        "by_category": {},
+    }
+    assert train.quality_gate_failure(metrics, 0.78, 0.75, 100) is None
+    failure = train.quality_gate_failure(
+        metrics, 0.78, 0.75, 100, max_long_bound_share=0.35
+    )
+    assert "two or more days" in failure
